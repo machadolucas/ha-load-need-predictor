@@ -7,7 +7,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.load_need_predictor.const import DOMAIN, SUBENTRY_TYPE_LOAD
+from custom_components.load_need_predictor.const import (
+    DOMAIN,
+    SUBENTRY_TYPE_LOAD,
+    SUBENTRY_TYPE_PRICE_FORECAST,
+)
 
 
 async def test_hub_user_flow_creates_entry(hass: HomeAssistant) -> None:
@@ -62,3 +66,28 @@ async def test_add_load_subentry(hass: HomeAssistant) -> None:
     assert result["title"] == "LVV"
     await hass.async_block_till_done()
     assert len(entry.subentries) == 1
+
+
+async def test_add_price_forecast_subentry(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, data={"name": "Predictor"})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PRICE_FORECAST), context={"source": SOURCE_USER}
+    )
+    assert result["type"] == FlowResultType.FORM
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            "name": "LVV forecast",
+            "price_entity": "sensor.electricity_price",
+            "wind_entity": "sensor.wind",
+            "weather_entity": "weather.home",
+            "temp_history_entity": "sensor.temp",
+        },
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["title"] == "LVV forecast"

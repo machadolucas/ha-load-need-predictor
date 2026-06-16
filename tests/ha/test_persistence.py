@@ -56,7 +56,7 @@ async def _setup(hass: HomeAssistant):
 
 async def test_learned_state_survives_reload(hass: HomeAssistant) -> None:
     entry = await _setup(hass)
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.load
     sid = next(iter(coordinator.load_configs()))
 
     async_mock_service(hass, "number", "set_value")
@@ -74,7 +74,7 @@ async def test_learned_state_survives_reload(hass: HomeAssistant) -> None:
     assert await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()
 
-    reloaded = entry.runtime_data
+    reloaded = entry.runtime_data.load
     assert reloaded.models[sid].sample_count == 1
     assert reloaded.models[sid].gain == learned_gain
     assert reloaded.training[sid][-1]["actual_kwh"] == 6.9
@@ -82,7 +82,7 @@ async def test_learned_state_survives_reload(hass: HomeAssistant) -> None:
 
 async def test_load_runtime_reads_existing_store(hass: HomeAssistant) -> None:
     entry = await _setup(hass)
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.load
     sid = next(iter(coordinator.load_configs()))
 
     # Pre-seed the Store with a learned model, then re-load runtime.

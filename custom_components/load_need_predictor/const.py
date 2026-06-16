@@ -53,6 +53,19 @@ CONF_WATER_TOTAL_ENTITY = "water_total_entity"
 CONF_MIN_MINUTES = "min_minutes"
 CONF_MAX_MINUTES = "max_minutes"
 
+# ── Price-forecast subentry (beyond-horizon price estimate for the scheduler) ─
+SUBENTRY_TYPE_PRICE_FORECAST = "price_forecast"
+
+CONF_PRICE_ENTITY = "price_entity"  # actual buy price (€/kWh) — fit + evaluate
+CONF_WIND_ENTITY = "wind_entity"  # Finland wind production forecast (series attr)
+CONF_WEATHER_ENTITY = "weather_entity"  # daily temperature forecast source
+CONF_TEMP_HISTORY_ENTITY = "temp_history_entity"  # actual outdoor temp — for fitting
+CONF_FORECAST_DAYS = "forecast_days"  # how many future days to publish
+CONF_FIT_DAYS = "fit_days"  # LTS lookback used to fit the model
+
+DEFAULT_FORECAST_DAYS = 3
+DEFAULT_FIT_DAYS = 365
+
 # Per-load UI defaults (tuned to the author's ~3 kW LVV; see CLAUDE.md data notes).
 DEFAULT_RATED_POWER_KW = 3.0
 DEFAULT_MIN_MINUTES = 40  # ~2 kWh safety floor: never starve the tank

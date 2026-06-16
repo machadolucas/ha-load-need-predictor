@@ -1,13 +1,15 @@
 """The Load Need Predictor integration.
 
-A hub config entry holds the global prediction/capture schedule + the
-coordinator; one config *subentry* per load (the water heater today, other
-flexible loads later) carries that load's sensors and its link to a Load
-Scheduler target.
+A hub config entry holds the global prediction/capture schedule + two
+coordinators; one config *subentry* per capability:
 
-The predictor answers *how much* a load needs to run each day and pushes that to
-the Load Scheduler, which decides *when*. See ``CLAUDE.md`` for the model and the
-data findings behind it.
+- **load** subentries predict *how much* a load needs to run and push that to the
+  Load Scheduler (which decides *when*);
+- a **price_forecast** subentry estimates electricity prices *beyond* Nord Pool's
+  day-ahead horizon, so the scheduler can defer an expensive day to a
+  forecast-cheaper one.
+
+See ``CLAUDE.md`` for the models and the data findings behind them.
 """
 
 from __future__ import annotations
@@ -17,21 +19,28 @@ import logging
 from homeassistant.core import HomeAssistant
 
 from .const import PLATFORMS
-from .coordinator import LoadNeedPredictorConfigEntry, LoadNeedPredictorCoordinator
+from .coordinator import LoadNeedPredictorCoordinator
+from .forecast_coordinator import PriceForecastCoordinator
 from .jobs import PredictorJobs
+from .runtime import LoadNeedPredictorConfigEntry, RuntimeData
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> bool:
     """Set up Load Need Predictor from the hub config entry."""
-    coordinator = LoadNeedPredictorCoordinator(hass, entry)
-    await coordinator.async_load_runtime()
-    await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = coordinator
+    load = LoadNeedPredictorCoordinator(hass, entry)
+    await load.async_load_runtime()
+    await load.async_config_entry_first_refresh()
 
-    # Schedule the two daily jobs (predict+push, capture+log).
-    jobs = PredictorJobs(hass, coordinator)
+    forecast = PriceForecastCoordinator(hass, entry)
+    await forecast.async_load_runtime()
+    await forecast.async_config_entry_first_refresh()
+
+    entry.runtime_data = RuntimeData(load=load, forecast=forecast)
+
+    # Both capabilities run on the hub's two daily wall-clock times.
+    jobs = PredictorJobs(hass, entry)
     jobs.async_start()
     entry.async_on_unload(jobs.async_shutdown)
 

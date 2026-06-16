@@ -1,13 +1,12 @@
 """The two daily jobs, scheduled on the hub's wall-clock times.
 
-- **Predict + push** (afternoon, after tomorrow's prices publish): recompute the
-  forecast and push the target to the scheduler.
-- **Capture + log** (late evening): read the day's actual delivery, complete the
-  training row, calibrate, and refresh the evaluation metrics.
+- **Predict** (afternoon, after tomorrow's prices publish): each load predicts +
+  pushes its target, and the price forecaster (re)fits and publishes the
+  beyond-horizon slots.
+- **Capture** (late evening): each load captures its actual delivery + calibrates,
+  and the price forecaster reconciles past forecasts against realised prices.
 
-M2 wires the scheduling and the predict-side refresh. The push (``actuation``)
-and the capture/calibration (``statistics_source``) are filled in at M3 — the
-hooks below are deliberately thin so the timing is testable on its own.
+Both capabilities share these two times; each coordinator does its own work.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_change
 
 from .const import CONF_CAPTURE_TIME, CONF_PREDICT_TIME, DEFAULT_CAPTURE_TIME, DEFAULT_PREDICT_TIME
-from .coordinator import LoadNeedPredictorCoordinator
+from .runtime import LoadNeedPredictorConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,15 +33,15 @@ def _parse_time(value: str) -> tuple[int, int, int]:
 class PredictorJobs:
     """Owns the daily time-change listeners for one hub."""
 
-    def __init__(self, hass: HomeAssistant, coordinator: LoadNeedPredictorCoordinator) -> None:
+    def __init__(self, hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> None:
         self.hass = hass
-        self.coordinator = coordinator
+        self.entry = entry
         self._unsubs: list[callable] = []
 
     @callback
     def async_start(self) -> None:
         """Register the predict and capture time-change listeners."""
-        data = self.coordinator.config_entry.data
+        data = self.entry.data
         ph, pm, ps = _parse_time(data.get(CONF_PREDICT_TIME, DEFAULT_PREDICT_TIME))
         ch, cm, cs = _parse_time(data.get(CONF_CAPTURE_TIME, DEFAULT_CAPTURE_TIME))
         self._unsubs.append(
@@ -59,11 +58,17 @@ class PredictorJobs:
             self._unsubs.pop()()
 
     async def _handle_predict(self, now) -> None:
-        """Predict + push the target for each load."""
+        """Predict + push each load, and (re)build the price forecast."""
         _LOGGER.debug("Predict job firing at %s", now)
-        await self.coordinator.async_predict_and_push()
+        runtime = self.entry.runtime_data
+        await runtime.load.async_predict_and_push()
+        if runtime.forecast is not None:
+            await runtime.forecast.async_build_forecast()
 
     async def _handle_capture(self, now) -> None:
-        """Capture actuals + log + calibrate for each load."""
+        """Capture + calibrate each load, and evaluate past forecasts."""
         _LOGGER.debug("Capture job firing at %s", now)
-        await self.coordinator.async_capture_and_log()
+        runtime = self.entry.runtime_data
+        await runtime.load.async_capture_and_log()
+        if runtime.forecast is not None:
+            await runtime.forecast.async_evaluate()

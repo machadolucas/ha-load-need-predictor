@@ -13,16 +13,24 @@ from dataclasses import dataclass
 from .const import (
     CONF_DELIVERED_ENERGY_ENTITY,
     CONF_DELIVERED_RUNTIME_ENTITY,
+    CONF_FIT_DAYS,
+    CONF_FORECAST_DAYS,
     CONF_GUESTS_CALENDAR_ENTITY,
     CONF_MAX_MINUTES,
     CONF_MIN_MINUTES,
     CONF_NAME,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PERSON_ENTITIES,
+    CONF_PRICE_ENTITY,
     CONF_RATED_POWER_KW,
     CONF_SUPPLY_TEMP_ENTITY,
     CONF_TARGET_NUMBER_ENTITY,
+    CONF_TEMP_HISTORY_ENTITY,
     CONF_WATER_TOTAL_ENTITY,
+    CONF_WEATHER_ENTITY,
+    CONF_WIND_ENTITY,
+    DEFAULT_FIT_DAYS,
+    DEFAULT_FORECAST_DAYS,
     DEFAULT_MAX_MINUTES,
     DEFAULT_MIN_MINUTES,
     DEFAULT_RATED_POWER_KW,
@@ -76,4 +84,30 @@ def load_config_from_data(data: Mapping) -> LoadConfig:
         water_total_entity=data.get(CONF_WATER_TOTAL_ENTITY),
         min_minutes=float(data.get(CONF_MIN_MINUTES, DEFAULT_MIN_MINUTES)),
         max_minutes=float(data.get(CONF_MAX_MINUTES, DEFAULT_MAX_MINUTES)),
+    )
+
+
+@dataclass(frozen=True)
+class PriceForecastConfig:
+    """Immutable view of a price-forecast subentry's configuration."""
+
+    name: str
+    price_entity: str | None  # actual buy price (€/kWh): fit target + evaluation
+    wind_entity: str | None  # wind production forecast (series attribute)
+    weather_entity: str | None  # daily temperature forecast source
+    temp_history_entity: str | None  # actual outdoor temp for fitting
+    forecast_days: int
+    fit_days: int
+
+
+def price_forecast_config_from_data(data: Mapping) -> PriceForecastConfig:
+    """Build a :class:`PriceForecastConfig` from a subentry's ``data`` mapping."""
+    return PriceForecastConfig(
+        name=str(data.get(CONF_NAME, "")),
+        price_entity=data.get(CONF_PRICE_ENTITY),
+        wind_entity=data.get(CONF_WIND_ENTITY),
+        weather_entity=data.get(CONF_WEATHER_ENTITY),
+        temp_history_entity=data.get(CONF_TEMP_HISTORY_ENTITY),
+        forecast_days=int(data.get(CONF_FORECAST_DAYS, DEFAULT_FORECAST_DAYS)),
+        fit_days=int(data.get(CONF_FIT_DAYS, DEFAULT_FIT_DAYS)),
     )

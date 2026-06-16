@@ -47,6 +47,28 @@
           }
         }
       }
+    },
+    "price_forecast": {
+      "initiate_flow": {
+        "user": "Add price forecast",
+        "reconfigure": "Reconfigure price forecast"
+      },
+      "entry_type": "Price forecast",
+      "step": {
+        "init": {
+          "title": "Beyond-horizon price forecast",
+          "description": "Estimate electricity prices beyond Nord Pool's day-ahead horizon from wind + temperature, and publish them for the scheduler's forecast_price_entity. The model is fit on long-term statistics of the price/temperature/wind history.",
+          "data": {
+            "name": "Name",
+            "price_entity": "Actual buy-price sensor (€/kWh — fit + evaluate)",
+            "wind_entity": "Finland wind-production forecast sensor",
+            "weather_entity": "Weather entity (daily temperature forecast)",
+            "temp_history_entity": "Outdoor temperature sensor (for fitting)",
+            "forecast_days": "Days ahead to publish",
+            "fit_days": "History window to fit on (days)"
+          }
+        }
+      }
     }
   },
   "entity": {
@@ -56,7 +78,11 @@
       "last_delivered": { "name": "Last delivered" },
       "prediction_error": { "name": "Prediction error" },
       "rolling_mae": { "name": "Rolling MAE" },
-      "sample_count": { "name": "Sample count" }
+      "sample_count": { "name": "Sample count" },
+      "price_forecast": { "name": "Price forecast" },
+      "forecast_error": { "name": "Forecast error" },
+      "forecast_mae": { "name": "Forecast MAE" },
+      "forecast_samples": { "name": "Forecast samples" }
     }
   }
 }

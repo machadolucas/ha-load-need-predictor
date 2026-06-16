@@ -32,8 +32,10 @@ from .predictor import ModelState
 class PredictorStore:
     """Thin wrapper over ``Store`` keyed per hub config entry."""
 
-    def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
-        self._store: Store[dict] = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}")
+    def __init__(self, hass: HomeAssistant, entry_id: str, suffix: str = "") -> None:
+        # The load coordinator uses suffix="" (one file per hub); the price
+        # forecaster uses a distinct suffix so the two don't clobber each other.
+        self._store: Store[dict] = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}{suffix}")
 
     async def async_load(self) -> dict:
         """Return the saved ``{subentry_id: {...}}`` mapping (empty if none)."""

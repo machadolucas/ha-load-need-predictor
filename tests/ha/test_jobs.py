@@ -43,7 +43,7 @@ async def _setup(hass: HomeAssistant, *, with_target: bool = True):
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    return entry, entry.runtime_data
+    return entry, entry.runtime_data.load
 
 
 def test_parse_time():
@@ -136,7 +136,7 @@ async def test_predict_resilient_without_scheduler(hass: HomeAssistant) -> None:
 
 async def test_jobs_register_and_cancel_listeners(hass: HomeAssistant) -> None:
     entry, coordinator = await _setup(hass)
-    jobs = PredictorJobs(hass, coordinator)
+    jobs = PredictorJobs(hass, entry)
     jobs.async_start()
     assert len(jobs._unsubs) == 2
     jobs.async_shutdown()
@@ -145,7 +145,7 @@ async def test_jobs_register_and_cancel_listeners(hass: HomeAssistant) -> None:
 
 async def test_job_handlers_delegate_to_coordinator(hass: HomeAssistant) -> None:
     entry, coordinator = await _setup(hass)
-    jobs = PredictorJobs(hass, coordinator)
+    jobs = PredictorJobs(hass, entry)
     with (
         patch.object(coordinator, "async_predict_and_push", new=AsyncMock()) as predict,
         patch.object(coordinator, "async_capture_and_log", new=AsyncMock()) as capture,

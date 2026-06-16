@@ -40,7 +40,7 @@ async def test_diagnostics_structure_and_redaction(hass: HomeAssistant) -> None:
     entry = await _setup(hass)
     diag = await async_get_config_entry_diagnostics(hass, entry)
 
-    assert set(diag) == {"hub", "loads"}
+    assert set(diag) == {"hub", "loads", "forecasts"}
     sid = next(iter(diag["loads"]))
     load = diag["loads"][sid]
 

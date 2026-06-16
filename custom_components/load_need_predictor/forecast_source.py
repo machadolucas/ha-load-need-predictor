@@ -142,3 +142,18 @@ async def async_fit_rows(
         if bucket in temp and bucket in wind:
             rows.append((temp[bucket], wind[bucket] / _MW_PER_GW, price_mean))
     return rows
+
+
+async def async_daily_price_mean(
+    hass: HomeAssistant, price_entity: str, day_start: datetime
+) -> float | None:
+    """Mean realised price (€/kWh) for the local day at ``day_start`` (for evaluation)."""
+    stats = await _daily_means(hass, [price_entity], day_start)
+    per_day = stats.get(price_entity, {})
+    if not per_day:
+        return None
+    target_ms = int(day_start.timestamp() * 1000)
+    # Prefer the exact bucket; fall back to the only/earliest bucket in range.
+    if target_ms in per_day:
+        return per_day[target_ms]
+    return per_day[min(per_day)]

@@ -95,3 +95,23 @@ async def test_fit_rows_aligns_and_normalises_wind(hass: HomeAssistant) -> None:
 async def test_fit_rows_empty_without_recorder(hass: HomeAssistant) -> None:
     rows = await fs.async_fit_rows(hass, "sensor.price", "sensor.temp", "sensor.wind", days=365)
     assert rows == []
+
+
+async def test_daily_price_mean_returns_bucket(hass: HomeAssistant) -> None:
+    day_start = dt_util.start_of_local_day()
+    bucket = int(day_start.timestamp() * 1000)
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(
+        return_value={"sensor.price": [{"start": bucket, "mean": 0.12}]}
+    )
+    with patch(_GET_INSTANCE, return_value=instance):
+        result = await fs.async_daily_price_mean(hass, "sensor.price", day_start)
+    assert result == 0.12
+
+
+async def test_daily_price_mean_none_when_empty(hass: HomeAssistant) -> None:
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(return_value={})
+    with patch(_GET_INSTANCE, return_value=instance):
+        result = await fs.async_daily_price_mean(hass, "sensor.price", dt_util.start_of_local_day())
+    assert result is None

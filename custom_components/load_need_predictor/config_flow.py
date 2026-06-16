@@ -25,6 +25,8 @@ from .const import (
     CONF_CAPTURE_TIME,
     CONF_DELIVERED_ENERGY_ENTITY,
     CONF_DELIVERED_RUNTIME_ENTITY,
+    CONF_FIT_DAYS,
+    CONF_FORECAST_DAYS,
     CONF_GUESTS_CALENDAR_ENTITY,
     CONF_MAX_MINUTES,
     CONF_MIN_MINUTES,
@@ -32,11 +34,17 @@ from .const import (
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PERSON_ENTITIES,
     CONF_PREDICT_TIME,
+    CONF_PRICE_ENTITY,
     CONF_RATED_POWER_KW,
     CONF_SUPPLY_TEMP_ENTITY,
     CONF_TARGET_NUMBER_ENTITY,
+    CONF_TEMP_HISTORY_ENTITY,
     CONF_WATER_TOTAL_ENTITY,
+    CONF_WEATHER_ENTITY,
+    CONF_WIND_ENTITY,
     DEFAULT_CAPTURE_TIME,
+    DEFAULT_FIT_DAYS,
+    DEFAULT_FORECAST_DAYS,
     DEFAULT_MAX_MINUTES,
     DEFAULT_MIN_MINUTES,
     DEFAULT_NAME,
@@ -44,6 +52,7 @@ from .const import (
     DEFAULT_RATED_POWER_KW,
     DOMAIN,
     SUBENTRY_TYPE_LOAD,
+    SUBENTRY_TYPE_PRICE_FORECAST,
 )
 
 _SENSOR = selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor"))
@@ -129,6 +138,43 @@ def _load_schema(defaults: dict) -> vol.Schema:
     )
 
 
+def _days_selector(maximum: int) -> selector.NumberSelector:
+    return selector.NumberSelector(
+        selector.NumberSelectorConfig(
+            min=1,
+            max=maximum,
+            step=1,
+            unit_of_measurement="d",
+            mode=selector.NumberSelectorMode.BOX,
+        )
+    )
+
+
+def _forecast_schema(defaults: dict) -> vol.Schema:
+    def suggest(key: str) -> dict:
+        return {"suggested_value": defaults.get(key)}
+
+    return vol.Schema(
+        {
+            vol.Required(CONF_NAME, description=suggest(CONF_NAME)): str,
+            vol.Required(CONF_PRICE_ENTITY, description=suggest(CONF_PRICE_ENTITY)): _SENSOR,
+            vol.Required(CONF_WIND_ENTITY, description=suggest(CONF_WIND_ENTITY)): _SENSOR,
+            vol.Required(
+                CONF_WEATHER_ENTITY, description=suggest(CONF_WEATHER_ENTITY)
+            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="weather")),
+            vol.Required(
+                CONF_TEMP_HISTORY_ENTITY, description=suggest(CONF_TEMP_HISTORY_ENTITY)
+            ): _TEMP_SENSOR,
+            vol.Optional(
+                CONF_FORECAST_DAYS, default=defaults.get(CONF_FORECAST_DAYS, DEFAULT_FORECAST_DAYS)
+            ): _days_selector(7),
+            vol.Optional(
+                CONF_FIT_DAYS, default=defaults.get(CONF_FIT_DAYS, DEFAULT_FIT_DAYS)
+            ): _days_selector(730),
+        }
+    )
+
+
 def _clean(user_input: dict) -> dict:
     """Drop unset optionals so model defaults apply cleanly."""
     return {k: v for k, v in user_input.items() if v not in (None, "")}
@@ -163,8 +209,11 @@ class LoadNeedPredictorConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_supported_subentry_types(
         cls, config_entry: ConfigEntry
     ) -> dict[str, type[ConfigSubentryFlow]]:
-        """Loads are added as subentries of the hub."""
-        return {SUBENTRY_TYPE_LOAD: LoadSubentryFlowHandler}
+        """Loads and the price forecast are both added as subentries of the hub."""
+        return {
+            SUBENTRY_TYPE_LOAD: LoadSubentryFlowHandler,
+            SUBENTRY_TYPE_PRICE_FORECAST: PriceForecastSubentryFlowHandler,
+        }
 
 
 class LoadSubentryFlowHandler(ConfigSubentryFlow):
@@ -198,3 +247,36 @@ class LoadSubentryFlowHandler(ConfigSubentryFlow):
                 data=data,
             )
         return self.async_show_form(step_id="init", data_schema=_load_schema(self._defaults))
+
+
+class PriceForecastSubentryFlowHandler(ConfigSubentryFlow):
+    """Add or reconfigure the beyond-horizon price forecast (one ``init`` step)."""
+
+    _defaults: dict
+
+    @property
+    def _is_new(self) -> bool:
+        return self.source == SOURCE_USER
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
+        self._defaults = {}
+        return await self.async_step_init(user_input)
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        self._defaults = dict(self._get_reconfigure_subentry().data)
+        return await self.async_step_init(user_input)
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
+        if user_input is not None:
+            data = _clean(user_input)
+            if self._is_new:
+                return self.async_create_entry(title=data[CONF_NAME], data=data)
+            return self.async_update_and_abort(
+                self._get_entry(),
+                self._get_reconfigure_subentry(),
+                title=data[CONF_NAME],
+                data=data,
+            )
+        return self.async_show_form(step_id="init", data_schema=_forecast_schema(self._defaults))

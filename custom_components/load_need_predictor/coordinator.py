@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -50,11 +49,10 @@ from .predictor import (
     refit_occupancy_params,
     rolling_mae,
 )
+from .runtime import LoadNeedPredictorConfigEntry
 from .statistics_source import async_daily_delivered_kwh
 
 _LOGGER = logging.getLogger(__name__)
-
-type LoadNeedPredictorConfigEntry = ConfigEntry[LoadNeedPredictorCoordinator]
 
 
 @dataclass
