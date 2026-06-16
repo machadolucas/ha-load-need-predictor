@@ -27,11 +27,12 @@ def test_manifest_domain_and_version():
 
 def test_manifest_dependencies():
     data = _manifest()
-    # We read long-term statistics, so recorder is a hard dependency.
-    assert "recorder" in data["dependencies"]
-    # The scheduler is a soft dependency: the predictor must still load without it.
+    # Both recorder and the scheduler are SOFT deps: the predictor must still load
+    # without them. It degrades to publish-only / no-learning rather than failing,
+    # and the statistics read guards for a missing recorder at job time.
+    assert "recorder" in data["after_dependencies"]
     assert "load_scheduler" in data["after_dependencies"]
-    assert data["dependencies"].count("load_scheduler") == 0
+    assert data["dependencies"] == []
 
 
 def test_hacs_json():

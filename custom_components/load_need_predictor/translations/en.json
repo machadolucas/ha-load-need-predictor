@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Load Need Predictor",
+        "description": "Set when to predict (after tomorrow's prices publish) and when to capture the day's actual delivery.",
+        "data": {
+          "name": "Name",
+          "predict_time": "Predict + push time",
+          "capture_time": "Capture + log time"
+        }
+      },
+      "reconfigure": {
+        "title": "Load Need Predictor",
+        "data": {
+          "name": "Name",
+          "predict_time": "Predict + push time",
+          "capture_time": "Capture + log time"
+        }
+      }
+    }
+  },
+  "config_subentries": {
+    "load": {
+      "initiate_flow": {
+        "user": "Add load",
+        "reconfigure": "Reconfigure load"
+      },
+      "entry_type": "Load",
+      "step": {
+        "init": {
+          "title": "Load",
+          "description": "Pick the scheduler target to drive, the delivered-energy sensor (training signal), the occupancy entities, and the runtime clamp. Temperature/water sensors are logged for a future model, not used in the prediction.",
+          "data": {
+            "name": "Name",
+            "target_number_entity": "Scheduler target (number)",
+            "delivered_energy_entity": "Delivered energy sensor (kWh, total)",
+            "delivered_runtime_entity": "Delivered runtime sensor (optional)",
+            "rated_power_kw": "Rated power (kW)",
+            "person_entities": "People",
+            "guests_calendar_entity": "Guests calendar",
+            "supply_temp_entity": "Incoming-water temperature (log-only)",
+            "outdoor_temp_entity": "Outdoor temperature (log-only)",
+            "water_total_entity": "Household water total (log-only)",
+            "min_minutes": "Minimum minutes/day (safety floor)",
+            "max_minutes": "Maximum minutes/day (cap)"
+          }
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "predicted_runtime": { "name": "Predicted runtime" },
+      "predicted_energy": { "name": "Predicted energy" },
+      "last_delivered": { "name": "Last delivered" },
+      "prediction_error": { "name": "Prediction error" },
+      "rolling_mae": { "name": "Rolling MAE" },
+      "sample_count": { "name": "Sample count" }
+    }
+  }
+}

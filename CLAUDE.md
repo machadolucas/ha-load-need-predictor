@@ -21,6 +21,11 @@ This integration consumes only the scheduler's **public surface** — it writes 
 scheduler's target `number` and (later) listens to its run events. It never
 imports scheduler internals; the dependency runs one way.
 
+Both `recorder` and `load_scheduler` are **soft** deps (`after_dependencies`):
+the integration must load and keep predicting/publishing even if either is
+absent. The predict path needs neither; only the evening capture/learning path
+reads statistics, and it guards for a missing recorder.
+
 ## The data findings (do NOT re-litigate)
 
 Validated on ~3–4 months of long-term statistics for the author's LVV:
