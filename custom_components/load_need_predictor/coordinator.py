@@ -1,10 +1,16 @@
-"""Coordinator: holds per-load model state and the published prediction.
+"""Coordinator: holds per-load model state and runs the daily loop.
 
 This is an *on-demand* ``DataUpdateCoordinator`` — there is no polling interval.
-The daily jobs (``jobs.py``, from M3) drive it explicitly: predict + push in the
-afternoon, capture + log in the evening. ``_async_update_data`` recomputes the
-current forecast from the stored model + a live feature snapshot, so the sensors
-always reflect the latest model even after a reload.
+``jobs.py`` drives it: predict + push in the afternoon, capture + log in the
+evening. ``_async_update_data`` recomputes the current forecast from the stored
+model + a live feature snapshot, so the sensors always reflect the latest model
+even after a reload.
+
+Prediction/actual alignment (v1): one training row per local calendar day. The
+predict job writes the row's prediction; the capture job fills in that same
+day's actual delivered energy and calibrates. Same-day alignment keeps the loop
+simple — the online gain only needs a *consistent* ratio, and an occupancy-gated
+daily model is insensitive to the exact overnight offset.
 """
 
 from __future__ import annotations
@@ -17,18 +23,24 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, EVAL_WINDOW_DAYS, SUBENTRY_TYPE_LOAD
+from .actuation import async_push_target
+from .const import DOMAIN, EVAL_WINDOW_DAYS, MAX_TRAINING_ROWS, SUBENTRY_TYPE_LOAD
 from .models import LoadConfig, load_config_from_data
 from .occupancy import count_people_home, guests_active
 from .persistence import PredictorStore, model_from_dict, model_to_dict
 from .predictor import (
+    FeatureVector,
     ModelState,
+    apply_observation,
     build_features,
     default_model_state,
+    is_valid_delivery,
+    kwh_to_minutes,
     predict_kwh,
     predict_minutes,
     rolling_mae,
 )
+from .statistics_source import async_daily_delivered_kwh
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,7 +61,7 @@ class LoadResult:
 
 
 class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]]):
-    """Owns the model state per load and recomputes the published forecast."""
+    """Owns the model state per load and runs predict/capture."""
 
     config_entry: LoadNeedPredictorConfigEntry
 
@@ -60,7 +72,7 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         self.models: dict[str, ModelState] = {}
         self.training: dict[str, list[dict]] = {}
         self.eval_errors: dict[str, list[float]] = {}
-        self._results: dict[str, LoadResult] = {}
+        self._push_ok: dict[str, bool] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -120,7 +132,7 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         """Assemble the feature snapshot for the coming cycle from live state.
 
         v1 uses the current occupancy + guests; the temps are read for logging
-        only. (Actual delivered energy is filled later from statistics — M3.)
+        only (the model ignores them).
         """
         now = dt_util.now()
         return {
@@ -135,23 +147,125 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
     # ── daily jobs (driven by jobs.py) ─────────────────────────────────────────
 
     async def async_predict_and_push(self) -> None:
-        """Recompute the forecast and push the target to the scheduler.
-
-        M2: recompute only. The push to ``number.<load>_target`` is wired in M3.
-        """
-        await self.async_request_refresh()
+        """Forecast each load, push the target, and record the prediction row."""
+        today = dt_util.now().date().isoformat()
+        for subentry_id, cfg in self.load_configs().items():
+            state = self.model_for(subentry_id)
+            features = build_features(self.build_snapshot(cfg))
+            minutes = predict_minutes(
+                state,
+                features,
+                rated_power_kw=cfg.rated_power_kw,
+                min_minutes=cfg.min_minutes,
+                max_minutes=cfg.max_minutes,
+            )
+            self._push_ok[subentry_id] = await async_push_target(
+                self.hass, cfg.target_number_entity, minutes
+            )
+            self._upsert_prediction_row(subentry_id, today, features, state, minutes)
+        self.async_persist()
+        await self.async_refresh()
 
     async def async_capture_and_log(self) -> None:
-        """Capture the day's actual delivery, log it, and calibrate.
+        """Read each load's actual delivery, complete its row, and calibrate."""
+        day_start = dt_util.start_of_local_day()
+        today = day_start.date().isoformat()
+        for subentry_id, cfg in self.load_configs().items():
+            if not cfg.delivered_energy_entity:
+                continue
+            actual_kwh = await async_daily_delivered_kwh(
+                self.hass, cfg.delivered_energy_entity, day_start
+            )
+            self._record_actual(subentry_id, today, cfg, actual_kwh)
+        self.async_persist()
+        await self.async_refresh()
 
-        M2: no-op. The statistics read, training-row append, gain update and
-        eval refresh are wired in M3.
-        """
+    # ── training-row management ────────────────────────────────────────────────
 
-    # ── prediction ──────────────────────────────────────────────────────────────
+    def _upsert_prediction_row(
+        self, subentry_id: str, date: str, features: FeatureVector, state: ModelState, minutes: int
+    ) -> None:
+        """Write/replace today's row with the prediction, keeping any actuals."""
+        rows = self.training.setdefault(subentry_id, [])
+        row = {
+            "date": date,
+            "people_home": features.people_home,
+            "guests": features.guests,
+            "weekend": features.weekend,
+            "supply_temp": features.supply_temp,
+            "outdoor_temp": features.outdoor_temp,
+            "water_total_delta": features.water_total_delta,
+            "predicted_kwh": round(predict_kwh(state, features), 3),
+            "predicted_minutes": minutes,
+            "gain": round(state.gain, 4),
+            "model_version": state.version,
+            "actual_kwh": None,
+            "actual_minutes": None,
+            "abs_error_minutes": None,
+            "data_quality": None,
+        }
+        existing = self._row_for_date(rows, date)
+        if existing is not None:
+            # Preserve actuals if the capture job already ran today.
+            for key in ("actual_kwh", "actual_minutes", "abs_error_minutes", "data_quality"):
+                row[key] = existing.get(key)
+            rows[rows.index(existing)] = row
+        else:
+            rows.append(row)
+        del rows[:-MAX_TRAINING_ROWS]  # cap the history
 
-    async def _async_update_data(self) -> dict[str, LoadResult]:
-        """Recompute the published forecast for every load."""
+    def _record_actual(
+        self, subentry_id: str, date: str, cfg: LoadConfig, actual_kwh: float | None
+    ) -> None:
+        """Fill today's row with the actual delivery and calibrate the model."""
+        rows = self.training.setdefault(subentry_id, [])
+        row = self._row_for_date(rows, date)
+        if row is None:  # capture without a prior prediction (e.g. fresh install)
+            row = {"date": date, "predicted_kwh": None, "predicted_minutes": None}
+            rows.append(row)
+            del rows[:-MAX_TRAINING_ROWS]
+
+        valid = is_valid_delivery(actual_kwh)
+        row["actual_kwh"] = round(actual_kwh, 3) if actual_kwh is not None else None
+        row["data_quality"] = valid
+        if actual_kwh is None:
+            return
+
+        actual_minutes = round(kwh_to_minutes(actual_kwh, cfg.rated_power_kw))
+        row["actual_minutes"] = actual_minutes
+        predicted_minutes = row.get("predicted_minutes")
+        if predicted_minutes is not None:
+            error = abs(predicted_minutes - actual_minutes)
+            row["abs_error_minutes"] = error
+            if valid:  # only learn from plausible days
+                errors = self.eval_errors.setdefault(subentry_id, [])
+                errors.append(error)
+                del errors[:-MAX_TRAINING_ROWS]
+
+        predicted_kwh = row.get("predicted_kwh")
+        if valid and predicted_kwh:
+            self.models[subentry_id] = apply_observation(
+                self.model_for(subentry_id), predicted_kwh, actual_kwh
+            )
+
+    @staticmethod
+    def _row_for_date(rows: list[dict], date: str) -> dict | None:
+        for row in rows:
+            if row.get("date") == date:
+                return row
+        return None
+
+    def _last_completed(self, subentry_id: str) -> dict | None:
+        """Most recent training row that has an actual delivery."""
+        for row in reversed(self.training.get(subentry_id, [])):
+            if row.get("actual_kwh") is not None:
+                return row
+        return None
+
+    # ── prediction / published results ──────────────────────────────────────────
+
+    def _build_results(self) -> dict[str, LoadResult]:
+        """Compute the published forecast + metrics for every load."""
         results: dict[str, LoadResult] = {}
         for subentry_id, cfg in self.load_configs().items():
             state = self.model_for(subentry_id)
@@ -165,15 +279,17 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
                 max_minutes=cfg.max_minutes,
             )
             errors = self.eval_errors.get(subentry_id, [])[-EVAL_WINDOW_DAYS:]
-            prev = self._results.get(subentry_id, LoadResult())
+            completed = self._last_completed(subentry_id)
             results[subentry_id] = LoadResult(
                 predicted_minutes=minutes,
                 predicted_kwh=round(kwh, 3),
-                last_delivered_kwh=prev.last_delivered_kwh,
-                prediction_error_minutes=prev.prediction_error_minutes,
+                last_delivered_kwh=completed.get("actual_kwh") if completed else None,
+                prediction_error_minutes=completed.get("abs_error_minutes") if completed else None,
                 rolling_mae_minutes=round(rolling_mae(errors), 1) if errors else None,
                 sample_count=state.sample_count,
-                last_push_ok=prev.last_push_ok,
+                last_push_ok=self._push_ok.get(subentry_id),
             )
-        self._results = results
         return results
+
+    async def _async_update_data(self) -> dict[str, LoadResult]:
+        return self._build_results()

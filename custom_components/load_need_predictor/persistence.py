@@ -44,6 +44,10 @@ class PredictorStore:
         """Debounced save; ``snapshot`` is called when the write actually fires."""
         self._store.async_delay_save(snapshot, SAVE_DELAY)
 
+    async def async_save_now(self, data: dict) -> None:
+        """Write immediately, bypassing the debounce (shutdown / explicit flush)."""
+        await self._store.async_save(data)
+
 
 def model_to_dict(state: ModelState) -> dict:
     """Serialise a :class:`ModelState` for the Store."""
