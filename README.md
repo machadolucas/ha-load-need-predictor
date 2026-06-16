@@ -61,6 +61,63 @@ predicted_min  = clamp( predicted_kWh / rated_kW × 60 , min , max )
   energy from the recorder, completes the training row, updates the calibration
   gain, and recomputes the evaluation metrics.
 
+### How the runtime is calculated (worked example)
+
+**Occupancy is read as a point-in-time snapshot at the predict time** (default
+14:00 local) — *not* a daily maximum, and *not* duration-weighted. At that instant
+the predictor counts how many of the load's configured `person.*` entities are
+`home`:
+
+- `home` → counts as 1; `not_home` or a zone name (e.g. `Tampere`) → 0;
+  `unknown`/`unavailable` → counted as present (conservative — never under-serve).
+- So a second resident who was home for 12 h but is **away at 14:00 contributes 0**;
+  one who is **home at 14:00 contributes a full +1**, even if only briefly.
+  Duration and the day's peak headcount are not considered — only presence at the
+  snapshot. (`guests_present` is likewise the guests-calendar state at that
+  instant: one flat bonus, regardless of how many guests.)
+
+That snapshot feeds the formula above. With the **seed** parameters and a 3 kW
+heater (so kWh → minutes is `kWh ÷ 3 × 60`), each factor contributes:
+
+| Factor | Energy | ≈ Runtime at 3 kW |
+|---|---|---|
+| Base `E_base` (standby + minimal use) | 3.0 kWh | ~60 min |
+| **Each person home at the snapshot** | +2.2 kWh each | **+44 min each** |
+| Guests active | +2.5 kWh | +50 min |
+| Nobody home (base scaled by 0.4) | 1.2 kWh | ~24 min → floored |
+
+Putting it together (seed values, `gain = 1.0`, clamp 40–240 min, rounded to 15):
+
+| Occupancy at 14:00 | Predicted kWh | Pushed runtime |
+|---|---|---|
+| Nobody home | 1.2 | **45 min** (safety floor) |
+| 1 person | 5.2 | **105 min** |
+| 2 people | 7.4 | **150 min** |
+| 1 person + guests | 7.7 | **150 min** |
+| 2 people + guests | 9.9 | **195 min** |
+
+Two things then adjust these numbers over time:
+
+- **Calibration gain** (`× gain`; starts 1.0, clamped 0.7–1.5, ~6-day EWMA
+  half-life) nudges the whole prediction toward your *actual* delivered energy —
+  if the model runs ~10 % hot, the gain drifts toward ~0.9 and every figure above
+  scales down ~10 %.
+- **Refit** — once ≥14 clean days are logged, `E_base` and `E_draw_per_person`
+  are re-fit from *your own* `actual_kWh` vs `people_home` history (blended toward
+  the seeds by sample count). So "+44 min per person" is only the starting point;
+  it becomes whatever your household's data says.
+
+**Why a snapshot rather than duration-weighting?** Daily hot-water energy is
+dominated by stochastic draw, so a richer occupancy measure buys little — the gain
+and the refit absorb systematic bias, and a single presence snapshot is simple and
+robust. It's a deliberate v1 choice; a future version could use a coming-day
+occupancy forecast or time-weighted presence.
+
+> The **pushed** target (and the row logged for training) uses the 14:00 snapshot.
+> `sensor.<load>_predicted_runtime` is recomputed on every coordinator refresh
+> (predict, capture, restart), so it reflects occupancy at the latest refresh — the
+> 14:00 push is the authoritative daily figure.
+
 ## Entities (per load)
 
 | Entity | Meaning |
