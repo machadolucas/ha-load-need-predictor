@@ -3,13 +3,20 @@
 [![hacs](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Home Assistant custom integration that predicts **how much** a flexible load
-needs to run each day — starting with a hot-water heater (LVV) — and pushes that
-target into the [Load Scheduler](https://github.com/machadolucas/ha-load-scheduler)
-integration, which decides **when** (cheapest / greenest slots).
+A Home Assistant custom integration with two forecasting capabilities that feed
+the [Load Scheduler](https://github.com/machadolucas/ha-load-scheduler):
 
-It replaces "set the runtime by hunch" with a small, explainable, self-improving
-model.
+1. **Load-need prediction** — predicts *how much* a flexible load (the hot-water
+   heater first) needs to run each day, and pushes that target to the scheduler,
+   which decides *when* (cheapest / greenest slots). Replaces "set the runtime by
+   hunch" with a small, explainable, self-improving model.
+2. **Beyond-horizon price forecast** — estimates electricity prices for the day
+   *after* tomorrow (past Nord Pool's day-ahead horizon) from Finland's wind +
+   temperature forecasts, published as the scheduler's `forecast_price_entity` so
+   a load with a multi-day horizon can defer an expensive 24 h to a
+   forecast-cheaper one.
+
+Both forecast the *forecastable* thing — never day-to-day hot-water demand.
 
 > **Status: alpha.** Install as a HACS custom repository (below). Backed by an
 > extensive test suite.
@@ -64,6 +71,27 @@ predicted_min  = clamp( predicted_kWh / rated_kW × 60 , min , max )
 | `sensor.<load>_prediction_error` | Yesterday's \|predicted − actual\| in minutes. |
 | `sensor.<load>_rolling_mae` | Rolling mean absolute error (minutes) over the evaluation window. |
 | `sensor.<load>_sample_count` | How many self-logged days the model has learned from. |
+
+## Beyond-horizon price forecast
+
+Nord Pool only publishes prices through tomorrow. This capability estimates the
+*day after* (and beyond) so the scheduler can plan further out.
+
+Add a **price forecast** subentry and point it at: your actual buy-price sensor
+(€/kWh, for fitting + evaluation), the Finland wind-production forecast sensor,
+a `weather` entity (daily temperature forecast), and an outdoor-temperature
+sensor (history for fitting). It publishes one `sensor.<name>_price_forecast`
+whose attributes carry a `data_today` list of `{start, end, buy}` slots — the
+exact shape Nord Pool sensors use — covering roughly the next few days. Set that
+sensor as the scheduler's `forecast_price_entity` and tune its confidence margin.
+
+**Model.** A small, explainable regression of daily price on wind + temperature
+with a **cold-weather interaction**, fit on long-term statistics. On ~356 days
+(incl. a full winter): more wind ⇒ lower price (r ≈ −0.23, −0.49 below −5 °C),
+colder ⇒ higher price (r ≈ −0.45), jointly R² ≈ 0.37 — so the model leans on
+temperature most in the cold and on wind most in the cold band. Daily price is
+expanded into flat hourly slots; the scheduler's margin absorbs the coarseness.
+`sensor.<name>_forecast_mae` / `_forecast_error` log forecast-vs-actual price.
 
 ## Installation
 

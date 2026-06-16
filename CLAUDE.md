@@ -46,27 +46,50 @@ floor. Temperature/water are **logged only**, not used in the prediction.
 
 ## Architecture
 
-- **Hub config entry** — the global predict/capture schedule + the coordinator.
-- **One config *subentry* per load** — its sensors, its scheduler-target link, its
-  delivery/occupancy sources, its clamp. The `ConfigSubentry` API is relatively
-  new; the `homeassistant` floor in `hacs.json` tracks it.
+- **Hub config entry** — the global predict/capture schedule + both coordinators
+  (held in `runtime.RuntimeData` on `entry.runtime_data`).
+- **`load` subentries** — each one's sensors, scheduler-target link,
+  delivery/occupancy sources, clamp.
+- **A `price_forecast` subentry** — the beyond-horizon price forecaster (its
+  inputs, the published `data_today` sensor, accuracy metrics).
+
+The two capabilities share only the hub's two daily times; their state and tests
+are otherwise independent. The `ConfigSubentry` API is relatively new; the
+`homeassistant` floor in `hacs.json` tracks it.
 
 ### Modules (`custom_components/load_need_predictor/`)
 
 | File | Role | HA? |
 |---|---|---|
-| `predictor.py` | **Pure** model: features → kWh → minutes, seeds, gain EWMA, prior↔empirical blend, rolling MAE | no |
-| `features.py` | **Pure** feature assembly from a raw snapshot dict | no |
-| `models.py` | Subentry config → frozen `LoadConfig` dataclass | no |
-| `statistics_source.py` | Read long-term statistics via the recorder (daily `change` / `mean`) | yes |
+| `predictor.py` | **Pure** load model: features → kWh → minutes, seeds, gain EWMA, prior↔empirical blend, `build_features`, rolling MAE | no |
+| `price_model.py` | **Pure** price model: ridge regression of price on wind+temp with a cold interaction; seed fallback; fit/predict/serialize | no |
+| `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig` | no |
+| `statistics_source.py` | Load delivery from the recorder (daily `change`) | yes |
+| `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price | yes |
 | `occupancy.py` | Sample `person.*` + guests calendar (no LTS to mine) | yes |
-| `persistence.py` | `Store` for model state + self-logged training rows + eval ring | yes |
+| `persistence.py` | `Store` (load: model+training+eval; forecast uses a `.forecast` file) | yes |
 | `actuation.py` | Resilient `number.set_value` push to the scheduler target | yes |
-| `jobs.py` | The two daily jobs (predict+push, capture+log), `async_track_time_change` | yes |
-| `coordinator.py` | On-demand `DataUpdateCoordinator`; holds per-load `LoadResult` | yes |
-| `config_flow.py` | Hub flow + per-load subentry wizard; both reconfigurable | yes |
-| `entity.py` / `sensor.py` | Entity base + the per-load sensors | yes |
-| `diagnostics.py` | Redacted diagnostics dump | yes |
+| `jobs.py` | The two daily jobs; drives both coordinators | yes |
+| `coordinator.py` | Load `DataUpdateCoordinator`; per-load `LoadResult` | yes |
+| `forecast_coordinator.py` | Price-forecast coordinator: fit → build slots → evaluate; `ForecastResult` | yes |
+| `runtime.py` | `RuntimeData` (both coordinators) + the `ConfigEntry` type alias | yes |
+| `config_flow.py` | Hub flow + `load` and `price_forecast` subentry wizards | yes |
+| `entity.py` / `sensor.py` | Entity bases + per-load and price-forecast sensors | yes |
+| `diagnostics.py` | Redacted diagnostics dump (loads + forecasts) | yes |
+
+## The price forecast (read before touching `price_model.py`)
+
+- **`price_model.py` must stay Home-Assistant-free** (importlib-tested like
+  `predictor.py`). Output contract for the scheduler: a `data_today` attribute of
+  `{start, end, buy}` slots — **tz-aware ISO** starts, `buy` in **€/kWh** — for
+  times beyond the real horizon; the scheduler ignores overlap and adds its own
+  `forecast_price_margin`.
+- Features `[temp, wind, cold_hinge, wind×cold_hinge]`, `cold_hinge = max(0,−temp)`;
+  wind in **GW** (the sensor's series is GW but its state/LTS is MW — normalise).
+  Fit daily on LTS (price/temp/wind), seed formula until enough history.
+- Forecast *price/opportunity, not demand*: treat the tank as a buffer and let
+  the scheduler shift discretionary heating into the forecast-cheap window; the
+  minimum-service floor is the safety net.
 
 ## The model contract (read before touching `predictor.py`)
 
