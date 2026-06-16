@@ -8,6 +8,10 @@
           "name": "Name",
           "predict_time": "Predict + push time",
           "capture_time": "Capture + log time"
+        },
+        "data_description": {
+          "predict_time": "Time of day to compute the prediction and push it to the scheduler target — set it just after tomorrow's day-ahead prices publish.",
+          "capture_time": "Time of day to record the day's actual delivered energy as a training sample (typically end of day)."
         }
       },
       "reconfigure": {
@@ -16,6 +20,10 @@
           "name": "Name",
           "predict_time": "Predict + push time",
           "capture_time": "Capture + log time"
+        },
+        "data_description": {
+          "predict_time": "Time of day to compute the prediction and push it to the scheduler target — set it just after tomorrow's day-ahead prices publish.",
+          "capture_time": "Time of day to record the day's actual delivered energy as a training sample (typically end of day)."
         }
       }
     }
@@ -44,6 +52,19 @@
             "water_total_entity": "Household water total (log-only)",
             "min_minutes": "Minimum minutes/day (safety floor)",
             "max_minutes": "Maximum minutes/day (cap)"
+          },
+          "data_description": {
+            "target_number_entity": "The Load Scheduler target number this predictor drives (e.g. number.water_heater_lvv_target_runtime). The prediction is written here.",
+            "delivered_energy_entity": "Energy delivered to the load (kWh, total/increasing). Its day-to-day change is the training signal.",
+            "delivered_runtime_entity": "Optional run-time sensor; used as the delivered signal instead of energy ÷ rated power when run-time is the better measure.",
+            "rated_power_kw": "The load's power draw, used to convert predicted energy (kWh) into a run-time (minutes) for the scheduler target.",
+            "person_entities": "People whose presence shifts demand (home vs away).",
+            "guests_calendar_entity": "Calendar marking guest visits — raises predicted demand while an event is active.",
+            "supply_temp_entity": "Incoming mains-water temperature. Logged for a future model; not used in the current prediction.",
+            "outdoor_temp_entity": "Outdoor temperature. Logged for a future model; not used in the current prediction.",
+            "water_total_entity": "Household water-meter total. Logged for a future model; not used in the current prediction.",
+            "min_minutes": "Lower clamp on the pushed target — a safety floor so the load never starves.",
+            "max_minutes": "Upper clamp on the pushed target — a cap so a bad prediction can't over-run the load."
           }
         }
       }
@@ -66,6 +87,14 @@
             "temp_history_entity": "Outdoor temperature sensor (for fitting)",
             "forecast_days": "Days ahead to publish",
             "fit_days": "History window to fit on (days)"
+          },
+          "data_description": {
+            "price_entity": "Your real all-in buy-price sensor (€/kWh). The model is fit on its history and its accuracy is evaluated against it.",
+            "wind_entity": "Finland wind-production forecast sensor — more wind generally means lower prices.",
+            "weather_entity": "Weather entity providing the daily temperature forecast — colder means higher prices, especially in deep cold.",
+            "temp_history_entity": "Outdoor temperature sensor whose recorded history is used to fit the price model.",
+            "forecast_days": "How many days ahead to publish the price estimate (beyond Nord Pool's day-ahead horizon).",
+            "fit_days": "How many days of history to fit the price model on."
           }
         }
       }
