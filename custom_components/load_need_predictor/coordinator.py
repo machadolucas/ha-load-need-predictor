@@ -31,7 +31,7 @@ from .const import (
     SUBENTRY_TYPE_LOAD,
 )
 from .models import LoadConfig, load_config_from_data
-from .occupancy import count_people_home, guests_active
+from .occupancy import async_count_residents_home, async_guest_equivalents
 from .persistence import PredictorStore, model_from_dict, model_to_dict
 from .predictor import (
     SEED_E_BASE,
@@ -136,16 +136,17 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         except (TypeError, ValueError):
             return None
 
-    def build_snapshot(self, cfg: LoadConfig) -> dict:
-        """Assemble the feature snapshot for the coming cycle from live state.
+    async def async_build_snapshot(self, cfg: LoadConfig) -> dict:
+        """Assemble the feature snapshot for the coming cycle.
 
-        v1 uses the current occupancy + guests; the temps are read for logging
-        only (the model ignores them).
+        Occupancy is duration-based (residents home for most of the trailing day;
+        guests weighted by visit length — see ``occupancy``), not a point-in-time
+        snapshot. Temps are read for logging only (the model ignores them).
         """
         now = dt_util.now()
         return {
-            "people_home": count_people_home(self.hass, cfg.person_entities),
-            "guests": guests_active(self.hass, cfg.guests_calendar_entity),
+            "people_home": await async_count_residents_home(self.hass, cfg.person_entities),
+            "guests": await async_guest_equivalents(self.hass, cfg.guests_calendar_entity),
             "weekend": now.weekday() >= 5,
             "supply_temp": self._state_float(cfg.supply_temp_entity),
             "outdoor_temp": self._state_float(cfg.outdoor_temp_entity),
@@ -159,7 +160,7 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         today = dt_util.now().date().isoformat()
         for subentry_id, cfg in self.load_configs().items():
             state = self.model_for(subentry_id)
-            features = build_features(self.build_snapshot(cfg))
+            features = build_features(await self.async_build_snapshot(cfg))
             minutes = predict_minutes(
                 state,
                 features,
@@ -303,12 +304,12 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
 
     # ── prediction / published results ──────────────────────────────────────────
 
-    def _build_results(self) -> dict[str, LoadResult]:
+    async def _build_results(self) -> dict[str, LoadResult]:
         """Compute the published forecast + metrics for every load."""
         results: dict[str, LoadResult] = {}
         for subentry_id, cfg in self.load_configs().items():
             state = self.model_for(subentry_id)
-            features = build_features(self.build_snapshot(cfg))
+            features = build_features(await self.async_build_snapshot(cfg))
             kwh = predict_kwh(state, features)
             minutes = predict_minutes(
                 state,
@@ -331,4 +332,4 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         return results
 
     async def _async_update_data(self) -> dict[str, LoadResult]:
-        return self._build_results()
+        return await self._build_results()

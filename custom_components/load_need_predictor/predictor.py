@@ -71,10 +71,15 @@ class FeatureVector:
     Only ``people_home`` and ``guests`` drive the v1 model; the remaining fields
     are recorded for evaluation and a future weather-aware model but are not read
     by :func:`predict_kwh`.
+
+    ``people_home`` is a count of residents (see ``occupancy`` for how it's
+    measured — residents home for most of the trailing day). ``guests`` is a
+    *guest-equivalent weight* (not a 0/1 flag): e.g. 0 for none, ~0.5 for a short
+    visit, ~2.0 for a long one. The model multiplies ``guest_bonus`` by it.
     """
 
     people_home: int
-    guests: bool = False
+    guests: float = 0.0
     weekend: bool = False
     # Log-only context (None when the source sensor is missing/unavailable).
     supply_temp: float | None = None
@@ -113,7 +118,7 @@ def build_features(snapshot: dict) -> FeatureVector:
     people = 1 if people is None else max(0, int(people))
     return FeatureVector(
         people_home=people,
-        guests=bool(snapshot.get("guests", False)),
+        guests=_opt_float(snapshot.get("guests")) or 0.0,
         weekend=bool(snapshot.get("weekend", False)),
         supply_temp=_opt_float(snapshot.get("supply_temp")),
         outdoor_temp=_opt_float(snapshot.get("outdoor_temp")),
@@ -138,8 +143,9 @@ def predict_kwh(state: ModelState, features: FeatureVector) -> float:
     occupancy_factor = 1.0 if people > 0 else state.empty_house_factor
     base = state.e_base + state.e_draw_per_person * people
     kwh = occupancy_factor * base
-    if features.guests:
-        kwh += state.guest_bonus
+    # guests is a guest-equivalent weight (0 / ~0.5 short visit / ~2.0 long visit),
+    # so the bonus scales with how much the guests are expected to draw.
+    kwh += state.guest_bonus * max(0.0, features.guests)
     kwh *= state.gain
     return max(0.0, kwh)
 

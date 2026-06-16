@@ -48,7 +48,7 @@ def test_build_features_maps_and_coerces():
     fv = predictor.build_features(
         {
             "people_home": 2,
-            "guests": True,
+            "guests": 0.5,
             "weekend": True,
             "supply_temp": "12.5",
             "outdoor_temp": 9,
@@ -57,7 +57,7 @@ def test_build_features_maps_and_coerces():
         }
     )
     assert fv.people_home == 2
-    assert fv.guests is True
+    assert fv.guests == 0.5  # guest-equivalent weight (no longer a 0/1 flag)
     assert fv.weekend is True
     assert fv.supply_temp == 12.5
     assert fv.outdoor_temp == 9.0
@@ -69,7 +69,7 @@ def test_build_features_missing_occupancy_assumes_one_person():
     # Conservative: unknown occupancy must not under-serve the tank.
     fv = predictor.build_features({})
     assert fv.people_home == 1
-    assert fv.guests is False
+    assert fv.guests == 0.0
     assert fv.supply_temp is None
 
 
@@ -99,11 +99,21 @@ def test_predict_kwh_empty_house_scales_base():
     assert kwh == pytest.approx(0.4 * 3.0)  # 1.2
 
 
-def test_predict_kwh_guests_add_bonus():
+def test_predict_kwh_guests_scale_with_weight():
+    # guests is a guest-equivalent weight: the bonus scales with it.
     s = predictor.default_model_state()
-    without = predictor.predict_kwh(s, FeatureVector(people_home=2, guests=False))
-    with_guests = predictor.predict_kwh(s, FeatureVector(people_home=2, guests=True))
-    assert with_guests - without == pytest.approx(2.5)
+    base = predictor.predict_kwh(s, FeatureVector(people_home=2, guests=0.0))
+    short = predictor.predict_kwh(s, FeatureVector(people_home=2, guests=0.5))
+    long = predictor.predict_kwh(s, FeatureVector(people_home=2, guests=2.0))
+    assert short - base == pytest.approx(0.5 * 2.5)  # short visit ≈ +1.25 kWh
+    assert long - base == pytest.approx(2.0 * 2.5)  # long visit ≈ +5.0 kWh
+
+
+def test_predict_kwh_negative_guests_ignored():
+    s = predictor.default_model_state()
+    assert predictor.predict_kwh(
+        s, FeatureVector(people_home=1, guests=-1.0)
+    ) == predictor.predict_kwh(s, FeatureVector(people_home=1, guests=0.0))
 
 
 def test_predict_kwh_monotonic_in_people():

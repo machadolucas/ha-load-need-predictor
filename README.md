@@ -63,38 +63,45 @@ predicted_min  = clamp( predicted_kWh / rated_kW × 60 , min , max )
 
 ### How the runtime is calculated (worked example)
 
-**Occupancy is read as a point-in-time snapshot at the predict time** (default
-14:00 local) — *not* a daily maximum, and *not* duration-weighted. At that instant
-the predictor counts how many of the load's configured `person.*` entities are
-`home`:
+Occupancy is measured by **duration**, not a point-in-time snapshot — so being out
+at a meeting when the prediction runs doesn't drop you from the count.
 
-- `home` → counts as 1; `not_home` or a zone name (e.g. `Tampere`) → 0;
-  `unknown`/`unavailable` → counted as present (conservative — never under-serve).
-- So a second resident who was home for 12 h but is **away at 14:00 contributes 0**;
-  one who is **home at 14:00 contributes a full +1**, even if only briefly.
-  Duration and the day's peak headcount are not considered — only presence at the
-  snapshot. (`guests_present` is likewise the guests-calendar state at that
-  instant: one flat bonus, regardless of how many guests.)
+- **Residents** (`people_home`): the number of configured `person.*` entities that
+  were `home` for **at least 12 h over the trailing 24 h**. A regular occupant who
+  slept home and is out for a daytime meeting still clears 12 h and counts; someone
+  genuinely travelling (away overnight) does not. Only `home` counts (`not_home`
+  or a zone name like `Tampere` → away); `unknown`/`unavailable` or no recorder →
+  treated as present (conservative — never under-serve).
+- **Guests**: weighted by **visit length**, from the guests calendar's events in
+  the next 24 h. No visit → 0; a **short visit (< 6 h)** → **0.5** guest-equivalents
+  (a dinner — little hot water); a **long visit (≥ 6 h, or all-day)** → **2.0**
+  guest-equivalents (likely a sauna + showers, possibly several guests — we
+  deliberately over-provision so guests never run the tank cold). The longest event
+  in the window decides the weight.
 
-That snapshot feeds the formula above. With the **seed** parameters and a 3 kW
-heater (so kWh → minutes is `kWh ÷ 3 × 60`), each factor contributes:
+These feed the formula above. With the **seed** parameters and a 3 kW heater (so
+kWh → minutes is `kWh ÷ 3 × 60`), each factor contributes:
 
 | Factor | Energy | ≈ Runtime at 3 kW |
 |---|---|---|
 | Base `E_base` (standby + minimal use) | 3.0 kWh | ~60 min |
-| **Each person home at the snapshot** | +2.2 kWh each | **+44 min each** |
-| Guests active | +2.5 kWh | +50 min |
+| **Each resident home ≥ 12 h of the last 24 h** | +2.2 kWh each | **+44 min each** |
+| Short guest visit (< 6 h → 0.5 ×) | +1.25 kWh | +25 min |
+| Long guest visit (≥ 6 h → 2.0 ×) | +5.0 kWh | +100 min |
 | Nobody home (base scaled by 0.4) | 1.2 kWh | ~24 min → floored |
 
 Putting it together (seed values, `gain = 1.0`, clamp 40–240 min, rounded to 15):
 
-| Occupancy at 14:00 | Predicted kWh | Pushed runtime |
+| Occupancy over the trailing/upcoming day | Predicted kWh | Pushed runtime |
 |---|---|---|
-| Nobody home | 1.2 | **45 min** (safety floor) |
-| 1 person | 5.2 | **105 min** |
-| 2 people | 7.4 | **150 min** |
-| 1 person + guests | 7.7 | **150 min** |
-| 2 people + guests | 9.9 | **195 min** |
+| Nobody home ≥ 12 h | 1.2 | **45 min** (safety floor) |
+| 1 resident | 5.2 | **105 min** |
+| 2 residents | 7.4 | **150 min** |
+| 2 residents + short guest (< 6 h) | 8.65 | **180 min** |
+| 2 residents + long guest (≥ 6 h) | 12.4 | **240 min** (hits the cap) |
+
+(The last row shows the cap doing its job — raise *Maximum minutes/day* on the load
+if you want long-guest days to reheat even more.)
 
 Two things then adjust these numbers over time:
 
@@ -107,16 +114,11 @@ Two things then adjust these numbers over time:
   the seeds by sample count). So "+44 min per person" is only the starting point;
   it becomes whatever your household's data says.
 
-**Why a snapshot rather than duration-weighting?** Daily hot-water energy is
-dominated by stochastic draw, so a richer occupancy measure buys little — the gain
-and the refit absorb systematic bias, and a single presence snapshot is simple and
-robust. It's a deliberate v1 choice; a future version could use a coming-day
-occupancy forecast or time-weighted presence.
-
-> The **pushed** target (and the row logged for training) uses the 14:00 snapshot.
-> `sensor.<load>_predicted_runtime` is recomputed on every coordinator refresh
-> (predict, capture, restart), so it reflects occupancy at the latest refresh — the
-> 14:00 push is the authoritative daily figure.
+> Residents look at the **trailing 24 h** (history); guests look at the **next
+> 24 h** (calendar). The **pushed** target — and the row logged for training — is
+> computed at the predict time; `sensor.<load>_predicted_runtime` is recomputed on
+> every coordinator refresh (predict, capture, restart). Thresholds (12 h, 6 h) and
+> the guest weights (0.5 / 2.0) live in `occupancy.py`.
 
 ## Entities (per load)
 

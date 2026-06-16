@@ -66,7 +66,7 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig` | no |
 | `statistics_source.py` | Load delivery from the recorder (daily `change`) | yes |
 | `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price | yes |
-| `occupancy.py` | Sample `person.*` + guests calendar (no LTS to mine) | yes |
+| `occupancy.py` | Duration-based occupancy: residents home ≥12 h over the trailing 24 h (from history) + guests weighted by visit length (next-24 h calendar); instantaneous fallbacks | yes |
 | `persistence.py` | `Store` (load: model+training+eval; forecast uses a `.forecast` file) | yes |
 | `actuation.py` | Resilient `number.set_value` push to the scheduler target | yes |
 | `jobs.py` | The two daily jobs; drives both coordinators | yes |

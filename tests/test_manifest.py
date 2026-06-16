@@ -21,7 +21,7 @@ def _manifest() -> dict:
 def test_manifest_domain_and_version():
     data = _manifest()
     assert data["domain"] == "load_need_predictor"
-    assert data["version"] == "0.2.1"  # HACS requires a version string
+    assert data["version"] == "0.3.0"  # HACS requires a version string
     assert data["config_flow"] is True
 
 
