@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.egg-info/
+.mypy_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Temporary: pushing these needs a GitHub token with `workflow` scope (or an
+# SSH key). The files exist locally; remove this block and commit them once
+# that's configured. See README/CLAUDE notes. Mirrors the ha-load-scheduler repo.
+/.github/workflows/

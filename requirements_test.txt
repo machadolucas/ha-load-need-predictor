@@ -1,0 +1,7 @@
+# Test + lint dependencies (CI). The pure-model tests need only pytest;
+# pytest-homeassistant-custom-component pulls Home Assistant for the HA-side
+# tests added from M2 onward.
+pytest>=8.0
+pytest-cov>=5.0
+pytest-homeassistant-custom-component
+ruff>=0.6

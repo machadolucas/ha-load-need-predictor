@@ -1,0 +1,14 @@
+{
+  "domain": "load_need_predictor",
+  "name": "Load Need Predictor",
+  "after_dependencies": ["load_scheduler"],
+  "codeowners": ["@machadolucas"],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/machadolucas/ha-load-need-predictor",
+  "integration_type": "hub",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/machadolucas/ha-load-need-predictor/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

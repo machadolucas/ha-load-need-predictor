@@ -1,0 +1,19 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Pure tests (test_predictor / test_features / test_models) load their module via
+# importlib and need only pytest. The HA-side tests under tests/ha/ use
+# pytest-homeassistant-custom-component (Python 3.13 — HA does not support 3.14).
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+  "B008",   # function calls in argument defaults (HA selector pattern)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components.load_need_predictor"]
