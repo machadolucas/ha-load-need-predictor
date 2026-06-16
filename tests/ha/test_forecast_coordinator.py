@@ -78,6 +78,15 @@ async def _setup(hass: HomeAssistant, forecast_days: int = 2):
     return entry, entry.runtime_data.forecast
 
 
+async def test_forecast_builds_on_setup(hass: HomeAssistant) -> None:
+    # No explicit build call: setup itself should populate the forecast (so the
+    # sensor isn't blank until the next predict time / after a restart).
+    entry, fc = await _setup(hass)
+    sid = next(iter(fc.forecast_configs()))
+    assert fc.slots.get(sid)  # non-empty
+    assert fc.data[sid].status == "ok"
+
+
 async def test_build_produces_scheduler_shaped_slots(hass: HomeAssistant) -> None:
     entry, fc = await _setup(hass, forecast_days=2)
     with patch(f"{_MOD}.async_fit_rows", new=AsyncMock(return_value=[])):  # no history → seed

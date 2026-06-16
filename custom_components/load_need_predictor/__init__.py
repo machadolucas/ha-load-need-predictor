@@ -46,6 +46,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigE
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+
+    # Build the price forecast once on setup so the sensor is populated
+    # immediately (and after every restart), not only at the next predict time.
+    # Backgrounded so a slow statistics fit never delays/fails setup.
+    if forecast.has_loads:
+        entry.async_create_background_task(
+            hass, forecast.async_build_forecast(), "lnp-initial-forecast"
+        )
     return True
 
 
