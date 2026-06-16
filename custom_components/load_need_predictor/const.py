@@ -67,6 +67,11 @@ SAVE_DELAY = 10  # seconds — debounce writes
 MAX_TRAINING_ROWS = 400  # cap the self-logged history (~13 months of daily rows)
 EVAL_WINDOW_DAYS = 30  # rolling window for the MAE / bias evaluation metrics
 
+# ── Structural refit (the prior → learned transition) ────────────────────────
+# Below this many clean, occupancy-labelled rows the seeds + online gain carry
+# the model; above it, blend in an empirical fit of E_base / E_draw_per_person.
+MIN_REFIT_SAMPLES = 14
+
 # ── Load Scheduler interop ───────────────────────────────────────────────────
 # Service used to push the predicted target (the only output path implemented in
 # load_scheduler v0.1.0; an external "target source" is planned but not yet live).

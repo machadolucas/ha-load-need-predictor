@@ -16,7 +16,7 @@ daily model is insensitive to the exact overnight offset.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -24,20 +24,30 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .actuation import async_push_target
-from .const import DOMAIN, EVAL_WINDOW_DAYS, MAX_TRAINING_ROWS, SUBENTRY_TYPE_LOAD
+from .const import (
+    DOMAIN,
+    EVAL_WINDOW_DAYS,
+    MAX_TRAINING_ROWS,
+    MIN_REFIT_SAMPLES,
+    SUBENTRY_TYPE_LOAD,
+)
 from .models import LoadConfig, load_config_from_data
 from .occupancy import count_people_home, guests_active
 from .persistence import PredictorStore, model_from_dict, model_to_dict
 from .predictor import (
+    SEED_E_BASE,
+    SEED_E_DRAW_PER_PERSON,
     FeatureVector,
     ModelState,
     apply_observation,
+    blend_param,
     build_features,
     default_model_state,
     is_valid_delivery,
     kwh_to_minutes,
     predict_kwh,
     predict_minutes,
+    refit_occupancy_params,
     rolling_mae,
 )
 from .statistics_source import async_daily_delivered_kwh
@@ -247,6 +257,37 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             self.models[subentry_id] = apply_observation(
                 self.model_for(subentry_id), predicted_kwh, actual_kwh
             )
+            self._maybe_refit(subentry_id)
+
+    def _maybe_refit(self, subentry_id: str) -> None:
+        """Blend in an empirical fit of E_base / E_draw once enough data exists.
+
+        Fits ``actual_kwh ~ people_home`` over the clean, occupancy-labelled rows
+        and blends the result toward the seeds by sample count (so the structure
+        shifts from prior to learned gradually). Needs occupancy variation —
+        otherwise ``refit_occupancy_params`` returns None and the seeds stand.
+        The online gain keeps handling any residual drift on top.
+        """
+        rows = [
+            r
+            for r in self.training.get(subentry_id, [])
+            if r.get("data_quality")
+            and r.get("actual_kwh") is not None
+            and r.get("people_home") is not None
+        ]
+        if len(rows) < MIN_REFIT_SAMPLES:
+            return
+        fit = refit_occupancy_params([(r["people_home"], r["actual_kwh"]) for r in rows])
+        if fit is None:
+            return
+        e_base_emp, e_draw_emp = fit
+        n = len(rows)
+        state = self.model_for(subentry_id)
+        self.models[subentry_id] = replace(
+            state,
+            e_base=blend_param(SEED_E_BASE, e_base_emp, n),
+            e_draw_per_person=blend_param(SEED_E_DRAW_PER_PERSON, e_draw_emp, n),
+        )
 
     @staticmethod
     def _row_for_date(rows: list[dict], date: str) -> dict | None:
