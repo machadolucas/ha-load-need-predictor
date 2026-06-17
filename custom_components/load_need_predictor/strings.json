@@ -112,6 +112,10 @@
       "forecast_error": { "name": "Forecast error" },
       "forecast_mae": { "name": "Forecast MAE" },
       "forecast_samples": { "name": "Forecast samples" }
+    },
+    "button": {
+      "predict_now": { "name": "Predict now" },
+      "forecast_now": { "name": "Update forecast now" }
     }
   }
 }

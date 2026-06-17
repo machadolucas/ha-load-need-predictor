@@ -155,10 +155,16 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
 
     # ── daily jobs (driven by jobs.py) ─────────────────────────────────────────
 
-    async def async_predict_and_push(self) -> None:
-        """Forecast each load, push the target, and record the prediction row."""
+    async def async_predict_and_push(self, only: str | None = None) -> None:
+        """Forecast each load, push the target, and record the prediction row.
+
+        ``only`` restricts the work to a single subentry (used by the per-load
+        "Predict now" button); the daily job passes nothing to do them all.
+        """
         today = dt_util.now().date().isoformat()
         for subentry_id, cfg in self.load_configs().items():
+            if only is not None and subentry_id != only:
+                continue
             state = self.model_for(subentry_id)
             features = build_features(await self.async_build_snapshot(cfg))
             minutes = predict_minutes(

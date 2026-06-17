@@ -130,6 +130,37 @@ Two things then adjust these numbers over time:
 | `sensor.<load>_prediction_error` | Yesterday's \|predicted − actual\| in minutes. |
 | `sensor.<load>_rolling_mae` | Rolling mean absolute error (minutes) over the evaluation window. |
 | `sensor.<load>_sample_count` | How many self-logged days the model has learned from. |
+| `button.<load>_predict_now` | Recompute the prediction and push it to the scheduler **now** (no need to wait for the daily predict time). |
+
+### When does it run? Publish time & DST
+
+The daily **predict + push** fires at the hub's `predict_time` (default 14:00) and
+**capture + log** at `capture_time`. These are tracked on the **local wall clock**,
+so they're DST-correct automatically — 14:00 stays 14:00 local across the spring/
+autumn transitions, never drifting by an hour.
+
+About Nord Pool's variable publish hour: the prediction **doesn't depend on the
+spot prices** — it answers *how much* (from occupancy) and writes the scheduler's
+target; the **scheduler** consumes the prices and re-plans *when* automatically
+whenever the prices or the target change. So the exact `predict_time` isn't
+critical: 14:00 local sits comfortably after the usual day-ahead publish, and if
+prices land late (or you change occupancy/guests), just hit **Predict now**.
+
+To react the moment prices publish — whatever hour that lands on — point an
+automation at the button using your Nord Pool "tomorrow prices available" sensor:
+
+```yaml
+automation:
+  - alias: "Re-predict LVV when tomorrow's prices publish"
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.nordpool_tomorrow_prices_availability
+        to: "on"
+    actions:
+      - action: button.press
+        target:
+          entity_id: button.lvv_predict_now
+```
 
 ## Beyond-horizon price forecast
 
@@ -143,6 +174,7 @@ sensor (history for fitting). It publishes one `sensor.<name>_price_forecast`
 whose attributes carry a `data_today` list of `{start, end, buy}` slots — the
 exact shape Nord Pool sensors use — covering roughly the next few days. Set that
 sensor as the scheduler's `forecast_price_entity` and tune its confidence margin.
+A `button.<name>_forecast_now` rebuilds the forecast on demand.
 
 **Model.** A small, explainable regression of daily price on wind + temperature
 with a **cold-weather interaction**, fit on long-term statistics. On ~356 days

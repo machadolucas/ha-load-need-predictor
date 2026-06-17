@@ -12,10 +12,10 @@ from homeassistant.const import Platform
 
 DOMAIN = "load_need_predictor"
 
-# Only sensors in v1: the predictor publishes its forecast + evaluation metrics
-# and drives the scheduler through a service call, so it owns no controllable
-# entities of its own.
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+# Sensors publish the forecast + evaluation metrics; the button is a manual
+# "predict / update now" trigger. The predictor drives the scheduler through a
+# service call, so it owns no controllable load entities of its own.
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BUTTON]
 
 # ── Hub config-entry keys ────────────────────────────────────────────────────
 CONF_NAME = "name"

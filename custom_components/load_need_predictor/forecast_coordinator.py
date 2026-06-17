@@ -110,10 +110,16 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
 
     # ── daily jobs ─────────────────────────────────────────────────────────────
 
-    async def async_build_forecast(self) -> None:
-        """Refit from LTS, then publish the beyond-horizon slots for each load."""
+    async def async_build_forecast(self, only: str | None = None) -> None:
+        """Refit from LTS, then publish the beyond-horizon slots for each load.
+
+        ``only`` restricts the work to a single subentry (used by the "Update
+        forecast now" button); the daily job passes nothing to do them all.
+        """
         today_start = dt_util.start_of_local_day()
         for subentry_id, cfg in self.forecast_configs().items():
+            if only is not None and subentry_id != only:
+                continue
             await self._build_one(subentry_id, cfg, today_start)
         self.async_persist()
         await self.async_refresh()

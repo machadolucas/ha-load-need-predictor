@@ -74,7 +74,8 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `forecast_coordinator.py` | Price-forecast coordinator: fit → build slots → evaluate; `ForecastResult` | yes |
 | `runtime.py` | `RuntimeData` (both coordinators) + the `ConfigEntry` type alias | yes |
 | `config_flow.py` | Hub flow + `load` and `price_forecast` subentry wizards | yes |
-| `entity.py` / `sensor.py` | Entity bases + per-load and price-forecast sensors | yes |
+| `entity.py` | `PredictorEntity` (load) + `ForecastEntity` bases | yes |
+| `sensor.py` / `button.py` | Per-load + price-forecast sensors; "predict/forecast now" buttons | yes |
 | `diagnostics.py` | Redacted diagnostics dump (loads + forecasts) | yes |
 
 ## The price forecast (read before touching `price_model.py`)

@@ -20,13 +20,11 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import UnitOfEnergy, UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SUBENTRY_TYPE_LOAD, SUBENTRY_TYPE_PRICE_FORECAST
-from .entity import PredictorEntity
-from .forecast_coordinator import ForecastResult, PriceForecastCoordinator
+from .const import SUBENTRY_TYPE_LOAD, SUBENTRY_TYPE_PRICE_FORECAST
+from .entity import ForecastEntity, PredictorEntity
+from .forecast_coordinator import ForecastResult
 from .runtime import LoadNeedPredictorConfigEntry
 
 _EUR_PER_KWH = "€/kWh"
@@ -177,31 +175,7 @@ class PredictorSensor(PredictorEntity, SensorEntity):
         return self.entity_description.value_fn(result)
 
 
-class _ForecastEntity(CoordinatorEntity[PriceForecastCoordinator]):
-    """Base for the price-forecast subentry's sensors (one subentry = one device)."""
-
-    _attr_has_entity_name = True
-
-    def __init__(self, coordinator, subentry_id, subentry, key) -> None:
-        super().__init__(coordinator)
-        self._subentry_id = subentry_id
-        self._attr_unique_id = f"{subentry_id}_{key}"
-        self._attr_translation_key = key
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, subentry_id)},
-            name=subentry.title,
-            manufacturer="Load Need Predictor",
-            entry_type=DeviceEntryType.SERVICE,
-        )
-
-    @property
-    def _result(self) -> ForecastResult | None:
-        if self.coordinator.data is None:
-            return None
-        return self.coordinator.data.get(self._subentry_id)
-
-
-class PriceForecastSensor(_ForecastEntity, SensorEntity):
+class PriceForecastSensor(ForecastEntity, SensorEntity):
     """The headline forecast: state = mean predicted price; attrs = scheduler slots."""
 
     _attr_native_unit_of_measurement = _EUR_PER_KWH
@@ -233,7 +207,7 @@ class PriceForecastSensor(_ForecastEntity, SensorEntity):
         }
 
 
-class ForecastValueSensor(_ForecastEntity, SensorEntity):
+class ForecastValueSensor(ForecastEntity, SensorEntity):
     """One forecast-accuracy metric from the ForecastResult."""
 
     entity_description: ForecastSensorDescription
