@@ -42,6 +42,7 @@ from .predictor import (
     blend_param,
     build_features,
     default_model_state,
+    explain_load,
     is_valid_delivery,
     kwh_to_minutes,
     predict_kwh,
@@ -66,6 +67,8 @@ class LoadResult:
     rolling_mae_minutes: float | None = None
     sample_count: int = 0
     last_push_ok: bool | None = None
+    # The prediction broken into its terms, for the dashboard card's rationale.
+    rationale: dict | None = None
 
 
 class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]]):
@@ -326,6 +329,13 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             )
             errors = self.eval_errors.get(subentry_id, [])[-EVAL_WINDOW_DAYS:]
             completed = self._last_completed(subentry_id)
+            rationale = explain_load(
+                state,
+                features,
+                rated_power_kw=cfg.rated_power_kw,
+                min_minutes=cfg.min_minutes,
+                max_minutes=cfg.max_minutes,
+            )
             results[subentry_id] = LoadResult(
                 predicted_minutes=minutes,
                 predicted_kwh=round(kwh, 3),
@@ -334,6 +344,7 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
                 rolling_mae_minutes=round(rolling_mae(errors), 1) if errors else None,
                 sample_count=state.sample_count,
                 last_push_ok=self._push_ok.get(subentry_id),
+                rationale=rationale,
             )
         return results
 

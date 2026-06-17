@@ -314,6 +314,58 @@ def test_rolling_mae_ignores_none():
     assert predictor.rolling_mae([None, 4.0, None, 2.0]) == pytest.approx(3.0)
 
 
+# ── explain_load ───────────────────────────────────────────────────────────--
+
+
+def _explain(state, features, **kw):
+    defaults = {"rated_power_kw": 3.0, "min_minutes": 40, "max_minutes": 240}
+    defaults.update(kw)
+    return predictor.explain_load(state, features, **defaults)
+
+
+def test_explain_load_matches_predict():
+    # The rationale must never drift from the real prediction.
+    state = predictor.default_model_state()
+    fv = FeatureVector(people_home=2, guests=0.5)
+    info = _explain(state, fv)
+    assert info["predicted_kwh"] == predictor.predict_kwh(state, fv)
+    assert info["predicted_minutes"] == predictor.predict_minutes(
+        state, fv, rated_power_kw=3.0, min_minutes=40, max_minutes=240
+    )
+
+
+def test_explain_load_terms_add_up():
+    state = predictor.default_model_state()  # E_base 3.0, draw 2.2, guest_bonus 2.5
+    info = _explain(state, FeatureVector(people_home=2, guests=1.0))
+    assert info["occupancy_factor"] == 1.0
+    assert info["base_kwh"] == pytest.approx(7.4)  # 3.0 + 2*2.2
+    assert info["occupied_kwh"] == pytest.approx(7.4)
+    assert info["guest_kwh"] == pytest.approx(2.5)  # guest_bonus * 1.0
+    assert info["pre_gain_kwh"] == pytest.approx(9.9)
+    assert info["predicted_kwh"] == pytest.approx(9.9)  # gain 1.0
+
+
+def test_explain_load_empty_house_uses_factor():
+    state = predictor.default_model_state()
+    info = _explain(state, FeatureVector(people_home=0))
+    assert info["occupancy_factor"] == predictor.SEED_EMPTY_HOUSE_FACTOR
+    assert info["occupied_kwh"] == pytest.approx(
+        predictor.SEED_EMPTY_HOUSE_FACTOR * predictor.SEED_E_BASE
+    )
+
+
+def test_explain_load_clamped_flag():
+    state = predictor.default_model_state()
+    # Empty house → ~1.2 kWh ≈ 24 min, below the floor → bound applied.
+    low = _explain(state, FeatureVector(people_home=0))
+    assert low["clamped"] is True
+    assert low["predicted_minutes"] == 45  # 40-min floor pulled up to the 15-min step
+    # A normal 2-person day lands inside the band → no bound applied.
+    mid = _explain(state, FeatureVector(people_home=2))
+    assert mid["clamped"] is False
+    assert mid["predicted_minutes"] == 150
+
+
 def test_no_homeassistant_import():
     # Guard the pure contract: the model must never pull Home Assistant.
     src = _PATH.read_text()

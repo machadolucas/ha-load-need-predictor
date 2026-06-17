@@ -192,6 +192,70 @@ def predict_minutes(
     return clamp_minutes(minutes, min_minutes, max_minutes, step)
 
 
+def explain_load(
+    state: ModelState,
+    features: FeatureVector,
+    *,
+    rated_power_kw: float,
+    min_minutes: float,
+    max_minutes: float,
+    step: int = DEFAULT_STEP_MINUTES,
+) -> dict:
+    """Break the prediction into its terms for a human-readable rationale.
+
+    Returns every intermediate the dashboard card needs to *explain* the number
+    in plain language — the inputs, the model parameters, each kWh contribution,
+    and the final clamped minutes. It recomputes the same arithmetic as
+    :func:`predict_kwh` / :func:`predict_minutes`; the pure tests assert the two
+    agree so this can never silently drift from the real prediction.
+    """
+    people = max(0, features.people_home)
+    occupancy_factor = 1.0 if people > 0 else state.empty_house_factor
+    base = state.e_base + state.e_draw_per_person * people
+    occupied_kwh = occupancy_factor * base
+    guest_kwh = state.guest_bonus * max(0.0, features.guests)
+    pre_gain_kwh = occupied_kwh + guest_kwh
+    predicted_kwh = max(0.0, pre_gain_kwh * state.gain)
+    raw_minutes = kwh_to_minutes(predicted_kwh, rated_power_kw)
+    minutes = clamp_minutes(raw_minutes, min_minutes, max_minutes, step)
+    # "clamped" = the safety floor or cap moved the answer (vs. only step-rounding).
+    stepped = round(raw_minutes / step) * step
+    return {
+        # Inputs (the day's feature snapshot).
+        "people_home": people,
+        "guests": features.guests,
+        "weekend": features.weekend,
+        "context": {
+            "supply_temp": features.supply_temp,
+            "outdoor_temp": features.outdoor_temp,
+            "inside_temp": features.inside_temp,
+            "water_total_delta": features.water_total_delta,
+        },
+        # Model parameters in force.
+        "e_base": state.e_base,
+        "e_draw_per_person": state.e_draw_per_person,
+        "guest_bonus": state.guest_bonus,
+        "empty_house_factor": state.empty_house_factor,
+        "gain": state.gain,
+        "sample_count": state.sample_count,
+        "model_version": state.version,
+        # Derived terms (the steps of the formula).
+        "occupancy_factor": occupancy_factor,
+        "base_kwh": base,
+        "occupied_kwh": occupied_kwh,
+        "guest_kwh": guest_kwh,
+        "pre_gain_kwh": pre_gain_kwh,
+        "predicted_kwh": predicted_kwh,
+        "raw_minutes": raw_minutes,
+        "predicted_minutes": minutes,
+        "clamped": minutes != stepped,
+        # Conversion / clamp config (so the card can show the limits applied).
+        "rated_power_kw": rated_power_kw,
+        "min_minutes": min_minutes,
+        "max_minutes": max_minutes,
+    }
+
+
 def is_valid_delivery(
     kwh: float | None,
     lo: float = ENERGY_VALID_MIN,

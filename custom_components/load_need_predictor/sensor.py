@@ -38,6 +38,30 @@ class PredictorSensorDescription(SensorEntityDescription):
     """A load-sensor description plus how to pull its value from a LoadResult."""
 
     value_fn: Callable
+    # Optional: build the sensor's extra_state_attributes from the LoadResult.
+    # Only the headline runtime sensor carries the rationale, so the rest leave
+    # this None and expose no attributes.
+    attr_fn: Callable | None = None
+
+
+def _runtime_attributes(result) -> dict:
+    """The rationale payload the dashboard card reads off the runtime sensor.
+
+    ``breakdown`` is the prediction split into its terms (see
+    :func:`predictor.explain_load`); ``metrics`` is the published actual-vs-
+    predicted summary so the card can show everything from this one entity. The
+    card classifies a load device by the presence of ``breakdown``.
+    """
+    return {
+        "breakdown": result.rationale,
+        "metrics": {
+            "last_delivered_kwh": result.last_delivered_kwh,
+            "prediction_error_minutes": result.prediction_error_minutes,
+            "rolling_mae_minutes": result.rolling_mae_minutes,
+            "sample_count": result.sample_count,
+            "last_push_ok": result.last_push_ok,
+        },
+    }
 
 
 SENSORS: tuple[PredictorSensorDescription, ...] = (
@@ -49,6 +73,7 @@ SENSORS: tuple[PredictorSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:timer-cog",
         value_fn=lambda r: r.predicted_minutes,
+        attr_fn=_runtime_attributes,
     ),
     PredictorSensorDescription(
         key="predicted_energy",
@@ -174,6 +199,14 @@ class PredictorSensor(PredictorEntity, SensorEntity):
             return None
         return self.entity_description.value_fn(result)
 
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        attr_fn = self.entity_description.attr_fn
+        result = self._result
+        if attr_fn is None or result is None:
+            return None
+        return attr_fn(result)
+
 
 class PriceForecastSensor(ForecastEntity, SensorEntity):
     """The headline forecast: state = mean predicted price; attrs = scheduler slots."""
@@ -204,6 +237,9 @@ class PriceForecastSensor(ForecastEntity, SensorEntity):
             "model_samples": result.model_samples,
             "fit_mae_eur_kwh": result.fit_mae,
             "forecast_mae_eur_kwh": result.forecast_mae,
+            # Rationale for the dashboard card: how the price is modelled.
+            "fitted": result.fitted,
+            "coefficients": result.coefficients,
         }
 
 

@@ -21,6 +21,7 @@ from homeassistant.core import HomeAssistant
 from .const import PLATFORMS
 from .coordinator import LoadNeedPredictorCoordinator
 from .forecast_coordinator import PriceForecastCoordinator
+from .frontend import async_register_card
 from .jobs import PredictorJobs
 from .runtime import LoadNeedPredictorConfigEntry, RuntimeData
 
@@ -29,6 +30,9 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> bool:
     """Set up Load Need Predictor from the hub config entry."""
+    # Serve + register the dashboard card (once per HA process; safe on reload).
+    await async_register_card(hass)
+
     load = LoadNeedPredictorCoordinator(hass, entry)
     await load.async_load_runtime()
     await load.async_config_entry_first_refresh()

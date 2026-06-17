@@ -77,6 +77,8 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `entity.py` | `PredictorEntity` (load) + `ForecastEntity` bases | yes |
 | `sensor.py` / `button.py` | Per-load + price-forecast sensors; "predict/forecast now" buttons | yes |
 | `diagnostics.py` | Redacted diagnostics dump (loads + forecasts) | yes |
+| `frontend.py` | Serves + auto-registers the dashboard card (long-cached static path + extra JS module with a `?hash=<content-hash>` cache-bust); best-effort, never breaks setup | yes |
+| `www/load-need-predictor-card.js` | The Lovelace diagnostic card (vanilla JS, no build) + its `ha-form` editor | no |
 
 ## The price forecast (read before touching `price_model.py`)
 
@@ -109,6 +111,26 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   "nobody home" prediction keeps standby + one shower's worth.
 - **Data-quality gate**: ignore days with delivered energy ≤ 0.2 or > 18 kWh
   (meter resets/outliers) when calibrating.
+
+## The dashboard card (read before touching `www/…card.js` or the attrs)
+
+A Lovelace card can only read **entity state + attributes**, so the rationale it
+shows is published as sensor attributes — the card itself holds no model logic:
+
+- Load: `sensor.<load>_predicted_runtime` carries `breakdown` (the
+  `predictor.explain_load` dict — every formula term + the in-force params) and
+  `metrics` (the published actual-vs-predicted summary). Only the *runtime*
+  sensor gets these (via `attr_fn` on its description); the other load sensors
+  stay attribute-free. `explain_load` is **pure** and a test asserts it agrees
+  with `predict_kwh`/`predict_minutes` so the explanation can't drift.
+- Forecast: `sensor.<name>_price_forecast` adds `coefficients`
+  (`price_model.describe` — feature names + betas + intercept, sign = effect
+  direction) and `fitted`, alongside the existing `days` / `data_today`.
+- The card **auto-discovers** devices from the entity registry
+  (`platform == "load_need_predictor"`) and classifies each by attribute content
+  (`breakdown` ⇒ load, `data_today` ⇒ forecast) — rename-proof, no entity-id
+  parsing. It is **vanilla JS, no build step** (ships + runs as-is); keep it that
+  way. `frontend.py` registration is best-effort and must never break setup.
 
 ## Dev workflow
 

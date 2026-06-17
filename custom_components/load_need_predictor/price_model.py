@@ -42,6 +42,10 @@ DEFAULT_L2 = 1.0
 
 FEATURE_COUNT = 4
 
+# Human-readable names for the four features, aligned with ``build_features``.
+# Used by the dashboard card to label the regression coefficients.
+FEATURE_NAMES = ("temp", "wind", "cold_hinge", "wind_x_cold_hinge")
+
 # ── Seed formula (cold start) — rough €/kWh, replaced by the fit ──────────────
 SEED_BASE = 0.06
 SEED_TEMP = -0.001  # per °C (warmer ⇒ slightly cheaper)
@@ -192,3 +196,23 @@ def mean_abs_error(
         return None
     total = sum(abs(predict_price(model, t, w) - p) for t, w, p in rows)
     return total / len(rows)
+
+
+def describe(model: FittedModel | None) -> dict | None:
+    """Expose a fitted model's coefficients for the dashboard card's rationale.
+
+    Returns ``None`` for the seed case (no fit yet) so the card can say it is
+    using the seed formula. Because features are standardised before the solve,
+    the *sign* of each beta is the direction of that feature's effect on price
+    (e.g. a negative ``wind`` beta means more wind lowers the forecast price).
+    """
+    if model is None:
+        return None
+    return {
+        "features": list(FEATURE_NAMES),
+        "betas": list(model.betas),
+        "intercept": model.intercept,
+        "means": list(model.means),
+        "stds": list(model.stds),
+        "n": model.n,
+    }

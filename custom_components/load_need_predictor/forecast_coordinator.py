@@ -31,7 +31,7 @@ from .forecast_source import (
 )
 from .models import PriceForecastConfig, price_forecast_config_from_data
 from .persistence import PredictorStore
-from .price_model import FittedModel, fit, mean_abs_error, predict_price
+from .price_model import FittedModel, describe, fit, mean_abs_error, predict_price
 from .runtime import LoadNeedPredictorConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ class ForecastResult:
     last_predicted: float | None = None
     last_actual: float | None = None
     last_error: float | None = None
+    fitted: bool = False  # True once a real fit replaced the seed formula
+    coefficients: dict | None = None  # regression terms, for the card's rationale
 
 
 class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]]):
@@ -264,6 +266,8 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
                 last_predicted=completed.get("predicted") if completed else None,
                 last_actual=completed.get("actual") if completed else None,
                 last_error=completed.get("abs_error") if completed else None,
+                fitted=model is not None,
+                coefficients=describe(model),
             )
         return results
 

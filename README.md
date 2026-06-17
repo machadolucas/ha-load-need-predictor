@@ -184,6 +184,32 @@ temperature most in the cold and on wind most in the cold band. Daily price is
 expanded into flat hourly slots; the scheduler's margin absorbs the coarseness.
 `sensor.<name>_forecast_mae` / `_forecast_error` log forecast-vs-actual price.
 
+## Dashboard card
+
+A bundled Lovelace card explains, in plain language, **how** each number was
+calculated — the occupancy/baseline/gain breakdown behind every load's runtime,
+and the wind/temperature regression behind the price forecast — with a
+"Predict now" / "Update forecast now" button on each.
+
+The integration **auto-registers** the card on startup (no manual Lovelace
+resource needed), so after a restart you can just add it:
+
+```yaml
+type: custom:load-need-predictor-card
+# Everything below is optional:
+title: Load Need Predictor          # card heading
+devices: []                         # leave empty to auto-discover all loads + forecasts
+default_expanded: false             # start with the detail section open
+show_context: false                 # also show the logged temps / water context
+```
+
+It is also available from the dashboard's **“Add card”** picker (with a
+graphical editor), is responsive across grid/section sizes, and is compact —
+each load/forecast is one collapsible block. The rationale is read from entity
+attributes the integration publishes: `breakdown` + `metrics` on
+`sensor.<load>_predicted_runtime`, and `coefficients` + `fitted` on
+`sensor.<name>_price_forecast`.
+
 ## Installation
 
 ### HACS (custom repository)

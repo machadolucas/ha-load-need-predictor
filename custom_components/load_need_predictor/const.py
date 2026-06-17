@@ -74,6 +74,13 @@ DEFAULT_MAX_MINUTES = 240  # ~12 kWh cap: below the meter-reset outliers
 # The scheduler's ``number.<load>_target`` accepts whole 15-minute steps.
 TARGET_STEP_MINUTES = 15
 
+# ── Dashboard card (bundled + auto-registered as a frontend module) ───────────
+# Served from this integration's ``www/`` dir; the URL is registered on setup so
+# ``type: custom:load-need-predictor-card`` works without a manual Lovelace
+# resource. See ``frontend.py``.
+CARD_FILENAME = "load-need-predictor-card.js"
+CARD_URL = f"/{DOMAIN}/{CARD_FILENAME}"
+
 # ── Persistence: a Store under .storage/ (included in HA backups) ─────────────
 STORAGE_VERSION = 1
 SAVE_DELAY = 10  # seconds — debounce writes

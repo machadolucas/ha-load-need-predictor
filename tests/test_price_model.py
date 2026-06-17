@@ -135,5 +135,28 @@ def test_mean_abs_error_empty():
     assert pm.mean_abs_error(None, []) is None
 
 
+# ── describe (coefficients for the dashboard card) ───────────────────────────
+
+
+def test_describe_seed_is_none():
+    assert pm.describe(None) is None
+
+
+def test_describe_exposes_coefficients():
+    model = pm.fit(_grid())
+    assert model is not None
+    d = pm.describe(model)
+    assert d["features"] == list(pm.FEATURE_NAMES)
+    assert len(d["betas"]) == pm.FEATURE_COUNT
+    assert len(d["means"]) == pm.FEATURE_COUNT
+    assert len(d["stds"]) == pm.FEATURE_COUNT
+    assert d["n"] == model.n
+    assert d["intercept"] == model.intercept
+    # Standardisation preserves sign, so betas read as effect direction on price:
+    # the seeded surface has wind lowering price and cold raising it.
+    assert d["betas"][1] < 0  # wind
+    assert d["betas"][2] > 0  # cold_hinge
+
+
 def test_no_homeassistant_import():
     assert "homeassistant" not in _PATH.read_text()
