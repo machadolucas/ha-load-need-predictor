@@ -77,7 +77,7 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `entity.py` | `PredictorEntity` (load) + `ForecastEntity` bases | yes |
 | `sensor.py` / `button.py` | Per-load + price-forecast sensors; "predict/forecast now" buttons | yes |
 | `diagnostics.py` | Redacted diagnostics dump (loads + forecasts) | yes |
-| `frontend.py` | Serves + auto-registers the dashboard card (long-cached static path + extra JS module with a `?hash=<content-hash>` cache-bust); best-effort, never breaks setup | yes |
+| `frontend.py` | Serves + auto-registers the dashboard card (long-cached static path registered first, then an extra JS module with a guarded `?v=<content-hash>` cache-bust that falls back to the bare URL); best-effort, never breaks setup | yes |
 | `www/load-need-predictor-card.js` | The Lovelace diagnostic card (vanilla JS, no build) + its `ha-form` editor | no |
 
 ## The price forecast (read before touching `price_model.py`)

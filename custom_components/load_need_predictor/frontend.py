@@ -7,13 +7,19 @@ on first setup, so ``type: custom:load-need-predictor-card`` is available on all
 dashboards after a restart. Registration runs once per Home Assistant process —
 config-entry reloads must not re-add the static path or the module URL.
 
-**Cache-busting.** The file is served with a long browser cache, and the module
-URL carries a ``?hash=<content-hash>`` suffix — the same pattern HACS uses with
-``?hacs=<version>``. A *content* hash (not the release version) means the URL
-changes whenever the JS actually changes, so every cache layer (browser, proxy,
-service worker) refetches a stale copy while unchanged files stay cached. The
-hash is recomputed on each startup, and editing a custom component requires a
-restart, so the URL is always in step with the served bytes.
+**Cache-busting.** The file is served with a long (~31-day) immutable cache, and
+the injected URL carries a ``?v=<content-hash>`` suffix — the same pattern HACS
+uses with ``?hacs=<version>``. A *content* hash (not the release version) means
+the URL changes exactly when the JS changes, so the browser HTTP cache, the PWA
+service worker and the Companion-app WebView all refetch a stale copy while
+unchanged files stay cached. HA restarts alone don't fix this — the stale copy
+is client-side — which is why the URL itself must change.
+
+The order matters: the static route is registered **first**, then the hash is
+computed in its own guarded step that falls back to the bare URL. Serving the
+card must never depend on the cache-buster — if hashing threw before the route
+existed, the card would 404 and every dashboard using it would break with
+"Custom element doesn't exist".
 """
 
 from __future__ import annotations
@@ -37,12 +43,9 @@ def _card_path() -> Path:
     return Path(__file__).parent / "www" / CARD_FILENAME
 
 
-def _content_hash(path: Path) -> str | None:
-    """Short hash of the card file's bytes, the cache-bust key. Blocking I/O."""
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
-    except OSError:
-        return None
+def _card_version(path: Path) -> str:
+    """Short content hash of the card file — the cache-bust key. Blocking I/O."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:8]
 
 
 async def async_register_card(hass: HomeAssistant) -> None:
@@ -60,17 +63,22 @@ async def async_register_card(hass: HomeAssistant) -> None:
 
     try:
         card_path = _card_path()
-        # cache_headers=True → long immutable cache; the hashed URL below is what
-        # forces a refetch when the file changes.
+        # Register the route FIRST so serving the card never depends on the
+        # cache-buster. cache_headers=True → long immutable cache; the hashed URL
+        # below is what forces clients to refetch when the file changes.
         await hass.http.async_register_static_paths(
             [StaticPathConfig(CARD_URL, str(card_path), True)]
         )
-        cache_key = await hass.async_add_executor_job(_content_hash, card_path)
-        url = f"{CARD_URL}?hash={cache_key}" if cache_key else CARD_URL
+        # Cache-bust on a content hash, best-effort: if hashing fails we still
+        # inject the bare URL so the card loads (just without the buster).
+        url = CARD_URL
+        try:
+            version = await hass.async_add_executor_job(_card_version, card_path)
+            url = f"{CARD_URL}?v={version}"
+        except Exception as err:  # noqa: BLE001 - cache-buster is best-effort
+            _LOGGER.debug("Card cache-buster skipped: %s", err)
         add_extra_js_url(hass, url)
-    except Exception as err:  # never let a UI nicety break setup
-        _LOGGER.warning("Could not register the dashboard card: %s", err)
-        return
-
-    hass.data[_REGISTERED_KEY] = True
-    _LOGGER.debug("Registered Load Need Predictor dashboard card at %s", url)
+        hass.data[_REGISTERED_KEY] = True
+        _LOGGER.debug("Registered Load Need Predictor dashboard card at %s", url)
+    except Exception as err:  # noqa: BLE001 - a UI nicety must never break setup
+        _LOGGER.debug("Dashboard card not registered: %s", err)

@@ -8,26 +8,21 @@ from custom_components.load_need_predictor.const import CARD_FILENAME, CARD_URL
 # ── content hash ─────────────────────────────────────────────────────────────
 
 
-def test_content_hash_is_stable_and_sensitive(tmp_path):
+def test_card_version_is_stable_and_sensitive(tmp_path):
     f = tmp_path / "card.js"
     f.write_text("console.log('alpha');")
-    first = frontend._content_hash(f)
-    assert first is not None
-    assert len(first) == 12
+    first = frontend._card_version(f)
+    assert len(first) == 8
     assert all(c in "0123456789abcdef" for c in first)
-    assert frontend._content_hash(f) == first  # same bytes → same hash
+    assert frontend._card_version(f) == first  # same bytes → same hash
 
     f.write_text("console.log('beta');")
-    assert frontend._content_hash(f) != first  # changed bytes → changed hash
+    assert frontend._card_version(f) != first  # changed bytes → changed hash
 
 
-def test_content_hash_missing_file_is_none(tmp_path):
-    assert frontend._content_hash(tmp_path / "absent.js") is None
-
-
-def test_shipped_card_hashes(tmp_path):
-    # The bundled card file hashes to a 12-char key (the real cache-bust source).
-    assert frontend._content_hash(frontend._card_path()) is not None
+def test_shipped_card_hashes():
+    # The bundled card file hashes to an 8-char key (the real cache-bust source).
+    assert len(frontend._card_version(frontend._card_path())) == 8
 
 
 # ── async_register_card ──────────────────────────────────────────────────────
@@ -52,16 +47,17 @@ class _FakeHass:
         return func(*args)
 
 
-async def test_register_appends_content_hash(monkeypatch):
+async def test_register_appends_content_version(monkeypatch):
     urls: list[str] = []
     monkeypatch.setattr(frontend, "add_extra_js_url", lambda hass, url: urls.append(url))
     hass = _FakeHass(_FakeHttp())
 
     await frontend.async_register_card(hass)
 
-    assert len(urls) == 1
-    assert urls[0].startswith(f"{CARD_URL}?hash=")
+    expected = frontend._card_version(frontend._card_path())
+    assert urls == [f"{CARD_URL}?v={expected}"]
     assert hass.http.registered  # the static path was registered
+    assert CARD_FILENAME in str(hass.http.registered[0].path)
     assert hass.data[frontend._REGISTERED_KEY] is True
 
     # Once per process: a second call (e.g. a reload) must not re-add the URL.
@@ -69,16 +65,23 @@ async def test_register_appends_content_hash(monkeypatch):
     assert len(urls) == 1
 
 
-async def test_register_url_matches_file_hash(monkeypatch):
+async def test_register_falls_back_to_bare_url_when_hash_fails(monkeypatch):
+    # The CRITICAL guarantee: if the cache-buster throws, the card is still
+    # served and injected (route registered first, bare URL added).
     urls: list[str] = []
     monkeypatch.setattr(frontend, "add_extra_js_url", lambda hass, url: urls.append(url))
+
+    def _boom(_path):
+        raise RuntimeError("hash exploded")
+
+    monkeypatch.setattr(frontend, "_card_version", _boom)
     hass = _FakeHass(_FakeHttp())
 
     await frontend.async_register_card(hass)
 
-    expected = frontend._content_hash(frontend._card_path())
-    assert urls[0] == f"{CARD_URL}?hash={expected}"
-    assert CARD_FILENAME in str(hass.http.registered[0].path)
+    assert urls == [CARD_URL]  # bare URL, no ?v= suffix
+    assert hass.http.registered  # route still registered → card serves
+    assert hass.data[frontend._REGISTERED_KEY] is True
 
 
 async def test_register_skips_without_http(monkeypatch):

@@ -15,7 +15,7 @@
  */
 
 const DOMAIN = "load_need_predictor";
-const CARD_VERSION = "0.5.0";
+const CARD_VERSION = "0.5.1";
 const DOC_URL = "https://github.com/machadolucas/ha-load-need-predictor";
 
 // translation_key values the integration assigns to its entities.
