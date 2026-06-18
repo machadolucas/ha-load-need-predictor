@@ -191,8 +191,10 @@ calculated — the occupancy/baseline/gain breakdown behind every load's runtime
 and the wind/temperature regression behind the price forecast — with a
 "Predict now" / "Update forecast now" button on each.
 
-The integration **auto-registers** the card on startup (no manual Lovelace
-resource needed), so after a restart you can just add it:
+The integration **auto-registers** the card on startup — it adds itself to the
+Lovelace **resource registry** (the same mechanism HACS uses), so no manual
+resource is needed and a single managed entry appears under *Settings →
+Dashboards → Resources*. After a restart you can just add it:
 
 ```yaml
 type: custom:load-need-predictor-card

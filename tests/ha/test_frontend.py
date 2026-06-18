@@ -1,4 +1,4 @@
-"""Card registration + content-hash cache-busting."""
+"""Card registration: content-hash cache-busting + Lovelace resource registry."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def test_shipped_card_hashes():
     assert len(frontend._card_version(frontend._card_path())) == 8
 
 
-# ── async_register_card ──────────────────────────────────────────────────────
+# ── test doubles ─────────────────────────────────────────────────────────────
 
 
 class _FakeHttp:
@@ -47,7 +47,136 @@ class _FakeHass:
         return func(*args)
 
 
-async def test_register_appends_content_version(monkeypatch):
+class _FakeResources:
+    """Stand-in for Lovelace's ResourceStorageCollection (storage mode)."""
+
+    def __init__(self, items, *, loaded=True) -> None:
+        self._items = list(items)
+        self.loaded = loaded
+        self.created: list = []
+        self.updated: list = []
+        self.deleted: list = []
+
+    async def async_load(self) -> None:
+        self.loaded = True
+
+    def async_items(self):
+        return list(self._items)
+
+    async def async_create_item(self, item):
+        self.created.append(item)
+        self._items.append({**item, "id": f"id{len(self._items)}"})
+
+    async def async_update_item(self, item_id, changes):
+        self.updated.append((item_id, changes))
+
+    async def async_delete_item(self, item_id):
+        self.deleted.append(item_id)
+
+
+class _FakeLovelaceData:
+    def __init__(self, resources) -> None:
+        self.resources = resources
+
+
+def _use_fake_lovelace(monkeypatch, hass, items, *, loaded=True):
+    """Wire a fake Lovelace storage collection into hass + make isinstance pass."""
+    from homeassistant.components.lovelace import resources as lr
+    from homeassistant.components.lovelace.const import LOVELACE_DATA
+
+    res = _FakeResources(items, loaded=loaded)
+    monkeypatch.setattr(lr, "ResourceStorageCollection", _FakeResources)
+    hass.data[LOVELACE_DATA] = _FakeLovelaceData(res)
+    return res
+
+
+# ── _async_register_resource ─────────────────────────────────────────────────
+
+
+async def test_resource_registry_creates_new(monkeypatch):
+    hass = _FakeHass(_FakeHttp())
+    res = _use_fake_lovelace(monkeypatch, hass, [])
+
+    handled = await frontend._async_register_resource(hass, f"{CARD_URL}?v=aaa")
+
+    assert handled is True
+    assert res.created == [{"res_type": "module", "url": f"{CARD_URL}?v=aaa"}]
+    assert res.updated == []
+    assert res.deleted == []
+
+
+async def test_resource_registry_updates_version_in_place(monkeypatch):
+    hass = _FakeHass(_FakeHttp())
+    res = _use_fake_lovelace(monkeypatch, hass, [{"id": "1", "url": f"{CARD_URL}?v=old"}])
+
+    handled = await frontend._async_register_resource(hass, f"{CARD_URL}?v=new")
+
+    assert handled is True
+    assert res.updated == [("1", {"url": f"{CARD_URL}?v=new"})]
+    assert res.created == []
+    assert res.deleted == []
+
+
+async def test_resource_registry_dedupes(monkeypatch):
+    hass = _FakeHass(_FakeHttp())
+    res = _use_fake_lovelace(
+        monkeypatch,
+        hass,
+        [
+            {"id": "1", "url": f"{CARD_URL}?v=new"},  # already current → kept, no update
+            {"id": "2", "url": f"{CARD_URL}?v=stale"},
+            {"id": "3", "url": CARD_URL},
+        ],
+    )
+
+    handled = await frontend._async_register_resource(hass, f"{CARD_URL}?v=new")
+
+    assert handled is True
+    assert res.deleted == ["2", "3"]
+    assert res.updated == []
+    assert res.created == []
+
+
+async def test_resource_registry_loads_when_unloaded(monkeypatch):
+    hass = _FakeHass(_FakeHttp())
+    res = _use_fake_lovelace(monkeypatch, hass, [], loaded=False)
+
+    await frontend._async_register_resource(hass, f"{CARD_URL}?v=aaa")
+
+    assert res.loaded is True
+
+
+async def test_resource_registry_falls_back_without_lovelace_data():
+    hass = _FakeHass(_FakeHttp())  # no LOVELACE_DATA in hass.data
+
+    assert await frontend._async_register_resource(hass, f"{CARD_URL}?v=x") is False
+
+
+# ── async_register_card ──────────────────────────────────────────────────────
+
+
+async def test_register_uses_resource_registry(monkeypatch):
+    urls: list[str] = []
+    monkeypatch.setattr(frontend, "add_extra_js_url", lambda hass, url: urls.append(url))
+    hass = _FakeHass(_FakeHttp())
+    res = _use_fake_lovelace(monkeypatch, hass, [])
+
+    await frontend.async_register_card(hass)
+
+    expected = frontend._card_version(frontend._card_path())
+    assert res.created == [{"res_type": "module", "url": f"{CARD_URL}?v={expected}"}]
+    assert urls == []  # registry handled it → no HTML-shell injection
+    assert hass.http.registered  # static path still served
+    assert CARD_FILENAME in str(hass.http.registered[0].path)
+    assert hass.data[frontend._REGISTERED_KEY] is True
+
+    # Once per process: a reload must not re-register.
+    await frontend.async_register_card(hass)
+    assert res.created == [{"res_type": "module", "url": f"{CARD_URL}?v={expected}"}]
+
+
+async def test_register_falls_back_to_extra_js_without_lovelace(monkeypatch):
+    # No Lovelace storage collection → fall back to add_extra_js_url (YAML mode).
     urls: list[str] = []
     monkeypatch.setattr(frontend, "add_extra_js_url", lambda hass, url: urls.append(url))
     hass = _FakeHass(_FakeHttp())
@@ -56,18 +185,30 @@ async def test_register_appends_content_version(monkeypatch):
 
     expected = frontend._card_version(frontend._card_path())
     assert urls == [f"{CARD_URL}?v={expected}"]
-    assert hass.http.registered  # the static path was registered
-    assert CARD_FILENAME in str(hass.http.registered[0].path)
+    assert hass.http.registered
     assert hass.data[frontend._REGISTERED_KEY] is True
 
-    # Once per process: a second call (e.g. a reload) must not re-add the URL.
+
+async def test_register_falls_back_when_registry_raises(monkeypatch):
+    # A registry write blowing up must still load the card (via add_extra_js_url).
+    urls: list[str] = []
+    monkeypatch.setattr(frontend, "add_extra_js_url", lambda hass, url: urls.append(url))
+
+    async def _boom(hass, url):
+        raise RuntimeError("registry down")
+
+    monkeypatch.setattr(frontend, "_async_register_resource", _boom)
+    hass = _FakeHass(_FakeHttp())
+
     await frontend.async_register_card(hass)
-    assert len(urls) == 1
+
+    expected = frontend._card_version(frontend._card_path())
+    assert urls == [f"{CARD_URL}?v={expected}"]
+    assert hass.data[frontend._REGISTERED_KEY] is True
 
 
 async def test_register_falls_back_to_bare_url_when_hash_fails(monkeypatch):
-    # The CRITICAL guarantee: if the cache-buster throws, the card is still
-    # served and injected (route registered first, bare URL added).
+    # If the cache-buster throws, the card is still registered with the bare URL.
     urls: list[str] = []
     monkeypatch.setattr(frontend, "add_extra_js_url", lambda hass, url: urls.append(url))
 

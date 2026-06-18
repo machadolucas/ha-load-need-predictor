@@ -2,24 +2,27 @@
 
 HA (and HACS) only load a Lovelace card when its JS is registered as a frontend
 resource. Rather than make every user add a resource by hand, the integration
-serves the bundled ``www/<card>.js`` and registers it as an *extra module URL*
-on first setup, so ``type: custom:load-need-predictor-card`` is available on all
-dashboards after a restart. Registration runs once per Home Assistant process —
-config-entry reloads must not re-add the static path or the module URL.
+serves the bundled ``www/<card>.js`` and registers it on first setup, so
+``type: custom:load-need-predictor-card`` is available on all dashboards after a
+restart. Registration runs once per Home Assistant process — config-entry
+reloads must not re-add it.
 
-**Cache-busting.** The file is served with a long (~31-day) immutable cache, and
-the injected URL carries a ``?v=<content-hash>`` suffix — the same pattern HACS
-uses with ``?hacs=<version>``. A *content* hash (not the release version) means
-the URL changes exactly when the JS changes, so the browser HTTP cache, the PWA
-service worker and the Companion-app WebView all refetch a stale copy while
-unchanged files stay cached. HA restarts alone don't fix this — the stale copy
-is client-side — which is why the URL itself must change.
+**Why the resource registry, not ``add_extra_js_url``.** ``add_extra_js_url``
+injects a ``<script>`` into the *server-rendered index HTML*. But that HTML / app
+shell is cached upstream (a Cloudflare edge, the frontend service worker, the
+Companion-app WebView), and a cached shell does **not** contain the injected tag —
+so the browser never requests the card module and the dashboard breaks with
+"Custom element doesn't exist". A URL cache-buster can't help because the stale
+artifact is the *HTML*, not the JS. So we register the card in the **Lovelace
+resource registry** (exactly what HACS does): the frontend fetches that list at
+runtime over WebSocket, independent of the cached HTML. ``add_extra_js_url``
+remains only as a fallback for YAML resource mode / when the registry isn't ready.
 
-The order matters: the static route is registered **first**, then the hash is
-computed in its own guarded step that falls back to the bare URL. Serving the
-card must never depend on the cache-buster — if hashing threw before the route
-existed, the card would 404 and every dashboard using it would break with
-"Custom element doesn't exist".
+**Cache-busting.** The file is still served with a long immutable cache and the
+registered URL carries a ``?v=<content-hash>`` suffix, so the JS itself refetches
+exactly when it changes. The registry write dedupes by URL path and updates the
+version in place, so the resource list never accumulates duplicates across
+updates.
 """
 
 from __future__ import annotations
@@ -48,8 +51,50 @@ def _card_version(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:8]
 
 
+async def _async_register_resource(hass: HomeAssistant, url: str) -> bool:
+    """Add/refresh the card in the Lovelace resource registry (storage mode).
+
+    Returns ``True`` if handled, ``False`` to fall back to ``add_extra_js_url``
+    (YAML resource mode, or Lovelace not ready). Idempotent across restarts: it
+    dedupes by URL *path* and updates the ``?v=`` version in place, so the
+    resource list never grows duplicates.
+    """
+    try:
+        from homeassistant.components.lovelace.const import LOVELACE_DATA
+        from homeassistant.components.lovelace.resources import (
+            ResourceStorageCollection,
+        )
+    except ImportError:
+        return False
+
+    data = hass.data.get(LOVELACE_DATA)
+    if data is None:
+        return False
+    resources = data.resources
+    if not isinstance(resources, ResourceStorageCollection):
+        return False  # YAML resource mode — can't edit programmatically
+
+    if not resources.loaded:
+        await resources.async_load()
+        resources.loaded = True
+
+    base = url.split("?", 1)[0]
+    existing = [
+        r for r in resources.async_items() if str(r.get("url", "")).split("?", 1)[0] == base
+    ]
+    if existing:
+        keep, *dupes = existing
+        if keep.get("url") != url:
+            await resources.async_update_item(keep["id"], {"url": url})
+        for dupe in dupes:  # collapse any duplicates
+            await resources.async_delete_item(dupe["id"])
+    else:
+        await resources.async_create_item({"res_type": "module", "url": url})
+    return True
+
+
 async def async_register_card(hass: HomeAssistant) -> None:
-    """Serve the card JS and add it as a frontend module (once per process).
+    """Serve the card JS and register it for the frontend (once per process).
 
     Best-effort: the card is a UI nicety, so a missing ``http`` component (some
     minimal test setups) or any registration error must never block the
@@ -70,15 +115,29 @@ async def async_register_card(hass: HomeAssistant) -> None:
             [StaticPathConfig(CARD_URL, str(card_path), True)]
         )
         # Cache-bust on a content hash, best-effort: if hashing fails we still
-        # inject the bare URL so the card loads (just without the buster).
+        # register the bare URL so the card loads (just without the buster).
         url = CARD_URL
         try:
             version = await hass.async_add_executor_job(_card_version, card_path)
             url = f"{CARD_URL}?v={version}"
         except Exception as err:  # noqa: BLE001 - cache-buster is best-effort
             _LOGGER.debug("Card cache-buster skipped: %s", err)
-        add_extra_js_url(hass, url)
+
+        # Prefer the resource registry (survives a cached HTML shell); fall back
+        # to add_extra_js_url for YAML mode or if the registry write fails.
+        registered = False
+        try:
+            registered = await _async_register_resource(hass, url)
+        except Exception as err:  # noqa: BLE001 - fall back, never break setup
+            _LOGGER.debug("Lovelace resource registration failed, falling back: %s", err)
+        if not registered:
+            add_extra_js_url(hass, url)
+
         hass.data[_REGISTERED_KEY] = True
-        _LOGGER.debug("Registered Load Need Predictor dashboard card at %s", url)
+        _LOGGER.debug(
+            "Registered Load Need Predictor dashboard card at %s (%s)",
+            url,
+            "resource registry" if registered else "extra_js_url",
+        )
     except Exception as err:  # noqa: BLE001 - a UI nicety must never break setup
         _LOGGER.debug("Dashboard card not registered: %s", err)
