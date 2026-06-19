@@ -23,6 +23,8 @@ from homeassistant.helpers import selector
 
 from .const import (
     CONF_CAPTURE_TIME,
+    CONF_CONTROLLED_SWITCH_ENTITY,
+    CONF_DEFICIT_CAP_MINUTES,
     CONF_DELIVERED_ENERGY_ENTITY,
     CONF_DELIVERED_RUNTIME_ENTITY,
     CONF_FIT_DAYS,
@@ -100,6 +102,11 @@ def _load_schema(defaults: dict) -> vol.Schema:
                 CONF_DELIVERED_RUNTIME_ENTITY, description=suggest(CONF_DELIVERED_RUNTIME_ENTITY)
             ): _SENSOR,
             vol.Optional(
+                CONF_CONTROLLED_SWITCH_ENTITY, description=suggest(CONF_CONTROLLED_SWITCH_ENTITY)
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch", "input_boolean"])
+            ),
+            vol.Optional(
                 CONF_RATED_POWER_KW,
                 default=defaults.get(CONF_RATED_POWER_KW, DEFAULT_RATED_POWER_KW),
             ): selector.NumberSelector(
@@ -133,6 +140,9 @@ def _load_schema(defaults: dict) -> vol.Schema:
             ): _minutes_selector(),
             vol.Optional(
                 CONF_MAX_MINUTES, default=defaults.get(CONF_MAX_MINUTES, DEFAULT_MAX_MINUTES)
+            ): _minutes_selector(),
+            vol.Optional(
+                CONF_DEFICIT_CAP_MINUTES, description=suggest(CONF_DEFICIT_CAP_MINUTES)
             ): _minutes_selector(),
         }
     )

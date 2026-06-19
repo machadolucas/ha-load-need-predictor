@@ -15,7 +15,7 @@
  */
 
 const DOMAIN = "load_need_predictor";
-const CARD_VERSION = "0.5.2";
+const CARD_VERSION = "0.6.0";
 const DOC_URL = "https://github.com/machadolucas/ha-load-need-predictor";
 
 // translation_key values the integration assigns to its entities.
@@ -270,11 +270,20 @@ function loadExplanation(bd) {
   const s2 = `Calibration gain ${bold(gain(bd.gain))} → ${bold(
     kwh(bd.predicted_kwh)
   )} kWh ≈ ${bold(mins(bd.raw_minutes))} at ${kwh(bd.rated_power_kw)} kW`;
-  const s3 = bd.clamped
-    ? `clamped to ${bold(mins(bd.predicted_minutes))} (limits ${Math.round(
-        bd.min_minutes
-      )}–${Math.round(bd.max_minutes)} min)`
-    : `rounded to ${bold(mins(bd.predicted_minutes))}`;
+  // With a backlog the headline is the *target* (need + carryover); call the
+  // need out explicitly so the two numbers don't look contradictory.
+  const hasBacklog = isNum(bd.deficit_minutes) && bd.deficit_minutes > 0;
+  const need = bold(mins(bd.predicted_minutes)) + (hasBacklog ? " need" : "");
+  let s3 = bd.clamped
+    ? `clamped to ${need} (limits ${Math.round(bd.min_minutes)}–${Math.round(
+        bd.max_minutes
+      )} min)`
+    : `rounded to ${need}`;
+  if (hasBacklog) {
+    s3 += ` + ${bold(mins(bd.deficit_minutes))} backlog from skipped/short days → target ${bold(
+      mins(bd.target_minutes)
+    )}`;
+  }
 
   return `<div class="explain">${s1}. ${s2}, ${s3}.</div>`;
 }
@@ -290,6 +299,10 @@ function loadDetail(bd, m, showContext) {
     chip("Empty-house", `${Math.round((bd.empty_house_factor || 0) * 100)}%`),
     chip("Gain", gain(bd.gain)),
   ];
+  // Carried backlog from days the scheduler skipped/under-ran (catch-up enabled).
+  if (isNum(bd.deficit_minutes) && bd.deficit_minutes > 0) {
+    rows.push(chip("Backlog", mins(bd.deficit_minutes)));
+  }
   const acc = [
     chip("Rolling MAE", m.rolling_mae_minutes != null ? mins(m.rolling_mae_minutes) : "—"),
     chip("Last delivered", m.last_delivered_kwh != null ? `${kwh(m.last_delivered_kwh)} kWh` : "—"),

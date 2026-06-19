@@ -61,10 +61,10 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 
 | File | Role | HA? |
 |---|---|---|
-| `predictor.py` | **Pure** load model: features → kWh → minutes, seeds, gain EWMA, prior↔empirical blend, `build_features`, rolling MAE | no |
+| `predictor.py` | **Pure** load model: features → kWh → minutes, seeds, gain EWMA, prior↔empirical blend, `build_features`, rolling MAE, deficit carryover (`close_cycle`/`open_cycle`) | no |
 | `price_model.py` | **Pure** price model: ridge regression of price on wind+temp with a cold interaction; seed fallback; fit/predict/serialize | no |
 | `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig` | no |
-| `statistics_source.py` | Load delivery from the recorder (daily `change`) | yes |
+| `statistics_source.py` | Load delivery from the recorder (daily `change`) + commanded switch on-time over a window (`async_commanded_minutes`, for deficit carryover) | yes |
 | `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price | yes |
 | `occupancy.py` | Duration-based occupancy: residents home ≥12 h over the trailing 24 h (from history) + guests weighted by visit length (next-24 h calendar); instantaneous fallbacks | yes |
 | `persistence.py` | `Store` (load: model+training+eval; forecast uses a `.forecast` file) | yes |
@@ -111,6 +111,21 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   "nobody home" prediction keeps standby + one shower's worth.
 - **Data-quality gate**: ignore days with delivered energy ≤ 0.2 or > 18 kWh
   (meter resets/outliers) when calibrating.
+- **Deficit carryover** (opt-in via a load's `controlled_switch_entity`): a
+  bounded backlog (a one-number proxy for tank state-of-charge) so a day the
+  scheduler skips/under-runs on price/solar is made up the next day. Each predict
+  closes the previous predict→predict cycle — `deficit = close_cycle(pending_owed,
+  commanded, cap)` where `commanded` is the switch's recorded **on-time** (any
+  source: scheduler, manual, automation — *not* the thermostat-gated energy
+  meter, so an over-ask self-heals) — then `open_cycle` pushes `need + deficit`
+  clamped to `[min,max]`; the uncapped `pending_owed` persists a deficit the daily
+  `max` can't satisfy. Cap defaults to `2 × max_minutes`. Both functions are pure
+  + tested. The row keeps `predicted_minutes` as the occupancy *need* (so
+  error/eval/gain measure demand), and `pushed_minutes`/`deficit_minutes` for what
+  was actually sent. The gain learns only on **clean** cycles (no backlog in play
+  *and* the switch ran ≈ the full ask — `CLEAN_CYCLE_TOL_MINUTES`), so a skip/defer
+  no longer drags it down. No switch / no recorder → backlog stays 0 = the plain
+  daily predictor.
 
 ## The dashboard card (read before touching `www/…card.js` or the attrs)
 
@@ -118,11 +133,14 @@ A Lovelace card can only read **entity state + attributes**, so the rationale it
 shows is published as sensor attributes — the card itself holds no model logic:
 
 - Load: `sensor.<load>_predicted_runtime` carries `breakdown` (the
-  `predictor.explain_load` dict — every formula term + the in-force params) and
-  `metrics` (the published actual-vs-predicted summary). Only the *runtime*
-  sensor gets these (via `attr_fn` on its description); the other load sensors
-  stay attribute-free. `explain_load` is **pure** and a test asserts it agrees
-  with `predict_kwh`/`predict_minutes` so the explanation can't drift.
+  `predictor.explain_load` dict — every formula term + the in-force params, incl.
+  `deficit_minutes` backlog and the `target_minutes` actually pushed) and
+  `metrics` (the published actual-vs-predicted summary + `deficit_minutes`). The
+  sensor *state* is the pushed target (need + backlog); `breakdown.predicted_minutes`
+  stays the need alone. Only the *runtime* sensor gets these (via `attr_fn`); the
+  other load sensors stay attribute-free. `explain_load` is **pure** and a test
+  asserts it agrees with `predict_kwh`/`predict_minutes`/`open_cycle` so the
+  explanation can't drift.
 - Forecast: `sensor.<name>_price_forecast` adds `coefficients`
   (`price_model.describe` — feature names + betas + intercept, sign = effect
   direction) and `fitted`, alongside the existing `days` / `data_today`.

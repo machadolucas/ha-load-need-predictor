@@ -11,6 +11,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .const import (
+    CONF_CONTROLLED_SWITCH_ENTITY,
+    CONF_DEFICIT_CAP_MINUTES,
     CONF_DELIVERED_ENERGY_ENTITY,
     CONF_DELIVERED_RUNTIME_ENTITY,
     CONF_FIT_DAYS,
@@ -29,6 +31,7 @@ from .const import (
     CONF_WATER_TOTAL_ENTITY,
     CONF_WEATHER_ENTITY,
     CONF_WIND_ENTITY,
+    DEFAULT_DEFICIT_CAP_FACTOR,
     DEFAULT_FIT_DAYS,
     DEFAULT_FORECAST_DAYS,
     DEFAULT_MAX_MINUTES,
@@ -58,6 +61,10 @@ class LoadConfig:
     # Output clamp (minutes/day).
     min_minutes: float
     max_minutes: float
+    # Deficit carryover: the controlled switch whose on-time measures runtime
+    # actually delivered (None → carryover disabled), and the backlog cap.
+    controlled_switch_entity: str | None
+    deficit_cap_minutes: float
 
 
 def _as_tuple(value) -> tuple[str, ...]:
@@ -71,6 +78,11 @@ def _as_tuple(value) -> tuple[str, ...]:
 
 def load_config_from_data(data: Mapping) -> LoadConfig:
     """Build a :class:`LoadConfig` from a subentry's ``data`` mapping."""
+    max_minutes = float(data.get(CONF_MAX_MINUTES, DEFAULT_MAX_MINUTES))
+    cap = data.get(CONF_DEFICIT_CAP_MINUTES)
+    deficit_cap_minutes = (
+        float(cap) if cap not in (None, "") else DEFAULT_DEFICIT_CAP_FACTOR * max_minutes
+    )
     return LoadConfig(
         name=str(data.get(CONF_NAME, "")),
         target_number_entity=data.get(CONF_TARGET_NUMBER_ENTITY),
@@ -83,7 +95,9 @@ def load_config_from_data(data: Mapping) -> LoadConfig:
         outdoor_temp_entity=data.get(CONF_OUTDOOR_TEMP_ENTITY),
         water_total_entity=data.get(CONF_WATER_TOTAL_ENTITY),
         min_minutes=float(data.get(CONF_MIN_MINUTES, DEFAULT_MIN_MINUTES)),
-        max_minutes=float(data.get(CONF_MAX_MINUTES, DEFAULT_MAX_MINUTES)),
+        max_minutes=max_minutes,
+        controlled_switch_entity=data.get(CONF_CONTROLLED_SWITCH_ENTITY),
+        deficit_cap_minutes=deficit_cap_minutes,
     )
 
 

@@ -61,6 +61,9 @@ def model_to_dict(state: ModelState) -> dict:
         "empty_house_factor": state.empty_house_factor,
         "sample_count": state.sample_count,
         "version": state.version,
+        "deficit_minutes": state.deficit_minutes,
+        "pending_owed_minutes": state.pending_owed_minutes,
+        "cycle_start_iso": state.cycle_start_iso,
     }
 
 
@@ -81,4 +84,7 @@ def model_from_dict(data: dict | None) -> ModelState:
         empty_house_factor=float(data.get("empty_house_factor", defaults.empty_house_factor)),
         sample_count=int(data.get("sample_count", defaults.sample_count)),
         version=str(data.get("version", defaults.version)),
+        deficit_minutes=float(data.get("deficit_minutes", defaults.deficit_minutes)),
+        pending_owed_minutes=float(data.get("pending_owed_minutes", defaults.pending_owed_minutes)),
+        cycle_start_iso=str(data.get("cycle_start_iso", defaults.cycle_start_iso)),
     )

@@ -60,6 +60,7 @@ def _runtime_attributes(result) -> dict:
             "rolling_mae_minutes": result.rolling_mae_minutes,
             "sample_count": result.sample_count,
             "last_push_ok": result.last_push_ok,
+            "deficit_minutes": result.deficit_minutes,
         },
     }
 

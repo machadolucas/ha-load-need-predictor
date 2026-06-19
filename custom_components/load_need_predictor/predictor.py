@@ -99,6 +99,17 @@ class ModelState:
     empty_house_factor: float = SEED_EMPTY_HOUSE_FACTOR
     sample_count: int = 0  # valid daily outcomes folded in so far (confidence)
     version: str = MODEL_VERSION
+    # ── Deficit carryover (backlog across predict→predict cycles) ──────────────
+    # A one-number proxy for tank state-of-charge: runtime (minutes) still owed
+    # because the scheduler skipped/under-ran past cycles. ``pending_owed_minutes``
+    # is the *uncapped* ask of the currently-open cycle and ``cycle_start_iso`` is
+    # when it opened — together they let the next predict measure how much
+    # actually ran and roll the unmet remainder forward. All neutral (0 / "")
+    # when no controlled-switch entity is configured, so the model degrades to
+    # the plain daily predictor. See :func:`close_cycle` / :func:`open_cycle`.
+    deficit_minutes: float = 0.0
+    pending_owed_minutes: float = 0.0
+    cycle_start_iso: str = ""
 
 
 def default_model_state() -> ModelState:
@@ -192,6 +203,51 @@ def predict_minutes(
     return clamp_minutes(minutes, min_minutes, max_minutes, step)
 
 
+# ── Deficit carryover ─────────────────────────────────────────────────────────
+# The scheduler decides *when* to run and may skip/defer a day on price or solar.
+# Neither side carries the unmet runtime forward, so a skipped day is lost. These
+# two pure functions implement a bounded backlog: the open cycle records what we
+# asked the tank to absorb; the next predict measures how much actually ran
+# (commanded switch on-time, from the recorder — *not* the thermostat-gated
+# energy meter) and rolls the remainder forward. An over-ask self-heals: the
+# contactor stays commanded so it clears to 0, while the tank thermostat trips
+# early to keep the water from overheating. See the coordinator for the wiring.
+
+
+def close_cycle(pending_owed_minutes: float, commanded_minutes: float, cap_minutes: float) -> float:
+    """Backlog (minutes) left after a predict→predict cycle.
+
+    ``pending_owed_minutes`` is what that cycle asked the tank to absorb (its
+    fresh need + the backlog carried in). ``commanded_minutes`` is how long the
+    load was actually switched on over the cycle (any source). Whatever did not
+    run rolls forward, clamped to ``[0, cap]`` so a long skip can't build an
+    unbounded backlog and a generous run clears it to zero.
+    """
+    residual = max(0.0, pending_owed_minutes) - max(0.0, commanded_minutes)
+    return _clamp(residual, 0.0, max(0.0, cap_minutes))
+
+
+def open_cycle(
+    need_minutes: float,
+    deficit_minutes: float,
+    min_minutes: float,
+    max_minutes: float,
+    step: int = DEFAULT_STEP_MINUTES,
+) -> tuple[float, int]:
+    """Begin a cycle: return ``(pending_owed, pushed_target)``.
+
+    ``pending_owed`` is the *uncapped* ask (this cycle's need + carried backlog),
+    kept uncapped so a deficit the per-day ``max`` clamp can't satisfy persists
+    into the next cycle. ``pushed_target`` is that ask clamped to the load's
+    runtime band — the value sent to the scheduler. With ``deficit_minutes`` 0
+    this reduces to :func:`predict_minutes`' clamping, so the no-backlog path is
+    byte-for-byte the plain predictor.
+    """
+    pending_owed = max(0.0, need_minutes) + max(0.0, deficit_minutes)
+    pushed = clamp_minutes(pending_owed, min_minutes, max_minutes, step)
+    return pending_owed, pushed
+
+
 def explain_load(
     state: ModelState,
     features: FeatureVector,
@@ -200,6 +256,7 @@ def explain_load(
     min_minutes: float,
     max_minutes: float,
     step: int = DEFAULT_STEP_MINUTES,
+    deficit_minutes: float = 0.0,
 ) -> dict:
     """Break the prediction into its terms for a human-readable rationale.
 
@@ -208,6 +265,11 @@ def explain_load(
     and the final clamped minutes. It recomputes the same arithmetic as
     :func:`predict_kwh` / :func:`predict_minutes`; the pure tests assert the two
     agree so this can never silently drift from the real prediction.
+
+    ``predicted_minutes`` is the occupancy need alone (it equals
+    :func:`predict_minutes`); ``deficit_minutes`` is the carried backlog and
+    ``target_minutes`` is what the scheduler is actually asked to run
+    (``need + backlog``, clamped — it equals :func:`open_cycle`'s pushed value).
     """
     people = max(0, features.people_home)
     occupancy_factor = 1.0 if people > 0 else state.empty_house_factor
@@ -218,6 +280,8 @@ def explain_load(
     predicted_kwh = max(0.0, pre_gain_kwh * state.gain)
     raw_minutes = kwh_to_minutes(predicted_kwh, rated_power_kw)
     minutes = clamp_minutes(raw_minutes, min_minutes, max_minutes, step)
+    deficit = max(0.0, deficit_minutes)
+    _, target_minutes = open_cycle(raw_minutes, deficit, min_minutes, max_minutes, step)
     # "clamped" = the safety floor or cap moved the answer (vs. only step-rounding).
     stepped = round(raw_minutes / step) * step
     return {
@@ -248,6 +312,9 @@ def explain_load(
         "predicted_kwh": predicted_kwh,
         "raw_minutes": raw_minutes,
         "predicted_minutes": minutes,
+        # Deficit carryover: backlog owed + the actual target pushed (need + backlog).
+        "deficit_minutes": round(deficit, 1),
+        "target_minutes": target_minutes,
         "clamped": minutes != stepped,
         # Conversion / clamp config (so the card can show the limits applied).
         "rated_power_kw": rated_power_kw,

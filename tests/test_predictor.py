@@ -39,6 +39,10 @@ def test_default_model_state_uses_seeds():
     assert s.gain == 1.0
     assert s.sample_count == 0
     assert s.version == "v1"
+    # Deficit carryover starts neutral (no backlog, no open cycle).
+    assert s.deficit_minutes == 0.0
+    assert s.pending_owed_minutes == 0.0
+    assert s.cycle_start_iso == ""
 
 
 # ── build_features ───────────────────────────────────────────────────────────
@@ -364,6 +368,100 @@ def test_explain_load_clamped_flag():
     mid = _explain(state, FeatureVector(people_home=2))
     assert mid["clamped"] is False
     assert mid["predicted_minutes"] == 150
+
+
+def test_explain_load_target_includes_backlog():
+    state = predictor.default_model_state()
+    fv = FeatureVector(people_home=2)  # 7.4 kWh / 3 kW × 60 = 148 min → need 150
+    info = _explain(state, fv, deficit_minutes=90)
+    assert info["deficit_minutes"] == 90
+    # The need-only number is unchanged and still matches predict_minutes.
+    assert info["predicted_minutes"] == predictor.predict_minutes(
+        state, fv, rated_power_kw=3.0, min_minutes=40, max_minutes=240
+    )
+    # target = need + backlog, clamped — must equal open_cycle's pushed value.
+    raw = predictor.kwh_to_minutes(predictor.predict_kwh(state, fv), 3.0)
+    _, pushed = predictor.open_cycle(raw, 90, 40, 240)
+    assert info["target_minutes"] == pushed
+    assert info["target_minutes"] > info["predicted_minutes"]
+
+
+def test_explain_load_no_backlog_target_equals_need():
+    state = predictor.default_model_state()
+    info = _explain(state, FeatureVector(people_home=2))
+    assert info["deficit_minutes"] == 0
+    assert info["target_minutes"] == info["predicted_minutes"]
+
+
+# ── deficit carryover (close_cycle / open_cycle) ─────────────────────────────
+
+
+def test_open_cycle_no_backlog_matches_plain_clamp():
+    # With no backlog, the pushed target is just the clamped need.
+    pending, pushed = predictor.open_cycle(148.0, 0.0, 40, 240)
+    assert pending == pytest.approx(148.0)
+    assert pushed == predictor.clamp_minutes(148.0, 40, 240)  # 150
+
+
+def test_open_cycle_keeps_owed_uncapped_but_clamps_push():
+    # Owed (need + backlog) stays uncapped so a deficit the per-day cap can't
+    # satisfy persists; the pushed target is clamped to the runtime band.
+    pending, pushed = predictor.open_cycle(300.0, 300.0, 40, 480)
+    assert pending == pytest.approx(600.0)
+    assert pushed == 480
+
+
+def test_close_cycle_full_run_clears_backlog():
+    assert predictor.close_cycle(300.0, 300.0, 960.0) == 0.0
+    assert predictor.close_cycle(300.0, 400.0, 960.0) == 0.0  # over-ran → still 0
+
+
+def test_close_cycle_skip_rolls_full_ask_forward():
+    assert predictor.close_cycle(300.0, 0.0, 960.0) == pytest.approx(300.0)
+
+
+def test_close_cycle_partial_run_rolls_remainder():
+    assert predictor.close_cycle(600.0, 480.0, 960.0) == pytest.approx(120.0)
+
+
+def test_close_cycle_clamps_to_cap():
+    # A long skip can't build an unbounded backlog.
+    assert predictor.close_cycle(2000.0, 0.0, 480.0) == 480.0
+
+
+def test_deficit_skip_then_recover_sequence():
+    # The plan's worked example: skip a day, make it up (bounded by the daily max).
+    minp, maxp, cap = 40, 480, 960
+    deficit = 0.0
+    # A normal day that runs in full leaves no backlog.
+    pending, pushed = predictor.open_cycle(300, deficit, minp, maxp)
+    assert pushed == 300
+    deficit = predictor.close_cycle(pending, 300, cap)
+    assert deficit == 0.0
+    # The scheduler skips this day (commanded 0) → the whole ask rolls forward.
+    pending, pushed = predictor.open_cycle(300, deficit, minp, maxp)
+    deficit = predictor.close_cycle(pending, 0, cap)
+    assert deficit == 300
+    # Next day asks for need + backlog (clamped to max) and runs in full.
+    pending, pushed = predictor.open_cycle(300, deficit, minp, maxp)
+    assert pushed == 480  # clamp(300 + 300)
+    deficit = predictor.close_cycle(pending, 480, cap)
+    assert deficit == 120  # the part the daily cap couldn't catch up
+    # The remainder clears the following day.
+    pending, pushed = predictor.open_cycle(300, deficit, minp, maxp)
+    assert pushed == 420
+    deficit = predictor.close_cycle(pending, 420, cap)
+    assert deficit == 0
+
+
+def test_phantom_backlog_auto_heals_when_run_in_full():
+    # A backlog the tank didn't actually need: we ask for it, the scheduler runs
+    # the full commanded time (the element's thermostat trips early internally),
+    # so commanded ≈ ask and the backlog clears — no permanent phantom.
+    pending, pushed = predictor.open_cycle(200, 200, 40, 480)
+    assert pushed == 405  # clamp_minutes(400) rounds to the 15-min step
+    # The scheduler runs the full pushed target → backlog clears (no phantom).
+    assert predictor.close_cycle(pending, pushed, 960) == 0.0
 
 
 def test_no_homeassistant_import():

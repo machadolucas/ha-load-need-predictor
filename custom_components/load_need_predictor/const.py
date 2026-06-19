@@ -40,6 +40,14 @@ CONF_TARGET_NUMBER_ENTITY = "target_number_entity"
 CONF_DELIVERED_ENERGY_ENTITY = "delivered_energy_entity"
 # Optional cross-check: a rolling/total runtime sensor (hours).
 CONF_DELIVERED_RUNTIME_ENTITY = "delivered_runtime_entity"
+# Optional: the load's controlled switch/contactor (the relay the scheduler
+# drives). Its recorded on-time — any source — is the runtime actually delivered,
+# which drives deficit carryover. Leave unset to disable carryover (plain daily
+# predictor). Must be the real contactor, not a thermostat-gated power sensor.
+CONF_CONTROLLED_SWITCH_ENTITY = "controlled_switch_entity"
+# Optional cap on the carried backlog (minutes). Defaults to a multiple of
+# max_minutes so a multi-day skip can be recovered, bounded against runaway.
+CONF_DEFICIT_CAP_MINUTES = "deficit_cap_minutes"
 CONF_RATED_POWER_KW = "rated_power_kw"  # kWh -> minutes conversion
 # Occupancy drivers (the only feature with real day-ahead leverage).
 CONF_PERSON_ENTITIES = "person_entities"
@@ -70,6 +78,16 @@ DEFAULT_FIT_DAYS = 365
 DEFAULT_RATED_POWER_KW = 3.0
 DEFAULT_MIN_MINUTES = 40  # ~2 kWh safety floor: never starve the tank
 DEFAULT_MAX_MINUTES = 240  # ~12 kWh cap: below the meter-reset outliers
+
+# ── Deficit carryover ────────────────────────────────────────────────────────
+# Cap the backlog at this multiple of max_minutes when no explicit cap is set —
+# enough to recover a ~2-day skip while bounding runaway after a long outage.
+DEFAULT_DEFICIT_CAP_FACTOR = 2.0
+# Slack (minutes) for the "clean cycle" gate on the demand learner: a cycle
+# is clean — safe to learn the gain from — only when no backlog is being worked
+# off and the scheduler ran roughly the full ask, so the meter reflects true
+# demand rather than a price-driven skip/defer. One step plus a margin.
+CLEAN_CYCLE_TOL_MINUTES = 30
 
 # The scheduler's ``number.<load>_target`` accepts whole 15-minute steps.
 TARGET_STEP_MINUTES = 15

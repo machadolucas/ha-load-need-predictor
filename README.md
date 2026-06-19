@@ -55,11 +55,13 @@ predicted_min  = clamp( predicted_kWh / rated_kW × 60 , min , max )
 ```
 
 - **Predict + push** runs each afternoon (after tomorrow's prices publish): it
-  builds the features, computes minutes, writes the Load Scheduler target, and
-  publishes its own `sensor.<load>_predicted_runtime`.
+  builds the features, computes minutes (today's need plus any carried-over
+  backlog — see *Catching up after a skipped day*), writes the Load Scheduler
+  target, and publishes its own `sensor.<load>_predicted_runtime`.
 - **Capture + log** runs late each evening: it reads the day's *actual* delivered
   energy from the recorder, completes the training row, updates the calibration
-  gain, and recomputes the evaluation metrics.
+  gain (only from *clean* days — see below), and recomputes the evaluation
+  metrics.
 
 ### How the runtime is calculated (worked example)
 
@@ -120,11 +122,39 @@ Two things then adjust these numbers over time:
 > every coordinator refresh (predict, capture, restart). Thresholds (12 h, 6 h) and
 > the guest weights (0.5 / 2.0) live in `occupancy.py`.
 
+### Catching up after a skipped day
+
+The scheduler is free to **skip** a day — defer an expensive, cloudy 24 h expecting
+a cheaper or sunnier tomorrow. By default that unmet runtime would simply be lost:
+the next day's target is sized for that day's occupancy alone. **Deficit carryover**
+fixes that. Point the load at its **controlled switch** (the relay the scheduler
+drives) and the predictor measures how long the load actually ran each
+predict-to-predict cycle and carries any shortfall forward — so a skipped day is
+*added* to the next day's target and made up.
+
+- The runtime actually delivered is read from the **switch's on-time**, from *any*
+  source — the scheduler, a manual boost, a comfort automation — so anything that
+  heats the tank correctly shrinks the backlog. It must be the real contactor,
+  **not** a thermostat-gated power sensor: asking for too much is harmless (the
+  tank's own thermostat trips early), and the backlog then clears on its own.
+- The backlog is **bounded** (default: twice the daily maximum) so a long outage
+  can't make it run away, and the per-day cap still limits one day's catch-up — a
+  deep deficit is recovered over several days, not in one giant run.
+- The calibration gain only learns from **clean** days: ones with no backlog being
+  worked off *and* where the load ran roughly the full target. So a price-driven
+  skip or defer can no longer trick the model into predicting less.
+
+Leave the controlled switch empty to disable catch-up — the predictor then behaves
+exactly as the plain daily model above. When enabled,
+`sensor.<load>_predicted_runtime` shows the **target** (need + backlog), and its
+`breakdown` attribute (and the dashboard card) splits out the need, the backlog,
+and the final target.
+
 ## Entities (per load)
 
 | Entity | Meaning |
 |---|---|
-| `sensor.<load>_predicted_runtime` | The forecast in minutes (also the forward-compatible "target source"). |
+| `sensor.<load>_predicted_runtime` | The pushed target in minutes — today's need plus any carried-over backlog (also the forward-compatible "target source"). |
 | `sensor.<load>_predicted_energy` | The forecast in kWh. |
 | `sensor.<load>_last_delivered` | Actual delivered energy captured for the previous day (kWh). |
 | `sensor.<load>_prediction_error` | Yesterday's \|predicted − actual\| in minutes. |
@@ -187,9 +217,9 @@ expanded into flat hourly slots; the scheduler's margin absorbs the coarseness.
 ## Dashboard card
 
 A bundled Lovelace card explains, in plain language, **how** each number was
-calculated — the occupancy/baseline/gain breakdown behind every load's runtime,
-and the wind/temperature regression behind the price forecast — with a
-"Predict now" / "Update forecast now" button on each.
+calculated — the occupancy/baseline/gain breakdown behind every load's runtime
+(plus any carried-over backlog), and the wind/temperature regression behind the
+price forecast — with a "Predict now" / "Update forecast now" button on each.
 
 The integration **auto-registers** the card on startup — it adds itself to the
 Lovelace **resource registry** (the same mechanism HACS uses), so no manual
@@ -232,8 +262,9 @@ Copy `custom_components/load_need_predictor` into your Home Assistant
 1. **Add the hub** and (optionally) adjust the predict/capture times.
 2. **Add a load** and follow the wizard: the Load Scheduler target `number` to
    drive, the delivered-energy sensor, the load's rated power, the people and
-   guests-calendar entities, optional log-only context sensors, and the
-   minute clamp.
+   guests-calendar entities, optional log-only context sensors, the minute clamp,
+   and — to enable catch-up after skipped days — the load's **controlled switch**
+   (the relay the scheduler drives) plus an optional backlog cap.
 
 The predictor is resilient if the Load Scheduler isn't installed yet: it keeps
 predicting and publishing its sensor, and simply skips the push.

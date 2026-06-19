@@ -20,6 +20,7 @@ _REDACT = {
     "target_number_entity",
     "delivered_energy_entity",
     "delivered_runtime_entity",
+    "controlled_switch_entity",
     "person_entities",
     "guests_calendar_entity",
     "supply_temp_entity",

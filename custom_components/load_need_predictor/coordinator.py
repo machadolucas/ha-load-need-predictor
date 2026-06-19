@@ -24,6 +24,7 @@ from homeassistant.util import dt as dt_util
 
 from .actuation import async_push_target
 from .const import (
+    CLEAN_CYCLE_TOL_MINUTES,
     DOMAIN,
     EVAL_WINDOW_DAYS,
     MAX_TRAINING_ROWS,
@@ -41,17 +42,19 @@ from .predictor import (
     apply_observation,
     blend_param,
     build_features,
+    clamp_minutes,
+    close_cycle,
     default_model_state,
     explain_load,
     is_valid_delivery,
     kwh_to_minutes,
+    open_cycle,
     predict_kwh,
-    predict_minutes,
     refit_occupancy_params,
     rolling_mae,
 )
 from .runtime import LoadNeedPredictorConfigEntry
-from .statistics_source import async_daily_delivered_kwh
+from .statistics_source import async_commanded_minutes, async_daily_delivered_kwh
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +70,9 @@ class LoadResult:
     rolling_mae_minutes: float | None = None
     sample_count: int = 0
     last_push_ok: bool | None = None
+    # Carried backlog (minutes) folded into the pushed target; None when deficit
+    # carryover is disabled (no controlled switch configured).
+    deficit_minutes: float | None = None
     # The prediction broken into its terms, for the dashboard card's rationale.
     rationale: dict | None = None
 
@@ -163,30 +169,68 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
 
         ``only`` restricts the work to a single subentry (used by the per-load
         "Predict now" button); the daily job passes nothing to do them all.
+
+        When a controlled switch is configured this also runs deficit carryover:
+        it first closes the previous predict→predict cycle (how much actually ran
+        vs. what was asked) and rolls the unmet remainder into a backlog, then
+        pushes today's occupancy need *plus* that backlog. Without a switch it is
+        the plain daily predictor (backlog stays 0).
         """
-        today = dt_util.now().date().isoformat()
+        now = dt_util.now()
+        today = now.date().isoformat()
         for subentry_id, cfg in self.load_configs().items():
             if only is not None and subentry_id != only:
                 continue
             state = self.model_for(subentry_id)
             features = build_features(await self.async_build_snapshot(cfg))
-            minutes = predict_minutes(
-                state,
-                features,
-                rated_power_kw=cfg.rated_power_kw,
-                min_minutes=cfg.min_minutes,
-                max_minutes=cfg.max_minutes,
-            )
+            need_raw = kwh_to_minutes(predict_kwh(state, features), cfg.rated_power_kw)
+            need_minutes = clamp_minutes(need_raw, cfg.min_minutes, cfg.max_minutes)
+
+            deficit = 0.0
+            if cfg.controlled_switch_entity:
+                deficit = state.deficit_minutes
+                commanded = await self._commanded_since(cfg, state.cycle_start_iso, now)
+                if commanded is not None and state.pending_owed_minutes > 0:
+                    deficit = close_cycle(
+                        state.pending_owed_minutes, commanded, cfg.deficit_cap_minutes
+                    )
+
+            pending_owed, pushed = open_cycle(need_raw, deficit, cfg.min_minutes, cfg.max_minutes)
+
+            if cfg.controlled_switch_entity:
+                # Persist the open cycle so the next predict can close it.
+                self.models[subentry_id] = state = replace(
+                    state,
+                    deficit_minutes=deficit,
+                    pending_owed_minutes=pending_owed,
+                    cycle_start_iso=now.isoformat(),
+                )
+
             self._push_ok[subentry_id] = await async_push_target(
-                self.hass, cfg.target_number_entity, minutes
+                self.hass, cfg.target_number_entity, pushed
             )
-            self._upsert_prediction_row(subentry_id, today, features, state, minutes)
+            self._upsert_prediction_row(
+                subentry_id, today, features, state, need_minutes, pushed, deficit
+            )
         self.async_persist()
         await self.async_refresh()
+
+    async def _commanded_since(self, cfg: LoadConfig, start_iso: str, end) -> float | None:
+        """Minutes the load's switch was on since ``start_iso`` (None if unknown).
+
+        ``None`` (no open cycle yet, unparseable timestamp, or the recorder
+        unavailable) tells the caller to leave the backlog untouched rather than
+        treat a missing reading as "nothing ran".
+        """
+        start = dt_util.parse_datetime(start_iso) if start_iso else None
+        if start is None or start >= end:
+            return None
+        return await async_commanded_minutes(self.hass, cfg.controlled_switch_entity, start, end)
 
     async def async_capture_and_log(self) -> None:
         """Read each load's actual delivery, complete its row, and calibrate."""
         day_start = dt_util.start_of_local_day()
+        now = dt_util.now()
         today = day_start.date().isoformat()
         for subentry_id, cfg in self.load_configs().items():
             if not cfg.delivered_energy_entity:
@@ -194,16 +238,36 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             actual_kwh = await async_daily_delivered_kwh(
                 self.hass, cfg.delivered_energy_entity, day_start
             )
-            self._record_actual(subentry_id, today, cfg, actual_kwh)
+            # Switch on-time over the day tells us whether the scheduler actually
+            # ran the ask — so the gain only learns from days the meter reflects
+            # true demand, not a price-driven skip/defer.
+            commanded_today = None
+            if cfg.controlled_switch_entity:
+                commanded_today = await async_commanded_minutes(
+                    self.hass, cfg.controlled_switch_entity, day_start, now
+                )
+            self._record_actual(subentry_id, today, cfg, actual_kwh, commanded_today)
         self.async_persist()
         await self.async_refresh()
 
     # ── training-row management ────────────────────────────────────────────────
 
     def _upsert_prediction_row(
-        self, subentry_id: str, date: str, features: FeatureVector, state: ModelState, minutes: int
+        self,
+        subentry_id: str,
+        date: str,
+        features: FeatureVector,
+        state: ModelState,
+        need_minutes: int,
+        pushed_minutes: int,
+        deficit_minutes: float,
     ) -> None:
-        """Write/replace today's row with the prediction, keeping any actuals."""
+        """Write/replace today's row with the prediction, keeping any actuals.
+
+        ``predicted_minutes`` stays the occupancy *need* (so the error/eval/gain
+        signals measure demand, unaffected by carryover); ``pushed_minutes`` is
+        what was actually sent to the scheduler (need + ``deficit_minutes``).
+        """
         rows = self.training.setdefault(subentry_id, [])
         row = {
             "date": date,
@@ -214,7 +278,9 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             "outdoor_temp": features.outdoor_temp,
             "water_total_delta": features.water_total_delta,
             "predicted_kwh": round(predict_kwh(state, features), 3),
-            "predicted_minutes": minutes,
+            "predicted_minutes": need_minutes,
+            "pushed_minutes": pushed_minutes,
+            "deficit_minutes": round(deficit_minutes, 1),
             "gain": round(state.gain, 4),
             "model_version": state.version,
             "actual_kwh": None,
@@ -233,7 +299,12 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         del rows[:-MAX_TRAINING_ROWS]  # cap the history
 
     def _record_actual(
-        self, subentry_id: str, date: str, cfg: LoadConfig, actual_kwh: float | None
+        self,
+        subentry_id: str,
+        date: str,
+        cfg: LoadConfig,
+        actual_kwh: float | None,
+        commanded_today: float | None = None,
     ) -> None:
         """Fill today's row with the actual delivery and calibrate the model."""
         rows = self.training.setdefault(subentry_id, [])
@@ -251,21 +322,48 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
 
         actual_minutes = round(kwh_to_minutes(actual_kwh, cfg.rated_power_kw))
         row["actual_minutes"] = actual_minutes
+        # A "clean" cycle ran roughly the full ask with no backlog in play, so the
+        # meter reflects demand rather than a skip/defer — only then do we learn.
+        clean = self._cycle_is_clean(subentry_id, cfg, row, commanded_today)
+        row["clean_cycle"] = clean
+
         predicted_minutes = row.get("predicted_minutes")
         if predicted_minutes is not None:
             error = abs(predicted_minutes - actual_minutes)
             row["abs_error_minutes"] = error
-            if valid:  # only learn from plausible days
+            if valid and clean:  # only learn from plausible, supply-clean days
                 errors = self.eval_errors.setdefault(subentry_id, [])
                 errors.append(error)
                 del errors[:-MAX_TRAINING_ROWS]
 
         predicted_kwh = row.get("predicted_kwh")
-        if valid and predicted_kwh:
+        if valid and clean and predicted_kwh:
             self.models[subentry_id] = apply_observation(
                 self.model_for(subentry_id), predicted_kwh, actual_kwh
             )
             self._maybe_refit(subentry_id)
+
+    def _cycle_is_clean(
+        self, subentry_id: str, cfg: LoadConfig, row: dict, commanded_today: float | None
+    ) -> bool:
+        """Whether today's delivery is a trustworthy demand sample for the gain.
+
+        Without carryover (no switch) every plausible day is fair game — the
+        original behaviour. With it, a day is *not* clean while a backlog is being
+        worked off (the meter under-reads demand then) or when the scheduler ran
+        materially less than asked (a price/solar skip/defer). A missing recorder
+        reading leaves learning enabled rather than starving the model.
+        """
+        if not cfg.controlled_switch_entity:
+            return True
+        if self.model_for(subentry_id).deficit_minutes >= CLEAN_CYCLE_TOL_MINUTES:
+            return False
+        if commanded_today is None:
+            return True
+        asked = row.get("pushed_minutes")
+        if asked is None:
+            asked = row.get("predicted_minutes") or 0
+        return commanded_today >= asked - CLEAN_CYCLE_TOL_MINUTES
 
     def _maybe_refit(self, subentry_id: str) -> None:
         """Blend in an empirical fit of E_base / E_draw once enough data exists.
@@ -320,13 +418,11 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             state = self.model_for(subentry_id)
             features = build_features(await self.async_build_snapshot(cfg))
             kwh = predict_kwh(state, features)
-            minutes = predict_minutes(
-                state,
-                features,
-                rated_power_kw=cfg.rated_power_kw,
-                min_minutes=cfg.min_minutes,
-                max_minutes=cfg.max_minutes,
-            )
+            need_raw = kwh_to_minutes(kwh, cfg.rated_power_kw)
+            # The headline runtime is what the scheduler is actually asked to run:
+            # occupancy need plus any standing backlog (0 when carryover is off).
+            deficit = state.deficit_minutes if cfg.controlled_switch_entity else 0.0
+            _, pushed = open_cycle(need_raw, deficit, cfg.min_minutes, cfg.max_minutes)
             errors = self.eval_errors.get(subentry_id, [])[-EVAL_WINDOW_DAYS:]
             completed = self._last_completed(subentry_id)
             rationale = explain_load(
@@ -335,15 +431,17 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
                 rated_power_kw=cfg.rated_power_kw,
                 min_minutes=cfg.min_minutes,
                 max_minutes=cfg.max_minutes,
+                deficit_minutes=deficit,
             )
             results[subentry_id] = LoadResult(
-                predicted_minutes=minutes,
+                predicted_minutes=pushed,
                 predicted_kwh=round(kwh, 3),
                 last_delivered_kwh=completed.get("actual_kwh") if completed else None,
                 prediction_error_minutes=completed.get("abs_error_minutes") if completed else None,
                 rolling_mae_minutes=round(rolling_mae(errors), 1) if errors else None,
                 sample_count=state.sample_count,
                 last_push_ok=self._push_ok.get(subentry_id),
+                deficit_minutes=round(deficit, 1) if cfg.controlled_switch_entity else None,
                 rationale=rationale,
             )
         return results

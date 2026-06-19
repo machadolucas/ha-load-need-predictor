@@ -44,6 +44,7 @@
             "target_number_entity": "Scheduler target (number)",
             "delivered_energy_entity": "Delivered energy sensor (kWh, total)",
             "delivered_runtime_entity": "Delivered runtime sensor (optional)",
+            "controlled_switch_entity": "Controlled switch (optional — enables catch-up)",
             "rated_power_kw": "Rated power (kW)",
             "person_entities": "People",
             "guests_calendar_entity": "Guests calendar",
@@ -51,12 +52,14 @@
             "outdoor_temp_entity": "Outdoor temperature (log-only)",
             "water_total_entity": "Household water total (log-only)",
             "min_minutes": "Minimum minutes/day (safety floor)",
-            "max_minutes": "Maximum minutes/day (cap)"
+            "max_minutes": "Maximum minutes/day (cap)",
+            "deficit_cap_minutes": "Backlog cap (minutes, optional)"
           },
           "data_description": {
             "target_number_entity": "The Load Scheduler target number this predictor drives (e.g. number.water_heater_lvv_target_runtime). The prediction is written here.",
             "delivered_energy_entity": "Energy delivered to the load (kWh, total/increasing). Its day-to-day change is the training signal.",
             "delivered_runtime_entity": "Optional run-time sensor; used as the delivered signal instead of energy ÷ rated power when run-time is the better measure.",
+            "controlled_switch_entity": "The load's switch/contactor — the relay the scheduler drives. Its recorded on-time (from any source: scheduler, a manual boost, an automation) measures the runtime actually delivered, so a day the scheduler skips on price/solar is carried over and made up the next day. Pick the real contactor, not a thermostat-gated power sensor. Leave empty to disable catch-up.",
             "rated_power_kw": "The load's power draw, used to convert predicted energy (kWh) into a run-time (minutes) for the scheduler target.",
             "person_entities": "People whose presence shifts demand. Counted when home for at least 12 h of the last 24 h, so a daytime absence (e.g. a meeting) doesn't drop them.",
             "guests_calendar_entity": "Calendar marking guest visits. Demand is weighted by visit length — a short visit (< 6 h) counts as ~half a person, a long one (≥ 6 h, likely sauna + showers) as two.",
@@ -64,7 +67,8 @@
             "outdoor_temp_entity": "Outdoor temperature. Logged for a future model; not used in the current prediction.",
             "water_total_entity": "Household water-meter total. Logged for a future model; not used in the current prediction.",
             "min_minutes": "Lower clamp on the pushed target — a safety floor so the load never starves.",
-            "max_minutes": "Upper clamp on the pushed target — a cap so a bad prediction can't over-run the load."
+            "max_minutes": "Upper clamp on the pushed target — a cap so a bad prediction can't over-run the load.",
+            "deficit_cap_minutes": "Largest backlog the catch-up can accumulate (minutes). Defaults to twice the daily cap — enough to recover a couple of skipped days without runaway after a long outage. Only used when a controlled switch is set."
           }
         }
       }
