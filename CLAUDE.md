@@ -165,6 +165,27 @@ uv pip install --python .venv313/bin/python -r requirements_test.txt
 - New model behaviour goes into a pure module as a tested function first, then is
   wired into the coordinator/jobs.
 
+## Releasing a version
+
+A release is the **version bump + commit on `main` + push + a GitHub release** —
+all four. HACS reads the version from `manifest.json` **and** picks up GitHub
+releases, so both must move together.
+
+1. Bump `"version"` in `custom_components/load_need_predictor/manifest.json`
+   (SemVer: **minor** for a feature — the 0.3.0/0.4.0/0.5.0/0.6.0 line — **patch**
+   for a fix/tweak — 0.2.2/0.5.1/0.5.2).
+2. Commit **directly to `main`** (every prior release is a direct main commit, not
+   a PR/branch — don't branch for a release). Message convention:
+   `vX.Y.Z: short description`, e.g. `v0.6.0: deficit carryover — make up loads…`.
+3. `git push origin main`.
+4. `gh release create vX.Y.Z --title "vX.Y.Z — short human description" --notes "…"`
+   The **GitHub release creates the tag** — there is no separate `git tag` step.
+
+Gotcha: local `git tag` lags far behind (it showed `v0.4.0` while shipped was
+`v0.6.0`) because release tags are created server-side by `gh release create` and
+never fetched. **Use `gh release list` to see the real latest version, not
+`git tag`.** Match the latest release's title style when writing the new one.
+
 ## Conventions
 
 - Comment the *why*, not the *what*; match the density in `predictor.py`.
