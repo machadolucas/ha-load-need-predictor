@@ -34,6 +34,81 @@ async def test_wind_series_missing_or_malformed(hass: HomeAssistant) -> None:
     assert await fs.async_wind_series_gw(hass, "sensor.wind2") == []
 
 
+async def test_wind_canonical_forecast_parsed_and_normalised_to_gw(hass: HomeAssistant) -> None:
+    hass.states.async_set(
+        "sensor.wind",
+        "2138",
+        {
+            "forecast": [
+                {
+                    "start": "2026-06-18T00:00:00+00:00",
+                    "end": "2026-06-18T01:00:00+00:00",
+                    "value": 2100.0,
+                },
+                {
+                    "start": "2026-06-18T01:00:00+00:00",
+                    "end": "2026-06-18T02:00:00+00:00",
+                    "value": 3000.0,
+                },
+            ],
+            "unit": "MW",
+            "source": "wind_forecast_fi",
+        },
+    )
+    series = await fs.async_wind_series_gw(hass, "sensor.wind")
+    assert len(series) == 2
+    assert series[0] == (datetime(2026, 6, 18, tzinfo=UTC), 2.1)
+    assert series[1] == (datetime(2026, 6, 18, 1, tzinfo=UTC), 3.0)
+
+
+async def test_wind_canonical_forecast_skips_malformed_entries(hass: HomeAssistant) -> None:
+    hass.states.async_set(
+        "sensor.wind",
+        "2138",
+        {
+            "forecast": [
+                {"start": "2026-06-18T00:00:00+00:00", "value": 2100.0},  # good
+                {"end": "2026-06-18T02:00:00+00:00", "value": 3000.0},  # missing start
+                {"start": "not-a-date", "value": 3000.0},  # unparseable date
+                {"start": "2026-06-18T03:00:00+00:00", "value": "not-a-number"},  # bad value
+                "not-a-dict",  # wrong shape entirely
+            ],
+        },
+    )
+    series = await fs.async_wind_series_gw(hass, "sensor.wind")
+    assert series == [(datetime(2026, 6, 18, tzinfo=UTC), 2.1)]
+
+
+async def test_wind_canonical_forecast_wins_over_legacy_series(hass: HomeAssistant) -> None:
+    t0 = 1781629200000  # epoch ms
+    hass.states.async_set(
+        "sensor.wind",
+        "2138",
+        {
+            "forecast": [{"start": "2026-06-18T00:00:00+00:00", "value": 2100.0}],
+            "series": [{"name": "wind", "data": [[t0, 9.9]]}],
+        },
+    )
+    series = await fs.async_wind_series_gw(hass, "sensor.wind")
+    assert series == [(datetime(2026, 6, 18, tzinfo=UTC), 2.1)]
+
+
+async def test_wind_empty_canonical_forecast_falls_back_to_legacy_series(
+    hass: HomeAssistant,
+) -> None:
+    t0 = 1781629200000  # epoch ms
+    hass.states.async_set(
+        "sensor.wind",
+        "2138",
+        {
+            "forecast": [],  # present but empty → fall back
+            "series": [{"name": "wind", "data": [[t0, 2.1]]}],
+        },
+    )
+    series = await fs.async_wind_series_gw(hass, "sensor.wind")
+    assert series == [(datetime.fromtimestamp(t0 / 1000, tz=UTC), 2.1)]
+
+
 async def test_daily_wind_means_gw(hass: HomeAssistant) -> None:
     base = dt_util.start_of_local_day() + timedelta(days=1)  # local midnight tomorrow
     series = [

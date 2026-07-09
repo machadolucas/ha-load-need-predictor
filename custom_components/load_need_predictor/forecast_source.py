@@ -2,21 +2,26 @@
 
 Three sources, all reaching ~72 h (unlike Nord Pool's day-ahead horizon):
 
-- **Future wind** — the ``finland_wind_forecast_average_fmi`` sensor carries an
-  hourly series in ``attributes.series[0].data`` as ``[epoch_ms, GW]`` pairs.
+- **Future wind** — the expected wind entity is a ``wind_forecast_fi`` sensor
+  carrying its canonical hourly series in ``attributes.forecast`` as
+  ``[{"start": <ISO8601 tz-aware>, "end": ..., "value": <MW>}, ...]``. The
+  legacy ``finland_wind_forecast_average_fmi`` REST sensor's
+  ``attributes.series[0].data`` as ``[epoch_ms, GW]`` pairs is kept as a
+  fallback for entities that haven't migrated yet.
 - **Future temperature** — a daily forecast via the ``weather.get_forecasts``
   service (``temperature``/``templow`` per day).
 - **History for fitting** — daily-mean long-term statistics for the price, the
   temperature and the wind sensors.
 
-Unit note: the wind sensor's *state / LTS is in MW* (~2138) while its *series
-attribute is in GW* (~2.1). We normalise everything to **GW** here so the model
-sees one consistent scale.
+Unit note: the wind sensor's *state / LTS is in MW* (~2138) — both the new and
+legacy sensors keep MW there — while the *forecast series is normalised to
+GW* here so the model sees one consistent scale.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 
 from homeassistant.core import HomeAssistant
@@ -29,12 +34,24 @@ _LOGGER = logging.getLogger(__name__)
 _MW_PER_GW = 1000.0
 
 
-async def async_wind_series_gw(hass: HomeAssistant, entity_id: str) -> list[tuple[datetime, float]]:
-    """Future hourly wind production (UTC datetime, GW) from the sensor's series."""
-    state = hass.states.get(entity_id)
-    if state is None:
-        return []
-    series = state.attributes.get("series")
+def _parse_canonical_forecast_gw(forecast: list) -> list[tuple[datetime, float]]:
+    """Parse ``wind_forecast_fi``'s canonical ``forecast`` attribute to (UTC, GW)."""
+    out: list[tuple[datetime, float]] = []
+    for entry in forecast:
+        try:
+            when = dt_util.parse_datetime(entry["start"])
+            if when is None:
+                continue
+            value = float(entry["value"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        out.append((dt_util.as_utc(when), value / _MW_PER_GW))
+    return out
+
+
+def _parse_legacy_series_gw(attributes: Mapping) -> list[tuple[datetime, float]]:
+    """Parse the legacy REST sensor's ``series[0].data`` [epoch_ms, GW] pairs."""
+    series = attributes.get("series")
     if not isinstance(series, list) or not series:
         return []
     data = series[0].get("data") if isinstance(series[0], dict) else None
@@ -48,6 +65,21 @@ async def async_wind_series_gw(hass: HomeAssistant, entity_id: str) -> list[tupl
         except (TypeError, ValueError, IndexError):
             continue
     return out
+
+
+async def async_wind_series_gw(hass: HomeAssistant, entity_id: str) -> list[tuple[datetime, float]]:
+    """Future hourly wind production (UTC datetime, GW) from the wind entity.
+
+    Prefers the canonical ``wind_forecast_fi`` ``forecast`` attribute (MW,
+    normalised to GW); falls back to the legacy REST sensor's GW ``series``.
+    """
+    state = hass.states.get(entity_id)
+    if state is None:
+        return []
+    forecast = state.attributes.get("forecast")
+    if isinstance(forecast, list) and forecast:
+        return _parse_canonical_forecast_gw(forecast)
+    return _parse_legacy_series_gw(state.attributes)
 
 
 def daily_wind_means_gw(series: list[tuple[datetime, float]]) -> dict[date, float]:
