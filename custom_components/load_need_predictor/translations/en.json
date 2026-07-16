@@ -51,6 +51,11 @@
             "supply_temp_entity": "Incoming-water temperature (log-only)",
             "outdoor_temp_entity": "Outdoor temperature (log-only)",
             "water_total_entity": "Household water total (log-only)",
+            "heating_active_entity": "Heating-active detector",
+            "tank_volume_l": "Tank volume",
+            "tank_setpoint_c": "Tank set temperature",
+            "tank_cold_in_c": "Cold-inlet temperature",
+            "tank_boost_soc_pct": "Low-charge boost threshold",
             "min_minutes": "Minimum minutes/day (safety floor)",
             "max_minutes": "Maximum minutes/day (cap)",
             "deficit_cap_minutes": "Backlog cap (minutes, optional)"
@@ -66,6 +71,11 @@
             "supply_temp_entity": "Incoming mains-water temperature. Logged for a future model; not used in the current prediction.",
             "outdoor_temp_entity": "Outdoor temperature. Logged for a future model; not used in the current prediction.",
             "water_total_entity": "Household water-meter total. Logged for a future model; not used in the current prediction.",
+            "heating_active_entity": "Binary sensor that is on only while the element actually draws power (contactor AND internal thermostat, e.g. an LED or current detector). Together with the controlled switch it detects 'thermostat tripped while commanded on' — the tank-is-full anchor that calibrates the charge estimate. Leave empty to disable the tank charge sensor.",
+            "tank_volume_l": "Hot-water tank volume in litres.",
+            "tank_setpoint_c": "The tank thermostat's set temperature.",
+            "tank_cold_in_c": "Cold-water inlet temperature at the house (annual average). Used to compute the tank's energy capacity.",
+            "tank_boost_soc_pct": "When the calibrated tank charge falls below this percentage, re-run predict + push immediately so the scheduler plans more heating. Leave empty to disable.",
             "min_minutes": "Lower clamp on the pushed target — a safety floor so the load never starves.",
             "max_minutes": "Upper clamp on the pushed target — a cap so a bad prediction can't over-run the load.",
             "deficit_cap_minutes": "Largest backlog the catch-up can accumulate (minutes). Defaults to twice the daily cap — enough to recover a couple of skipped days without runaway after a long outage. Only used when a controlled switch is set."
@@ -107,6 +117,7 @@
   "entity": {
     "sensor": {
       "predicted_runtime": { "name": "Predicted runtime" },
+      "tank_soc": { "name": "Tank charge" },
       "predicted_energy": { "name": "Predicted energy" },
       "last_delivered": { "name": "Last delivered" },
       "prediction_error": { "name": "Prediction error" },

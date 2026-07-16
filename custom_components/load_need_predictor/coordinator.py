@@ -33,7 +33,13 @@ from .const import (
 )
 from .models import LoadConfig, load_config_from_data
 from .occupancy import async_count_residents_home, async_guest_equivalents
-from .persistence import PredictorStore, model_from_dict, model_to_dict
+from .persistence import (
+    PredictorStore,
+    model_from_dict,
+    model_to_dict,
+    tank_from_dict,
+    tank_to_dict,
+)
 from .predictor import (
     SEED_E_BASE,
     SEED_E_DRAW_PER_PERSON,
@@ -55,6 +61,7 @@ from .predictor import (
 )
 from .runtime import LoadNeedPredictorConfigEntry
 from .statistics_source import async_commanded_minutes, async_daily_delivered_kwh
+from .tank_model import TankState, deficit_minutes_from_kwh
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -90,6 +97,9 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         self.training: dict[str, list[dict]] = {}
         self.eval_errors: dict[str, list[float]] = {}
         self._push_ok: dict[str, bool] = {}
+        # Tank state-of-charge, mutated by the tank tracker but owned here so the
+        # debounced snapshot doesn't drop it (see tank_tracker for the rationale).
+        self.tanks: dict[str, TankState] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -100,6 +110,8 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             self.models[subentry_id] = model_from_dict(payload.get("model"))
             self.training[subentry_id] = list(payload.get("training", []))
             self.eval_errors[subentry_id] = list(payload.get("eval", []))
+            if (tank := payload.get("tank")) and (restored := tank_from_dict(tank)) is not None:
+                self.tanks[subentry_id] = restored
 
     def _runtime_snapshot(self) -> dict:
         """Serialise everything persistable (called by the debounced save)."""
@@ -108,6 +120,12 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
                 "model": model_to_dict(self.models.get(subentry_id, default_model_state())),
                 "training": self.training.get(subentry_id, []),
                 "eval": self.eval_errors.get(subentry_id, []),
+                # Additive: only present for loads with tank tracking enabled.
+                **(
+                    {"tank": tank_to_dict(self.tanks[subentry_id])}
+                    if subentry_id in self.tanks
+                    else {}
+                ),
             }
             for subentry_id in self.load_configs()
         }
@@ -159,7 +177,16 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             "weekend": now.weekday() >= 5,
             "supply_temp": self._state_float(cfg.supply_temp_entity),
             "outdoor_temp": self._state_float(cfg.outdoor_temp_entity),
-            "water_total_delta": None,
+            # A generic daily-`change` statistics read despite the kWh-named helper:
+            # the value is in the meter's own unit (m³ here). Log-only context — the
+            # v1 model ignores it (see CLAUDE.md's data findings).
+            "water_total_delta": (
+                await async_daily_delivered_kwh(
+                    self.hass, cfg.water_total_entity, dt_util.start_of_local_day()
+                )
+                if cfg.water_total_entity
+                else None
+            ),
         }
 
     # ── daily jobs (driven by jobs.py) ─────────────────────────────────────────
@@ -186,23 +213,46 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             need_raw = kwh_to_minutes(predict_kwh(state, features), cfg.rated_power_kw)
             need_minutes = clamp_minutes(need_raw, cfg.min_minutes, cfg.max_minutes)
 
-            deficit = 0.0
+            # Commanded-minutes bookkeeping: close the previous predict→predict
+            # cycle. This is the backlog fallback — it keeps running/persisting
+            # even when a calibrated tank supersedes it for the pushed target.
+            bookkept_deficit = 0.0
             if cfg.controlled_switch_entity:
-                deficit = state.deficit_minutes
+                bookkept_deficit = state.deficit_minutes
                 commanded = await self._commanded_since(cfg, state.cycle_start_iso, now)
                 if commanded is not None and state.pending_owed_minutes > 0:
-                    deficit = close_cycle(
+                    bookkept_deficit = close_cycle(
                         state.pending_owed_minutes, commanded, cfg.deficit_cap_minutes
                     )
 
-            pending_owed, pushed = open_cycle(need_raw, deficit, cfg.min_minutes, cfg.max_minutes)
+            # SoC feedback #1: the measured tank deficit is a better backlog than
+            # the commanded-minutes bookkeeping — it self-heals on manual heating,
+            # early thermostat trips and skips alike. Over-ask is physically safe
+            # (the thermostat just trips). Only a *calibrated* tank overrides.
+            deficit = bookkept_deficit
+            tank = self.tanks.get(subentry_id)
+            deficit_source = "commanded" if cfg.controlled_switch_entity else None
+            if tank is not None and tank.calibrated:
+                deficit = min(
+                    max(deficit_minutes_from_kwh(tank.deficit_kwh, cfg.rated_power_kw), 0.0),
+                    cfg.deficit_cap_minutes,
+                )
+                deficit_source = "tank"
+
+            # ``pushed`` reflects the effective (possibly tank-overridden) deficit.
+            _, pushed = open_cycle(need_raw, deficit, cfg.min_minutes, cfg.max_minutes)
 
             if cfg.controlled_switch_entity:
-                # Persist the open cycle so the next predict can close it.
+                # Persist the open cycle from the *bookkept* deficit (not the tank
+                # override) so the commanded-minutes backlog stays a valid fallback
+                # and the clean-cycle gain gate reads an untouched deficit.
+                bookkept_pending, _ = open_cycle(
+                    need_raw, bookkept_deficit, cfg.min_minutes, cfg.max_minutes
+                )
                 self.models[subentry_id] = state = replace(
                     state,
-                    deficit_minutes=deficit,
-                    pending_owed_minutes=pending_owed,
+                    deficit_minutes=bookkept_deficit,
+                    pending_owed_minutes=bookkept_pending,
                     cycle_start_iso=now.isoformat(),
                 )
 
@@ -210,7 +260,7 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
                 self.hass, cfg.target_number_entity, pushed
             )
             self._upsert_prediction_row(
-                subentry_id, today, features, state, need_minutes, pushed, deficit
+                subentry_id, today, features, state, need_minutes, pushed, deficit, deficit_source
             )
         self.async_persist()
         await self.async_refresh()
@@ -261,12 +311,16 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         need_minutes: int,
         pushed_minutes: int,
         deficit_minutes: float,
+        deficit_source: str | None = None,
     ) -> None:
         """Write/replace today's row with the prediction, keeping any actuals.
 
         ``predicted_minutes`` stays the occupancy *need* (so the error/eval/gain
         signals measure demand, unaffected by carryover); ``pushed_minutes`` is
         what was actually sent to the scheduler (need + ``deficit_minutes``).
+        ``deficit_source`` records where the backlog came from — ``"tank"`` (a
+        calibrated tank's measured deficit), ``"commanded"`` (the switch on-time
+        bookkeeping), or ``None`` (carryover disabled).
         """
         rows = self.training.setdefault(subentry_id, [])
         row = {
@@ -281,6 +335,7 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             "predicted_minutes": need_minutes,
             "pushed_minutes": pushed_minutes,
             "deficit_minutes": round(deficit_minutes, 1),
+            "deficit_source": deficit_source,
             "gain": round(state.gain, 4),
             "model_version": state.version,
             "actual_kwh": None,
@@ -358,6 +413,11 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             return True
         if self.model_for(subentry_id).deficit_minutes >= CLEAN_CYCLE_TOL_MINUTES:
             return False
+        # The row's deficit is the *effective* backlog folded into the push — with
+        # a calibrated tank it can be nonzero while the bookkept value above is 0.
+        # A tank-refill day delivers backlog + demand, so it must not teach either.
+        if (row.get("deficit_minutes") or 0) >= CLEAN_CYCLE_TOL_MINUTES:
+            return False
         if commanded_today is None:
             return True
         asked = row.get("pushed_minutes")
@@ -422,6 +482,14 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             # The headline runtime is what the scheduler is actually asked to run:
             # occupancy need plus any standing backlog (0 when carryover is off).
             deficit = state.deficit_minutes if cfg.controlled_switch_entity else 0.0
+            # SoC feedback #1: a calibrated tank's measured deficit supersedes the
+            # bookkept backlog for the in-force target the sensors/card show.
+            tank = self.tanks.get(subentry_id)
+            if tank is not None and tank.calibrated:
+                deficit = min(
+                    max(deficit_minutes_from_kwh(tank.deficit_kwh, cfg.rated_power_kw), 0.0),
+                    cfg.deficit_cap_minutes,
+                )
             _, pushed = open_cycle(need_raw, deficit, cfg.min_minutes, cfg.max_minutes)
             errors = self.eval_errors.get(subentry_id, [])[-EVAL_WINDOW_DAYS:]
             completed = self._last_completed(subentry_id)

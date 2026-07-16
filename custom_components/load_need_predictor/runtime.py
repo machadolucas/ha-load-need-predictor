@@ -16,6 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 if TYPE_CHECKING:
     from .coordinator import LoadNeedPredictorCoordinator
     from .forecast_coordinator import PriceForecastCoordinator
+    from .tank_tracker import TankTracker
 
 
 @dataclass
@@ -24,6 +25,7 @@ class RuntimeData:
 
     load: LoadNeedPredictorCoordinator
     forecast: PriceForecastCoordinator | None = None
+    tank: TankTracker | None = None
 
 
 type LoadNeedPredictorConfigEntry = ConfigEntry[RuntimeData]

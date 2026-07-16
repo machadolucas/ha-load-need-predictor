@@ -111,3 +111,66 @@ async def test_price_forecast_sensor_exposes_coefficients(hass: HomeAssistant) -
     # No fit yet (build was mocked out) → seed formula, no coefficients.
     assert state.attributes["fitted"] is False
     assert state.attributes["coefficients"] is None
+
+
+async def test_non_tank_load_has_no_tank_sensor(hass: HomeAssistant) -> None:
+    # The base setup's load has no heating detector → no tank charge sensor.
+    entry = await _setup(hass)
+    eid = er.async_get(hass).async_get_entity_id("sensor", DOMAIN, f"{_load_id(entry)}_tank_soc")
+    assert eid is None
+
+
+_TANK_LOAD = {
+    "name": "LVV",
+    "target_number_entity": "number.lvv_target",
+    "delivered_energy_entity": "sensor.lvv_energy",
+    "rated_power_kw": 3.0,
+    "person_entities": ["person.a"],
+    "heating_active_entity": "binary_sensor.led",
+    "water_total_entity": "sensor.water",
+    "tank_volume_l": 300,
+    "tank_setpoint_c": 75,
+    "tank_cold_in_c": 12,
+}
+
+# The documented tank-charge attribute keys the card reads (HA adds its own on top).
+_TANK_ATTRS = {
+    "deficit_kwh",
+    "capacity_kwh",
+    "hot_fraction",
+    "standby_w",
+    "calibrated",
+    "last_full",
+    "draw_source",
+    "liters_40c",
+    "showers_left",
+}
+_HA_MANAGED = {"state_class", "unit_of_measurement", "icon", "friendly_name", "device_class"}
+
+
+async def test_tank_soc_attribute_contract(hass: HomeAssistant) -> None:
+    hass.states.async_set("person.a", "home")
+    hass.states.async_set("number.lvv_target", "0")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"name": "Predictor", "predict_time": "14:00:00", "capture_time": "23:55:00"},
+        subentries_data=[
+            ConfigSubentryData(
+                subentry_type=SUBENTRY_TYPE_LOAD, title="LVV", unique_id=None, data=_TANK_LOAD
+            )
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    sid = _load_id(entry)
+    await entry.runtime_data.tank.async_tick()
+    await hass.async_block_till_done()
+
+    state = hass.states.get(_sensor_id(hass, sid, "tank_soc"))
+    assert state is not None
+    assert _TANK_ATTRS <= set(state.attributes)  # every documented key present
+    # …and nothing extra beyond the documented keys + HA-managed ones.
+    assert set(state.attributes) - _TANK_ATTRS <= _HA_MANAGED
+    assert "breakdown" not in state.attributes  # not a load runtime sensor

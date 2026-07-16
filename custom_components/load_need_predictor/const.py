@@ -57,6 +57,22 @@ CONF_GUESTS_CALENDAR_ENTITY = "guests_calendar_entity"
 CONF_SUPPLY_TEMP_ENTITY = "supply_temp_entity"
 CONF_OUTDOOR_TEMP_ENTITY = "outdoor_temp_entity"
 CONF_WATER_TOTAL_ENTITY = "water_total_entity"
+
+# ── Tank state-of-charge (opt-in per load; see tank_model.py) ────────────────
+# Binary sensor proving the element actually draws power (contactor AND
+# internal thermostat, e.g. an LED/current detector); setting it enables the
+# tank charge sensor + tracker.
+CONF_HEATING_ACTIVE_ENTITY = "heating_active_entity"
+CONF_TANK_VOLUME_L = "tank_volume_l"
+CONF_TANK_SETPOINT_C = "tank_setpoint_c"
+# Cold-inlet temperature at the house — an annual average constant, NOT the
+# supply-water source sensor, which measures the lake and runs ~10 °C high in
+# summer.
+CONF_TANK_COLD_IN_C = "tank_cold_in_c"
+# Optional low-charge boost threshold; below this calibrated SoC the tracker
+# re-runs predict+push so the scheduler plans more heating. Empty disables.
+CONF_TANK_BOOST_SOC_PCT = "tank_boost_soc_pct"
+
 # Output clamp (minutes/day).
 CONF_MIN_MINUTES = "min_minutes"
 CONF_MAX_MINUTES = "max_minutes"
@@ -78,6 +94,11 @@ DEFAULT_FIT_DAYS = 365
 DEFAULT_RATED_POWER_KW = 3.0
 DEFAULT_MIN_MINUTES = 40  # ~2 kWh safety floor: never starve the tank
 DEFAULT_MAX_MINUTES = 240  # ~12 kWh cap: below the meter-reset outliers
+DEFAULT_TANK_VOLUME_L = 300.0
+DEFAULT_TANK_SETPOINT_C = 75.0
+DEFAULT_TANK_COLD_IN_C = 12.0
+DEFAULT_TANK_BOOST_SOC_PCT = 20.0
+TANK_TICK_SECONDS = 60  # tank tracker tick cadence
 
 # ── Deficit carryover ────────────────────────────────────────────────────────
 # Cap the backlog at this multiple of max_minutes when no explicit cap is set —

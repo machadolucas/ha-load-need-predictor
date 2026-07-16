@@ -30,6 +30,7 @@ from .const import (
     CONF_FIT_DAYS,
     CONF_FORECAST_DAYS,
     CONF_GUESTS_CALENDAR_ENTITY,
+    CONF_HEATING_ACTIVE_ENTITY,
     CONF_MAX_MINUTES,
     CONF_MIN_MINUTES,
     CONF_NAME,
@@ -39,6 +40,10 @@ from .const import (
     CONF_PRICE_ENTITY,
     CONF_RATED_POWER_KW,
     CONF_SUPPLY_TEMP_ENTITY,
+    CONF_TANK_BOOST_SOC_PCT,
+    CONF_TANK_COLD_IN_C,
+    CONF_TANK_SETPOINT_C,
+    CONF_TANK_VOLUME_L,
     CONF_TARGET_NUMBER_ENTITY,
     CONF_TEMP_HISTORY_ENTITY,
     CONF_WATER_TOTAL_ENTITY,
@@ -52,6 +57,9 @@ from .const import (
     DEFAULT_NAME,
     DEFAULT_PREDICT_TIME,
     DEFAULT_RATED_POWER_KW,
+    DEFAULT_TANK_COLD_IN_C,
+    DEFAULT_TANK_SETPOINT_C,
+    DEFAULT_TANK_VOLUME_L,
     DOMAIN,
     SUBENTRY_TYPE_LOAD,
     SUBENTRY_TYPE_PRICE_FORECAST,
@@ -135,6 +143,56 @@ def _load_schema(defaults: dict) -> vol.Schema:
             vol.Optional(
                 CONF_WATER_TOTAL_ENTITY, description=suggest(CONF_WATER_TOTAL_ENTITY)
             ): _SENSOR,
+            vol.Optional(
+                CONF_HEATING_ACTIVE_ENTITY, description=suggest(CONF_HEATING_ACTIVE_ENTITY)
+            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="binary_sensor")),
+            vol.Optional(
+                CONF_TANK_VOLUME_L,
+                default=defaults.get(CONF_TANK_VOLUME_L, DEFAULT_TANK_VOLUME_L),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=30,
+                    max=1000,
+                    step=10,
+                    unit_of_measurement="L",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_TANK_SETPOINT_C,
+                default=defaults.get(CONF_TANK_SETPOINT_C, DEFAULT_TANK_SETPOINT_C),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=40,
+                    max=95,
+                    step=1,
+                    unit_of_measurement="°C",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_TANK_COLD_IN_C,
+                default=defaults.get(CONF_TANK_COLD_IN_C, DEFAULT_TANK_COLD_IN_C),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=1,
+                    max=25,
+                    step=1,
+                    unit_of_measurement="°C",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_TANK_BOOST_SOC_PCT, description=suggest(CONF_TANK_BOOST_SOC_PCT)
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0,
+                    max=90,
+                    step=5,
+                    unit_of_measurement="%",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
             vol.Optional(
                 CONF_MIN_MINUTES, default=defaults.get(CONF_MIN_MINUTES, DEFAULT_MIN_MINUTES)
             ): _minutes_selector(),

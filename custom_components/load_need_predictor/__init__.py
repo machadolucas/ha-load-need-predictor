@@ -24,6 +24,7 @@ from .forecast_coordinator import PriceForecastCoordinator
 from .frontend import async_register_card
 from .jobs import PredictorJobs
 from .runtime import LoadNeedPredictorConfigEntry, RuntimeData
+from .tank_tracker import TankTracker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,12 +42,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigE
     await forecast.async_load_runtime()
     await forecast.async_config_entry_first_refresh()
 
-    entry.runtime_data = RuntimeData(load=load, forecast=forecast)
+    # The tank tracker shares the load coordinator's persisted state (it owns the
+    # tank dict) and drives its own 60 s tick.
+    tank = TankTracker(hass, entry, load)
 
-    # Both capabilities run on the hub's two daily wall-clock times.
+    entry.runtime_data = RuntimeData(load=load, forecast=forecast, tank=tank)
+
+    # Both daily capabilities run on the hub's two daily wall-clock times.
     jobs = PredictorJobs(hass, entry)
     jobs.async_start()
     entry.async_on_unload(jobs.async_shutdown)
+
+    # The tank tracker ticks on its own interval (registered only when a load
+    # opted in), independent of the daily jobs.
+    tank.async_start()
+    entry.async_on_unload(tank.async_shutdown_ticker)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
@@ -58,6 +68,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigE
         entry.async_create_background_task(
             hass, forecast.async_build_forecast(), "lnp-initial-forecast"
         )
+    # One backgrounded tick seeds the tank sensor + performs restart
+    # reconciliation without delaying setup.
+    if tank.has_tanks:
+        entry.async_create_background_task(hass, tank.async_tick(), "lnp-initial-tank-tick")
     return True
 
 

@@ -150,6 +150,51 @@ exactly as the plain daily model above. When enabled,
 `breakdown` attribute (and the dashboard card) splits out the need, the backlog,
 and the final target.
 
+### Tank charge % — how much hot water is left
+
+An opt-in, continuously updated **state-of-charge estimate** for the hot-water
+tank: `sensor.<load>_tank_charge` (0–100 %). It tracks the tank's **energy
+deficit below "full at setpoint"** with a minute-by-minute balance:
+
+- **Energy in** from the delivered-energy counter's deltas (cumulative, so
+  restarts and HA downtime lose nothing).
+- **Energy out** from the cold-water meter: household liters are first passed
+  through a **hot-flow cap** (~8 L/min sustained — hot water only moves through
+  taps and showers, so garden hoses and cold-only appliances beyond the cap are
+  attributed cold), then multiplied by a **learned hot fraction**.
+- **Standing loss** as a learned constant wattage.
+- **The calibration anchor**: when the contactor is commanded *on* but the
+  heating-active detector shows the element *idle* for a sustained spell, the
+  tank's own thermostat has tripped — the tank is **100 % full**, and the
+  estimate snaps to it. Between consecutive anchors the energy balance closes
+  exactly, which is what self-calibrates the hot fraction (large-draw cycles)
+  and the standing loss (near-zero-draw cycles). Every learned parameter is
+  clamped, dirty cycles (meter dropouts) never teach, and until the first
+  anchor the sensor reports `calibrated: false`.
+- If the water meter drops out, the model falls back to an occupancy-based draw
+  estimate (flagged via the `draw_source` attribute) and reconciles when the
+  meter returns, so OCR dropouts neither stall nor double-count.
+
+Attributes carry the full rationale (`deficit_kwh`, `capacity_kwh`,
+`hot_fraction`, `standby_w`, `calibrated`, `last_full`, `draw_source`) plus two
+human-friendly conversions: `liters_40c` (equivalent 40 °C water) and
+`showers_left`.
+
+**The charge feeds back into the prediction** (only once calibrated):
+
+- At predict time, the **measured** tank deficit replaces the commanded-minutes
+  backlog bookkeeping — it self-heals on manual boosts, early thermostat trips
+  and skipped days alike.
+- An optional **low-charge boost** re-runs predict + push immediately when the
+  charge falls below a threshold (default 20 %), so the scheduler plans more
+  heating before the tank runs cold. It re-arms only after the charge recovers
+  and fires at most once per six hours.
+
+Enable it by setting the load's **heating-active detector** (a binary sensor
+that is on only while the element actually draws power — e.g. an LED or current
+detector) plus the tank volume, set temperature and cold-inlet temperature. The
+controlled switch and water-meter entities are shared with the features above.
+
 ## Entities (per load)
 
 | Entity | Meaning |
@@ -160,6 +205,7 @@ and the final target.
 | `sensor.<load>_prediction_error` | Yesterday's \|predicted − actual\| in minutes. |
 | `sensor.<load>_rolling_mae` | Rolling mean absolute error (minutes) over the evaluation window. |
 | `sensor.<load>_sample_count` | How many self-logged days the model has learned from. |
+| `sensor.<load>_tank_charge` | Opt-in: estimated hot-water charge (%). Attributes carry the energy deficit/capacity, learned parameters, calibration state and a "showers left" estimate. |
 | `button.<load>_predict_now` | Recompute the prediction and push it to the scheduler **now** (no need to wait for the daily predict time). |
 
 ### When does it run? Publish time & DST
@@ -220,6 +266,8 @@ A bundled Lovelace card explains, in plain language, **how** each number was
 calculated — the occupancy/baseline/gain breakdown behind every load's runtime
 (plus any carried-over backlog), and the wind/temperature regression behind the
 price forecast — with a "Predict now" / "Update forecast now" button on each.
+Loads with tank tracking enabled also get a live **tank-charge bar** (red below
+25 %, with a "showers left" hint).
 
 The integration **auto-registers** the card on startup — it adds itself to the
 Lovelace **resource registry** (the same mechanism HACS uses), so no manual
@@ -264,7 +312,10 @@ Copy `custom_components/load_need_predictor` into your Home Assistant
    drive, the delivered-energy sensor, the load's rated power, the people and
    guests-calendar entities, optional log-only context sensors, the minute clamp,
    and — to enable catch-up after skipped days — the load's **controlled switch**
-   (the relay the scheduler drives) plus an optional backlog cap.
+   (the relay the scheduler drives) plus an optional backlog cap. To enable the
+   **tank charge %** estimate, also set the **heating-active detector** and the
+   tank volume / set temperature / cold-inlet temperature (and, optionally, the
+   low-charge boost threshold).
 
 The predictor is resilient if the Load Scheduler isn't installed yet: it keeps
 predicting and publishing its sensor, and simply skips the push.

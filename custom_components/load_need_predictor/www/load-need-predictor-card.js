@@ -15,13 +15,14 @@
  */
 
 const DOMAIN = "load_need_predictor";
-const CARD_VERSION = "0.6.0";
+const CARD_VERSION = "0.8.0";
 const DOC_URL = "https://github.com/machadolucas/ha-load-need-predictor";
 
 // translation_key values the integration assigns to its entities.
 const TK = {
   loadPrimary: "predicted_runtime",
   forecastPrimary: "price_forecast",
+  tankSoc: "tank_soc",
   predictNow: "predict_now",
   forecastNow: "forecast_now",
 };
@@ -125,10 +126,15 @@ class LoadNeedPredictorCard extends HTMLElement {
     const fp = JSON.stringify({
       cfg: this._config,
       exp: [...this._toggled.entries()].sort(),
-      st: devices.map((d) => {
-        const eid = d.keys[d.type === "load" ? TK.loadPrimary : TK.forecastPrimary];
-        const s = this._hass.states[eid];
-        return [eid, s ? s.state + "@" + s.last_updated : "none"];
+      st: devices.flatMap((d) => {
+        // The tank-charge sensor updates every minute, unlike the daily primary —
+        // it must join the fingerprint or the bar would go stale until midnight.
+        const eids = [d.keys[d.type === "load" ? TK.loadPrimary : TK.forecastPrimary]];
+        if (d.keys[TK.tankSoc]) eids.push(d.keys[TK.tankSoc]);
+        return eids.map((eid) => {
+          const s = this._hass.states[eid];
+          return [eid, s ? s.state + "@" + s.last_updated : "none"];
+        });
       }),
     });
     if (fp === this._fingerprint) return;
@@ -186,6 +192,7 @@ class LoadNeedPredictorCard extends HTMLElement {
           ${btn}
         </div>
         <div class="big">${headline}</div>
+        ${tankRow(hass.states[d.keys[TK.tankSoc]])}
         ${loadExplanation(bd)}
         <div class="toggle" data-action="toggle" data-device="${d.deviceId}">
           ${open ? "Hide detail ▴" : "Show detail ▾"}
@@ -245,6 +252,28 @@ class LoadNeedPredictorCard extends HTMLElement {
       this._hass.callService(domain, service, {}, { entity_id: el.dataset.entity });
     }
   }
+}
+
+// ── tank charge bar (load) ───────────────────────────────────────────────────
+// Rendered only when the load has a tank_soc sensor (the tank feature is opt-in);
+// absent or non-numeric states (e.g. "unknown" before the first tick) hide the row.
+function tankRow(st) {
+  if (!st || Number.isNaN(Number(st.state))) return "";
+  const pct = Math.max(0, Math.min(100, Math.round(Number(st.state))));
+  const a = st.attributes || {};
+  const note =
+    a.calibrated === false
+      ? "calibrating…"
+      : isNum(a.showers_left)
+        ? `~${Math.round(a.showers_left)} showers`
+        : "";
+  const low = pct < 25 ? " low" : "";
+  return `<div class="tank" title="Estimated hot-water charge">
+    <span class="tl">Tank</span>
+    <div class="bar"><div class="fill${low}" style="width:${pct}%"></div></div>
+    <span class="tv">${pct}%</span>
+    ${note ? `<span class="muted tn">${esc(note)}</span>` : ""}
+  </div>`;
 }
 
 // ── natural-language composition (load) ─────────────────────────────────────
@@ -429,6 +458,14 @@ const STYLES = `
   .warn { color: var(--warning-color, #ffa600); font-size: 0.8rem; }
   .explain { font-size: 0.92rem; line-height: 1.45; color: var(--primary-text-color); }
   .explain b { font-weight: 600; }
+  .tank { display: flex; align-items: center; gap: 8px; margin: 2px 0 4px; font-size: 0.85rem; }
+  .tank .tl { color: var(--secondary-text-color); }
+  .tank .bar { flex: 1; max-width: 220px; height: 8px; border-radius: 4px;
+               background: var(--secondary-background-color); overflow: hidden; }
+  .tank .fill { height: 100%; border-radius: 4px; background: var(--primary-color); }
+  .tank .fill.low { background: var(--error-color, #db4437); }
+  .tank .tv { font-weight: 600; }
+  .tank .tn { font-size: 0.8rem; }
   .toggle { margin-top: 6px; font-size: 0.82rem; color: var(--primary-color); cursor: pointer; user-select: none; width: fit-content; }
   .detail { margin-top: 6px; }
   .sub { font-size: 0.74rem; text-transform: uppercase; letter-spacing: .04em; color: var(--secondary-text-color); margin: 8px 0 4px; }

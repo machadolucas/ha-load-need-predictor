@@ -18,6 +18,7 @@ from .const import (
     CONF_FIT_DAYS,
     CONF_FORECAST_DAYS,
     CONF_GUESTS_CALENDAR_ENTITY,
+    CONF_HEATING_ACTIVE_ENTITY,
     CONF_MAX_MINUTES,
     CONF_MIN_MINUTES,
     CONF_NAME,
@@ -26,6 +27,10 @@ from .const import (
     CONF_PRICE_ENTITY,
     CONF_RATED_POWER_KW,
     CONF_SUPPLY_TEMP_ENTITY,
+    CONF_TANK_BOOST_SOC_PCT,
+    CONF_TANK_COLD_IN_C,
+    CONF_TANK_SETPOINT_C,
+    CONF_TANK_VOLUME_L,
     CONF_TARGET_NUMBER_ENTITY,
     CONF_TEMP_HISTORY_ENTITY,
     CONF_WATER_TOTAL_ENTITY,
@@ -37,6 +42,9 @@ from .const import (
     DEFAULT_MAX_MINUTES,
     DEFAULT_MIN_MINUTES,
     DEFAULT_RATED_POWER_KW,
+    DEFAULT_TANK_COLD_IN_C,
+    DEFAULT_TANK_SETPOINT_C,
+    DEFAULT_TANK_VOLUME_L,
 )
 
 
@@ -58,6 +66,12 @@ class LoadConfig:
     supply_temp_entity: str | None
     outdoor_temp_entity: str | None
     water_total_entity: str | None
+    # Tank state-of-charge (opt-in: tracked only when heating_active_entity is set).
+    heating_active_entity: str | None
+    tank_volume_l: float
+    tank_setpoint_c: float
+    tank_cold_in_c: float
+    tank_boost_soc_pct: float | None  # None → low-charge boost disabled
     # Output clamp (minutes/day).
     min_minutes: float
     max_minutes: float
@@ -83,6 +97,8 @@ def load_config_from_data(data: Mapping) -> LoadConfig:
     deficit_cap_minutes = (
         float(cap) if cap not in (None, "") else DEFAULT_DEFICIT_CAP_FACTOR * max_minutes
     )
+    boost = data.get(CONF_TANK_BOOST_SOC_PCT)
+    tank_boost_soc_pct = float(boost) if boost not in (None, "") else None
     return LoadConfig(
         name=str(data.get(CONF_NAME, "")),
         target_number_entity=data.get(CONF_TARGET_NUMBER_ENTITY),
@@ -94,6 +110,11 @@ def load_config_from_data(data: Mapping) -> LoadConfig:
         supply_temp_entity=data.get(CONF_SUPPLY_TEMP_ENTITY),
         outdoor_temp_entity=data.get(CONF_OUTDOOR_TEMP_ENTITY),
         water_total_entity=data.get(CONF_WATER_TOTAL_ENTITY),
+        heating_active_entity=data.get(CONF_HEATING_ACTIVE_ENTITY),
+        tank_volume_l=float(data.get(CONF_TANK_VOLUME_L, DEFAULT_TANK_VOLUME_L)),
+        tank_setpoint_c=float(data.get(CONF_TANK_SETPOINT_C, DEFAULT_TANK_SETPOINT_C)),
+        tank_cold_in_c=float(data.get(CONF_TANK_COLD_IN_C, DEFAULT_TANK_COLD_IN_C)),
+        tank_boost_soc_pct=tank_boost_soc_pct,
         min_minutes=float(data.get(CONF_MIN_MINUTES, DEFAULT_MIN_MINUTES)),
         max_minutes=max_minutes,
         controlled_switch_entity=data.get(CONF_CONTROLLED_SWITCH_ENTITY),

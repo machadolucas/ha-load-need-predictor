@@ -63,6 +63,7 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 |---|---|---|
 | `predictor.py` | **Pure** load model: features → kWh → minutes, seeds, gain EWMA, prior↔empirical blend, `build_features`, rolling MAE, deficit carryover (`close_cycle`/`open_cycle`) | no |
 | `price_model.py` | **Pure** price model: ridge regression of price on wind+temp with a cold interaction; seed fallback; fit/predict/serialize | no |
+| `tank_model.py` | **Pure** tank state-of-charge: energy-deficit integration (`apply_tick`), 100 %-anchor + EWMA calibration of `hot_fraction`/`standby_w`, hot-flow cap, meter-misread/fallback guards, boost gating (`should_boost`), liters/showers helpers | no |
 | `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig` | no |
 | `statistics_source.py` | Load delivery from the recorder (daily `change`) + commanded switch on-time over a window (`async_commanded_minutes`, for deficit carryover) | yes |
 | `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price | yes |
@@ -72,6 +73,7 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `jobs.py` | The two daily jobs; drives both coordinators | yes |
 | `coordinator.py` | Load `DataUpdateCoordinator`; per-load `LoadResult` | yes |
 | `forecast_coordinator.py` | Price-forecast coordinator: fit → build slots → evaluate; `ForecastResult` | yes |
+| `tank_tracker.py` | 60 s-tick coordinator: reads counters/switch/detector states, drives `tank_model.apply_tick`, publishes per-load `TankResult`, fires the low-charge boost | yes |
 | `runtime.py` | `RuntimeData` (both coordinators) + the `ConfigEntry` type alias | yes |
 | `config_flow.py` | Hub flow + `load` and `price_forecast` subentry wizards | yes |
 | `entity.py` | `PredictorEntity` (load) + `ForecastEntity` bases | yes |
@@ -127,6 +129,50 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   no longer drags it down. No switch / no recorder → backlog stays 0 = the plain
   daily predictor.
 
+## The tank model (read before touching `tank_model.py` / `tank_tracker.py`)
+
+- **`tank_model.py` must stay Home-Assistant-free** (importlib-tested like
+  `predictor.py`). It tracks `deficit_kwh` — energy below "full at setpoint" —
+  and `SoC = 1 − deficit/E_cap`; `E_cap` uses the configured `tank_cold_in_c`
+  (default 12 °C), **not** the supply-temp sensor (that one measures the lake
+  source and runs ~10 °C high in summer; the user's 7–8 h full-heat observation
+  validates 300 L × ΔT63 ≈ 22 kWh at 3 kW).
+- **Inputs are cumulative counters** (energy kWh, water litres) — deltas are
+  lossless across restarts/downtime; negative deltas mean resets → re-baseline,
+  never negative energy. Water litres pass a rate-based misread guard
+  (`MAX_PLAUSIBLE_FLOW_LPM` over the span since baseline) and a **hot-flow cap**
+  (`MAX_HOT_FLOW_LPM`, taps/showers only — garden/appliance cold draws beyond it
+  are attributed cold) before `hot_fraction` applies.
+- **The 100 % anchor**: contactor commanded on + heating-active detector off,
+  both sustained (60 s / 120 s via `last_changed` age — `unknown`/`unavailable`
+  map to None = "don't anchor", never "off"). Anchors fire on the *transition*
+  only (`anchor_latched` dedupes; deficit stays pinned 0 while latched).
+- **Learning invariants** (all in `learn_from_cycle`): only between two real
+  anchors (`calibrated` gate — the first anchor never learns), only on clean
+  cycles (no fallback/misread ticks), `hot_fraction` needs ≥ 50 metered litres,
+  `standby_w` needs a < 10 L, ≥ 12 h cycle; both EWMA (β = 0.2) and hard-clamped.
+  Meter dropouts fall back to an occupancy-based draw and reconcile via
+  `pending_fallback_kwh` when the meter returns (no double-count).
+- **SoC → prediction feedback**, gated on `calibrated`: at predict time the
+  measured tank deficit (kWh → minutes, clamped to the deficit cap) **replaces**
+  the commanded-minutes `close_cycle` backlog (which still runs as the
+  fallback; the training row records `deficit_source`), and the tracker's
+  low-charge boost (`tank_boost_soc_pct`) re-runs `async_predict_and_push` —
+  hysteresis + ≥ 6 h rate limit live in `should_boost`. Over-ask is physically
+  safe: the tank thermostat trips and the element idles.
+- Persistence: a `"tank"` key inside the load's existing per-subentry Store dict
+  (`tank_to_dict`/`tank_from_dict`, defaults-tolerant, `STORAGE_VERSION` still
+  1). `TankState` lives in `LoadNeedPredictorCoordinator.tanks` because
+  `_runtime_snapshot` rebuilds the whole dict on every save — state owned
+  elsewhere would be dropped. Saves: immediately on anchor/learn/boost, else
+  every ~15 ticks (the cumulative counters make the lost tail harmless).
+- The tracker ticks via its own `async_track_time_interval` (60 s), NOT a
+  coordinator `update_interval` — a polling coordinator stops while no entity
+  listens, which would silently freeze anchoring/learning. Per-load work is
+  wrapped so one broken entity never kills the loop. Future work: room-occupancy
+  draw attribution (bathroom motion ⇒ hot) if garden-heavy days still skew the
+  estimate.
+
 ## The dashboard card (read before touching `www/…card.js` or the attrs)
 
 A Lovelace card can only read **entity state + attributes**, so the rationale it
@@ -149,6 +195,10 @@ shows is published as sensor attributes — the card itself holds no model logic
   (`breakdown` ⇒ load, `data_today` ⇒ forecast) — rename-proof, no entity-id
   parsing. It is **vanilla JS, no build step** (ships + runs as-is); keep it that
   way. `frontend.py` registration is best-effort and must never break setup.
+- Loads may also own a `tank_soc` sensor (translation-key matched, opt-in): the
+  card renders a charge bar and must tolerate its absence, and the sensor's
+  state **must be part of the render fingerprint** — it updates every minute
+  while the runtime sensor changes daily, so leaving it out freezes the bar.
 
 ## Dev workflow
 

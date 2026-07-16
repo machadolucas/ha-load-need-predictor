@@ -18,13 +18,14 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfEnergy, UnitOfTime
+from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import SUBENTRY_TYPE_LOAD, SUBENTRY_TYPE_PRICE_FORECAST
-from .entity import ForecastEntity, PredictorEntity
+from .entity import ForecastEntity, PredictorEntity, TankEntity
 from .forecast_coordinator import ForecastResult
+from .models import load_config_from_data
 from .runtime import LoadNeedPredictorConfigEntry
 
 _EUR_PER_KWH = "€/kWh"
@@ -164,13 +165,16 @@ async def async_setup_entry(
     runtime = entry.runtime_data
     for subentry_id, subentry in entry.subentries.items():
         if subentry.subentry_type == SUBENTRY_TYPE_LOAD:
-            async_add_entities(
-                [
-                    PredictorSensor(runtime.load, subentry_id, subentry, description)
-                    for description in SENSORS
-                ],
-                config_subentry_id=subentry_id,
-            )
+            entities: list[SensorEntity] = [
+                PredictorSensor(runtime.load, subentry_id, subentry, description)
+                for description in SENSORS
+            ]
+            # The tank charge sensor is opt-in: only for loads with a heating
+            # detector configured (i.e. tank tracking enabled).
+            tank_enabled = load_config_from_data(subentry.data).heating_active_entity
+            if runtime.tank is not None and tank_enabled:
+                entities.append(TankSocSensor(runtime.tank, subentry_id, subentry))
+            async_add_entities(entities, config_subentry_id=subentry_id)
         elif (
             subentry.subentry_type == SUBENTRY_TYPE_PRICE_FORECAST and runtime.forecast is not None
         ):
@@ -207,6 +211,45 @@ class PredictorSensor(PredictorEntity, SensorEntity):
         if attr_fn is None or result is None:
             return None
         return attr_fn(result)
+
+
+class TankSocSensor(TankEntity, SensorEntity):
+    """The tank charge % (energy-balance SoC), with its rationale as attributes.
+
+    State is the current charge; the attributes expose the energy-balance terms
+    and the learned parameters so the card can explain the number. ``None`` state
+    (before the first tick) surfaces as ``unknown``.
+    """
+
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:water-percent"
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, coordinator, subentry_id, subentry) -> None:
+        super().__init__(coordinator, subentry_id, subentry, "tank_soc")
+
+    @property
+    def native_value(self) -> float | None:
+        result = self._result
+        return result.soc_pct if result else None
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        result = self._result
+        if result is None:
+            return None
+        return {
+            "deficit_kwh": round(result.deficit_kwh, 2),
+            "capacity_kwh": round(result.capacity_kwh, 2),
+            "hot_fraction": round(result.hot_fraction, 3),
+            "standby_w": round(result.standby_w, 1),
+            "calibrated": result.calibrated,
+            "last_full": result.last_full,
+            "draw_source": result.draw_source,
+            "liters_40c": round(result.liters_40c, 0),
+            "showers_left": round(result.showers_left, 1),
+        }
 
 
 class PriceForecastSensor(ForecastEntity, SensorEntity):

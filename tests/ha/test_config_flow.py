@@ -60,12 +60,23 @@ async def test_add_load_subentry(hass: HomeAssistant) -> None:
             "name": "LVV",
             "delivered_energy_entity": "sensor.lvv_energy",
             "rated_power_kw": 3.0,
+            "heating_active_entity": "binary_sensor.led",
+            "tank_volume_l": 300,
+            "tank_setpoint_c": 75,
+            "tank_cold_in_c": 12,
+            "tank_boost_soc_pct": 20,
         },
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert result["title"] == "LVV"
     await hass.async_block_till_done()
     assert len(entry.subentries) == 1
+    subentry = next(iter(entry.subentries.values()))
+    assert subentry.data["heating_active_entity"] == "binary_sensor.led"
+    assert subentry.data["tank_volume_l"] == 300
+    assert subentry.data["tank_setpoint_c"] == 75
+    assert subentry.data["tank_cold_in_c"] == 12
+    assert subentry.data["tank_boost_soc_pct"] == 20
 
 
 async def test_add_price_forecast_subentry(hass: HomeAssistant) -> None:
