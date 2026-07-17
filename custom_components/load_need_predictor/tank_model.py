@@ -92,6 +92,16 @@ WATER_STALE_AFTER_S = 900.0
 ANCHOR_MIN_HEATING_OFF_S = 60.0
 ANCHOR_MIN_CONTACTOR_ON_S = 120.0
 
+# ── Heating-active floor (the anchor's inverse) ───────────────────────────────
+# An element actively drawing power means the thermostat is calling for heat —
+# the tank is below setpoint by at least the hysteresis band, whatever the
+# energy balance says. Floor the deficit accordingly (≈ 5 % of a 300 L tank) so
+# the sensor can never read 100 % *while heating*; only a genuine
+# commanded-on-but-idle anchor shows full. Sustained ≥ 60 s so detector blips
+# can't inject the floor.
+HEATING_MIN_DEFICIT_KWH = 1.0
+HEATING_ACTIVE_MIN_S = 60.0
+
 # ── Cold start ────────────────────────────────────────────────────────────────
 # No ground truth on day 1 → assume half-full; ``calibrated`` stays False until
 # the first anchor so the SoC feedback never acts on this guess.
@@ -212,6 +222,11 @@ class TickInputs:
     water_counter_l: float | None
     contactor_on: bool | None
     heating_on: bool | None
+    # Seconds the entity has held its *current* state (from ``last_changed``),
+    # None when the state itself is unknown. The names reflect the anchor's
+    # reading (contactor on / heating off); when ``heating_on`` is True,
+    # ``heating_off_for_s`` therefore holds the time spent heating — which is
+    # what the heating-active deficit floor checks.
     contactor_on_for_s: float | None
     heating_off_for_s: float | None
     people_home: int | None
@@ -582,6 +597,16 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
     else:
         # Ordinary integrating tick: carry the deficit, accumulate the cycle, and
         # clear the latch so the next anchor transition can fire.
+        # The anchor's inverse: sustained active heating proves the tank is below
+        # setpoint by at least the thermostat hysteresis, so the balance may not
+        # read (near-)full — the seeds underestimate draws until calibrated, and
+        # without this floor the clamp would show 100 % with the element running.
+        if (
+            inputs.heating_on is True
+            and inputs.heating_off_for_s is not None
+            and inputs.heating_off_for_s >= HEATING_ACTIVE_MIN_S
+        ):
+            new_deficit = max(new_deficit, min(HEATING_MIN_DEFICIT_KWH, capacity))
         new_state = replace(
             base,
             deficit_kwh=new_deficit,

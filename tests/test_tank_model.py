@@ -761,6 +761,91 @@ def test_showers_left():
     assert tank.showers_left(160.0, per_shower=0.0) == 0.0
 
 
+# ── apply_tick: heating-active deficit floor (the anchor's inverse) ───────────
+
+
+def test_heating_active_floors_deficit():
+    # Element actively drawing ≥ 60 s → the tank cannot read (near-)full even if
+    # the balance says so: floor at HEATING_MIN_DEFICIT_KWH.
+    st = _state(deficit_kwh=0.5, energy_baseline_kwh=100.0, calibrated=True, standby_w=0.0)
+    inp = _inputs(
+        elapsed_s=60.0,
+        energy_counter_kwh=102.0,  # 2 kWh in would clamp the deficit to 0…
+        contactor_on=True,
+        heating_on=True,
+        contactor_on_for_s=600.0,
+        heating_off_for_s=600.0,  # …but it has been heating for 10 min
+    )
+    res = tank.apply_tick(st, PARAMS, inp)
+    assert res.state.deficit_kwh == pytest.approx(tank.HEATING_MIN_DEFICIT_KWH)
+    assert res.soc < 1.0
+
+
+def test_heating_active_floor_needs_sustained_on():
+    # A fresh heating flank (< 60 s) doesn't floor — detector blips can't inject it.
+    st = _state(deficit_kwh=0.0, energy_baseline_kwh=100.0, calibrated=True, standby_w=0.0)
+    inp = _inputs(
+        elapsed_s=60.0,
+        energy_counter_kwh=100.0,
+        e_base=0.0,
+        e_draw_per_person=0.0,
+        heating_on=True,
+        heating_off_for_s=30.0,
+    )
+    res = tank.apply_tick(st, PARAMS, inp)
+    assert res.state.deficit_kwh == 0.0
+
+
+def test_heating_floor_leaves_larger_deficit_alone():
+    st = _state(deficit_kwh=8.0, energy_baseline_kwh=100.0, calibrated=True, standby_w=0.0)
+    inp = _inputs(
+        elapsed_s=60.0,
+        energy_counter_kwh=100.0,
+        e_base=0.0,
+        e_draw_per_person=0.0,
+        heating_on=True,
+        heating_off_for_s=600.0,
+    )
+    res = tank.apply_tick(st, PARAMS, inp)
+    assert res.state.deficit_kwh == pytest.approx(8.0)
+
+
+def test_heating_floor_does_not_apply_when_idle_or_unknown():
+    for heating_on, held in ((False, 600.0), (None, None)):
+        st = _state(deficit_kwh=0.0, energy_baseline_kwh=100.0, calibrated=True, standby_w=0.0)
+        inp = _inputs(
+            elapsed_s=60.0,
+            energy_counter_kwh=100.0,
+            e_base=0.0,
+            e_draw_per_person=0.0,
+            heating_on=heating_on,
+            heating_off_for_s=held,
+        )
+        res = tank.apply_tick(st, PARAMS, inp)
+        assert res.state.deficit_kwh == 0.0
+
+
+def test_anchor_still_wins_over_heating_floor():
+    # A genuine commanded-on-but-idle anchor resets to full; the floor only
+    # applies while the element is actually drawing.
+    st = _state(
+        deficit_kwh=tank.HEATING_MIN_DEFICIT_KWH,
+        energy_baseline_kwh=100.0,
+        calibrated=True,
+    )
+    inp = _inputs(
+        energy_counter_kwh=100.0,
+        contactor_on=True,
+        heating_on=False,
+        contactor_on_for_s=600.0,
+        heating_off_for_s=120.0,
+    )
+    res = tank.apply_tick(st, PARAMS, inp)
+    assert res.anchored is True
+    assert res.state.deficit_kwh == 0.0
+    assert res.soc == 1.0
+
+
 # ── HA-free contract ──────────────────────────────────────────────────────────
 
 

@@ -166,7 +166,9 @@ deficit below "full at setpoint"** with a minute-by-minute balance:
 - **The calibration anchor**: when the contactor is commanded *on* but the
   heating-active detector shows the element *idle* for a sustained spell, the
   tank's own thermostat has tripped — the tank is **100 % full**, and the
-  estimate snaps to it. Between consecutive anchors the energy balance closes
+  estimate snaps to it. The inverse also holds: while the element is *actively
+  heating*, the tank is provably below setpoint, so the estimate is capped just
+  under full — only a genuine thermostat trip can show 100 %. Between consecutive anchors the energy balance closes
   exactly, which is what self-calibrates the hot fraction (large-draw cycles)
   and the standing loss (near-zero-draw cycles). Every learned parameter is
   clamped, dirty cycles (meter dropouts) never teach, and until the first

@@ -147,6 +147,12 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   both sustained (60 s / 120 s via `last_changed` age — `unknown`/`unavailable`
   map to None = "don't anchor", never "off"). Anchors fire on the *transition*
   only (`anchor_latched` dedupes; deficit stays pinned 0 while latched).
+- **The anchor's inverse — heating-active floor** (v0.8.1): the element actively
+  drawing (sustained ≥ 60 s) proves the tank is below setpoint by at least the
+  thermostat hysteresis, so the deficit is floored at
+  `HEATING_MIN_DEFICIT_KWH` (1 kWh ≈ 5 %) — the sensor can never read 100 %
+  *while heating* even when the seeded params under-track draws and the balance
+  clamps to 0. Only a genuine anchor shows full.
 - **Learning invariants** (all in `learn_from_cycle`): only between two real
   anchors (`calibrated` gate — the first anchor never learns), only on clean
   cycles (no fallback/misread ticks), `hot_fraction` needs ≥ 50 metered litres,

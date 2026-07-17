@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MANIFEST = _ROOT / "custom_components" / "load_need_predictor" / "manifest.json"
@@ -21,7 +22,9 @@ def _manifest() -> dict:
 def test_manifest_domain_and_version():
     data = _manifest()
     assert data["domain"] == "load_need_predictor"
-    assert data["version"] == "0.7.0"  # HACS requires a version string
+    # HACS requires a version string; check the SemVer shape rather than pinning
+    # the value (a pinned value silently fails on every release bump).
+    assert re.fullmatch(r"\d+\.\d+\.\d+", data["version"])
     assert data["config_flow"] is True
 
 
