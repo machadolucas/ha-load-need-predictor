@@ -41,6 +41,22 @@ Validated on ~3–4 months of long-term statistics for the author's LVV:
 - **Occupancy is the only feature with real leverage** and has **no LTS** (only
   ~10 days raw). → We must self-log occupancy + outcomes daily.
 
+**Tank (v0.9.0 replay of 2026-08-28→09-04):**
+
+- Anchors fire roughly daily; true trip residual rms ≈ 1 kWh (± ~4.5 SoC points).
+- Bias ≈ +0.1–0.3 kWh against the replay-fitted params (`hot_fraction` 0.248,
+  `standby_w` 114 W) — small enough that the old hard floor was solving a
+  problem the physics didn't have.
+- The old heating-active floor (v0.8.1) pinned the display at 95.4 % for 146 of
+  997 heating minutes across the week and caused 6 non-anchor jumps/week — the
+  soft-saturation redesign (below) replaces it.
+- Post-trip re-heat delivers ≈ 0.81 kWh roughly 45–60 min after a trip.
+- powercalc's delivered-energy counter tracks LED × 3 kW exactly but steps
+  0.5 kWh every 10 min rather than continuously — the source of the
+  display-only LED smoothing.
+- Hot/cold attribution noise (garden hose vs. shower) is the remaining error
+  floor; a hot-outlet pipe sensor is the only real fix, deferred.
+
 Consequence: v1 = calibrated, occupancy-gated constant + online gain + safety
 floor. Temperature/water are **logged only**, not used in the prediction.
 
@@ -132,52 +148,121 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 ## The tank model (read before touching `tank_model.py` / `tank_tracker.py`)
 
 - **`tank_model.py` must stay Home-Assistant-free** (importlib-tested like
-  `predictor.py`). It tracks `deficit_kwh` — energy below "full at setpoint" —
-  and `SoC = 1 − deficit/E_cap`; `E_cap` uses the configured `tank_cold_in_c`
-  (default 12 °C), **not** the supply-temp sensor (that one measures the lake
-  source and runs ~10 °C high in summer; the user's 7–8 h full-heat observation
-  validates 300 L × ΔT63 ≈ 22 kWh at 3 kW).
+  `predictor.py`). `SoC = 1 − display_deficit/E_cap`; `E_cap` uses the
+  configured `tank_cold_in_c` (default 12 °C), **not** the supply-temp sensor
+  (that one measures the lake source and runs ~10 °C high in summer; the
+  user's 7–8 h full-heat observation validates 300 L × ΔT63 ≈ 22 kWh at 3 kW).
 - **Inputs are cumulative counters** (energy kWh, water litres) — deltas are
   lossless across restarts/downtime; negative deltas mean resets → re-baseline,
   never negative energy. Water litres pass a rate-based misread guard
   (`MAX_PLAUSIBLE_FLOW_LPM` over the span since baseline) and a **hot-flow cap**
   (`MAX_HOT_FLOW_LPM`, taps/showers only — garden/appliance cold draws beyond it
   are attributed cold) before `hot_fraction` applies.
-- **The 100 % anchor**: contactor commanded on + heating-active detector off,
-  both sustained (60 s / 120 s via `last_changed` age — `unknown`/`unavailable`
-  map to None = "don't anchor", never "off"). Anchors fire on the *transition*
-  only (`anchor_latched` dedupes; deficit stays pinned 0 while latched).
-- **The anchor's inverse — heating-active floor** (v0.8.1): the element actively
-  drawing (sustained ≥ 60 s) proves the tank is below setpoint by at least the
-  thermostat hysteresis, so the deficit is floored at
-  `HEATING_MIN_DEFICIT_KWH` (1 kWh ≈ 5 %) — the sensor can never read 100 %
-  *while heating* even when the seeded params under-track draws and the balance
-  clamps to 0. Only a genuine anchor shows full.
-- **Learning invariants** (all in `learn_from_cycle`): only between two real
-  anchors (`calibrated` gate — the first anchor never learns), only on clean
-  cycles (no fallback/misread ticks), `hot_fraction` needs ≥ 50 metered litres,
-  `standby_w` needs a < 10 L, ≥ 12 h cycle; both EWMA (β = 0.2) and hard-clamped.
-  Meter dropouts fall back to an occupancy-based draw and reconcile via
-  `pending_fallback_kwh` when the meter returns (no double-count).
-- **SoC → prediction feedback**, gated on `calibrated`: at predict time the
-  measured tank deficit (kWh → minutes, clamped to the deficit cap) **replaces**
-  the commanded-minutes `close_cycle` backlog (which still runs as the
-  fallback; the training row records `deficit_source`), and the tracker's
-  low-charge boost (`tank_boost_soc_pct`) re-runs `async_predict_and_push` —
-  hysteresis + ≥ 6 h rate limit live in `should_boost`. Over-ask is physically
-  safe: the tank thermostat trips and the element idles.
+- **Three ledgers, three jobs** (v0.9.0 — a real-week replay showed the old
+  single clamped `deficit_kwh` was discarding information, not adding safety):
+  - `deficit_kwh` — clamped to `[0, E_cap]`, drives *control* (the
+    SoC→prediction feedback below; over-asking is physically safe, the
+    thermostat just trips).
+  - `cycle_unclamped_kwh` — the identical arithmetic with no clamp and no
+    post-trip relaxation, reset to 0 at each anchor; its value **at the next
+    trip is the residual** — the model's true error over that cycle — and is
+    what `learn_from_cycle` trains on.
+  - `cycle_relax_kwh` — post-trip relaxation accrued since the last trip and
+    not yet paid back; **paid down first** by any energy in, so a re-heat
+    clears it before it can bleed into the next cycle's draw.
+- **Soft saturation instead of a floor**: the *displayed* deficit
+  (`display_deficit_kwh` — what the % and the `deficit_kwh` attribute show)
+  runs `unclamped + relax` through a C¹ curve: identity above the model's own
+  uncertainty `σ`, and `σ²/(2σ − u)` below it (a slow `1/|u|` approach that
+  never quite reaches 0). `σ = max(0.05, residual_ratio × cycle_gross_kwh)` —
+  ~0 right at an anchor (no post-anchor cliff), growing with the flow
+  attributed since. **100 % shows only on the anchor transition tick**; every
+  tick after that the % declines again, smoothly, whether or not the element
+  is heating.
+- **Post-trip relaxation** models the mixing loss the thermostat feels once the
+  element idles: `cycle_relax_kwh` relaxes toward a learned `hysteresis_kwh`
+  (seed 0.8 kWh, τ = 45 min — the LVV's re-engage is seen ~45–60 min after a
+  trip) and feeds only the *display*. It is deliberately **excluded from the
+  learning ledger**: trip-to-trip energy conservation has no mixing loss in
+  it, and the 2026-08-28 replay showed including it biased the learner
+  +0.9 kWh.
+- **Daypart `hot_fraction_profile`** — 4 buckets by local hour (night 0–6,
+  morning 6–11, day 11–17, evening 17–24). Each qualifying anchor takes a
+  normalised-LMS step on the residual across whichever buckets carried litres
+  that cycle, then every bucket is pulled 5 % toward the profile mean (a
+  sparse bucket can't run away) and hard-clamped; `hot_fraction` is published
+  as the profile's mean. The replay separated evening ≈ 0.27 (showers) from
+  the rest of the day ≈ 0.20 (toilets/dishwasher/washer — cold-only) on the
+  author's house.
+- **Learner regimes** (`learn_from_cycle`, gated on `calibrated` + a clean
+  cycle — no fallback/misread ticks): cycles < 4 h are post-trip re-heats and
+  teach `hysteresis_kwh` only; ≥ 50 L metered in a longer cycle → the
+  hot-fraction profile learns; < 10 L over ≥ 12 h → `standby_w` absorbs the
+  residual instead. Long cycles also EWMA-update `residual_ratio` (the
+  saturation curve's σ scale). Step size is `LEARN_BETA = 0.1` (hysteresis and
+  residual_ratio use a faster 0.2) — the replay showed a faster learner chases
+  ±1 kWh of cycle-to-cycle noise and gets worse. Meter dropouts fall back to
+  an occupancy-based draw and reconcile via `pending_fallback_kwh` when the
+  meter returns (no double-count).
+- **The anchor + latch**: contactor commanded on + heating-active detector off,
+  both sustained (≥ 120 s / ≥ 60 s via `last_changed` age — `unknown`/
+  `unavailable` map to `None` = "don't anchor", never "off"). The *transition*
+  needs those sustained thresholds, but once latched (`anchor_latched`) the
+  latch itself only dedupes: it survives `unknown` blips and the scheduler's
+  off→on re-toggle at a slot boundary, and releases only on a *definite*
+  "element heating" or "contactor off". `TickResult.anchored` is True on the
+  transition tick only (that's when learning happens); `latched` stays True
+  for the whole trip, during which the tank keeps accruing standby/
+  relaxation/draws — the % drifts below 100 until the element re-engages or
+  the contactor drops.
+- **Counter rollback guard** (`COUNTER_ROLLBACK_TOL_KWH = 1.0`): a cumulative
+  energy counter that steps *down* by less than this is a restore-after-restart
+  (powercalc republished an older value after an HA restart on 2026-09-03),
+  not a reset — keep the old baseline and let the counter catch up; a larger
+  drop re-baselines as a genuine reset/meter swap.
+- **Display-only LED smoothing**: the powercalc counter steps 0.5 kWh every
+  10 min, so between steps `rated_power_kw × on-time` fills the gap for
+  display (`led_kwh_since_counter`, capped at 1 kWh so a stalled counter can't
+  run it away), cleared the instant the authoritative counter actually moves.
+- **Sensor attributes**: `deficit_kwh` (the shown/saturated value the % is
+  derived from), `deficit_raw_kwh` (the clamped control ledger — what the
+  SoC→prediction feedback actually uses), `uncertainty_kwh` (σ),
+  `hysteresis_kwh`, `hot_fraction_profile`, `latched`, plus the pre-existing
+  `capacity_kwh`, `hot_fraction`, `standby_w`, `calibrated`, `last_full`,
+  `draw_source`, `liters_40c`, `showers_left`.
+- **SoC → prediction feedback**, gated on `calibrated`, still reads the raw
+  **control ledger** (`deficit_raw_kwh`/`state.deficit_kwh`), never the
+  saturated display value — the curve is for the human-facing %, not for what
+  gets pushed to the scheduler. At predict time the measured deficit
+  (kWh → minutes, clamped to the deficit cap) **replaces** the
+  commanded-minutes `close_cycle` backlog (which still runs as the fallback;
+  the training row records `deficit_source`), and the tracker's low-charge
+  boost (`tank_boost_soc_pct`) re-runs `async_predict_and_push` — hysteresis +
+  ≥ 6 h rate limit live in `should_boost`. Over-ask is physically safe: the
+  tank thermostat trips and the element idles.
 - Persistence: a `"tank"` key inside the load's existing per-subentry Store dict
   (`tank_to_dict`/`tank_from_dict`, defaults-tolerant, `STORAGE_VERSION` still
-  1). `TankState` lives in `LoadNeedPredictorCoordinator.tanks` because
-  `_runtime_snapshot` rebuilds the whole dict on every save — state owned
-  elsewhere would be dropped. Saves: immediately on anchor/learn/boost, else
-  every ~15 ticks (the cumulative counters make the lost tail harmless).
+  1) — the v2 fields (`hot_fraction_profile`, `hysteresis_kwh`,
+  `residual_ratio`, `cycle_unclamped_kwh`, `cycle_relax_kwh`,
+  `led_kwh_since_counter`, …) all default so a pre-v2 payload loads as a flat
+  profile with no learning history. `TankState` lives in
+  `LoadNeedPredictorCoordinator.tanks` because `_runtime_snapshot` rebuilds the
+  whole dict on every save — state owned elsewhere would be dropped. Saves:
+  immediately on anchor/learn/boost, else every ~15 ticks (the cumulative
+  counters make the lost tail harmless).
 - The tracker ticks via its own `async_track_time_interval` (60 s), NOT a
   coordinator `update_interval` — a polling coordinator stops while no entity
   listens, which would silently freeze anchoring/learning. Per-load work is
-  wrapped so one broken entity never kills the loop. Future work: room-occupancy
-  draw attribution (bathroom motion ⇒ hot) if garden-heavy days still skew the
-  estimate.
+  wrapped so one broken entity never kills the loop.
+- **Regression-test the physics before touching a constant**:
+  `tests/fixtures/tank_week_2026-08-28.csv` (exported from HA history JSON via
+  `tools/replay_tank.py`) + `tests/test_tank_replay.py` replay a real week
+  through `apply_tick` and report/assert on the trip-residual distribution.
+  **Re-run the replay before changing any tank constant** — it's what caught
+  the old hard-floor design silently discarding delivered energy in the first
+  place. Future work: room-occupancy draw attribution (bathroom motion ⇒ hot)
+  if garden-heavy days still skew the estimate; a hot-outlet pipe sensor
+  remains the real fix for hot/cold attribution noise, deferred.
 
 ## The dashboard card (read before touching `www/…card.js` or the attrs)
 

@@ -216,9 +216,14 @@ class PredictorSensor(PredictorEntity, SensorEntity):
 class TankSocSensor(TankEntity, SensorEntity):
     """The tank charge % (energy-balance SoC), with its rationale as attributes.
 
-    State is the current charge; the attributes expose the energy-balance terms
-    and the learned parameters so the card can explain the number. ``None`` state
-    (before the first tick) surfaces as ``unknown``.
+    State is the current charge — derived from the *shown* deficit, i.e. the
+    control ledger passed through the model's saturation curve, so it only reads
+    100 % at a genuine thermostat-trip anchor. The attributes expose both
+    deficits (``deficit_kwh`` shown, ``deficit_raw_kwh`` the clamped control
+    ledger), the curve's uncertainty σ and post-trip hysteresis, and the learned
+    parameters (incl. the four per-daypart hot fractions behind the mean) so the
+    card can explain the number. ``None`` state (before the first tick) surfaces
+    as ``unknown``.
     """
 
     _attr_native_unit_of_measurement = PERCENTAGE
@@ -241,10 +246,15 @@ class TankSocSensor(TankEntity, SensorEntity):
             return None
         return {
             "deficit_kwh": round(result.deficit_kwh, 2),
+            "deficit_raw_kwh": round(result.deficit_raw_kwh, 2),
+            "uncertainty_kwh": round(result.uncertainty_kwh, 2),
+            "hysteresis_kwh": round(result.hysteresis_kwh, 2),
             "capacity_kwh": round(result.capacity_kwh, 2),
             "hot_fraction": round(result.hot_fraction, 3),
+            "hot_fraction_profile": [round(value, 3) for value in result.hot_fraction_profile],
             "standby_w": round(result.standby_w, 1),
             "calibrated": result.calibrated,
+            "latched": result.latched,
             "last_full": result.last_full,
             "draw_source": result.draw_source,
             "liters_40c": round(result.liters_40c, 0),

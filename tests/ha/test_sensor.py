@@ -136,10 +136,15 @@ _TANK_LOAD = {
 # The documented tank-charge attribute keys the card reads (HA adds its own on top).
 _TANK_ATTRS = {
     "deficit_kwh",
+    "deficit_raw_kwh",
+    "uncertainty_kwh",
+    "hysteresis_kwh",
     "capacity_kwh",
     "hot_fraction",
+    "hot_fraction_profile",
     "standby_w",
     "calibrated",
+    "latched",
     "last_full",
     "draw_source",
     "liters_40c",

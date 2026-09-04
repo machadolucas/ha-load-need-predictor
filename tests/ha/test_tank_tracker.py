@@ -173,13 +173,32 @@ async def test_anchor_pins_full_after_sustained_idle(hass: HomeAssistant, freeze
     assert tracker.data[sid].soc_pct != 100.0
     assert tracker.data[sid].calibrated is False
 
-    # Sustain both past the 120 s / 60 s thresholds → anchor fires.
+    # Sustain both past the 120 s / 60 s thresholds → the anchor *transition*
+    # fires and pins the tank exactly full.
     freezer.tick(timedelta(seconds=200))
     await tracker.async_tick()
     r = tracker.data[sid]
     assert r.soc_pct == 100.0
     assert r.calibrated is True
+    assert r.latched is True
     assert r.last_full is not None
+    assert r.deficit_kwh == pytest.approx(0.0, abs=1e-9)
+
+    # A following latched idle tick is *not* held at 100: the tank keeps losing
+    # energy (standby + post-trip mixing) until the element re-engages.
+    freezer.tick(timedelta(seconds=1800))
+    await tracker.async_tick()
+    after = tracker.data[sid]
+    assert after.latched is True
+    assert after.soc_pct < 100.0
+    assert after.soc_pct > 90.0  # a slow drift, not a collapse
+    assert after.deficit_kwh > 0.0
+
+    # The v2 diagnostics ride along on every result.
+    assert len(after.hot_fraction_profile) == 4
+    assert after.deficit_raw_kwh >= 0.0
+    assert after.uncertainty_kwh >= 0.05
+    assert after.hysteresis_kwh > 0.0
 
 
 async def test_unavailable_heating_never_anchors(hass: HomeAssistant, freezer) -> None:

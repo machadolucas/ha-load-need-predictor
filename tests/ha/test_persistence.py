@@ -55,6 +55,53 @@ def test_tank_dict_round_trip():
     assert tank_from_dict(tank_to_dict(state)) == state
 
 
+def test_tank_v2_dict_round_trip():
+    # The v2 fields include two tuples (JSON lists on disk) and a nullable float.
+    state = TankState(
+        deficit_kwh=5.5,
+        hot_fraction=0.25,
+        hot_fraction_profile=(0.2, 0.21, 0.22, 0.27),
+        hysteresis_kwh=0.9,
+        residual_ratio=0.2,
+        cycle_unclamped_kwh=-0.4,
+        cycle_gross_kwh=3.2,
+        cycle_relax_kwh=0.3,
+        cycle_hot_liters_by_bucket=(1.0, 2.0, 3.0, 4.0),
+        led_kwh_since_counter=0.25,
+    )
+    restored = tank_from_dict(tank_to_dict(state))
+    assert restored == state
+    # Tuples survive as tuples, not lists (the model indexes/zips them).
+    assert isinstance(restored.hot_fraction_profile, tuple)
+    assert isinstance(restored.cycle_hot_liters_by_bucket, tuple)
+
+
+def test_tank_from_dict_pre_v2_payload_defaults():
+    # A pre-v2 stored shape has none of the v2 keys: the profile loads empty
+    # ("flat at hot_fraction") and cycle_unclamped_kwh stays None ("start the
+    # learning ledger from the clamped deficit"), which is the migration path.
+    pre_v2 = {
+        "deficit_kwh": 6.0,
+        "hot_fraction": 0.3,
+        "standby_w": 88.0,
+        "calibrated": True,
+        "cycle_liters": 42.0,
+        "version": "v1",
+    }
+    state = tank_from_dict(pre_v2)
+    defaults = TankState(deficit_kwh=0.0)
+    assert state.deficit_kwh == 6.0
+    assert state.hot_fraction == 0.3
+    assert state.hot_fraction_profile == ()
+    assert state.cycle_unclamped_kwh is None
+    assert state.hysteresis_kwh == defaults.hysteresis_kwh
+    assert state.residual_ratio == defaults.residual_ratio
+    assert state.cycle_gross_kwh == 0.0
+    assert state.cycle_relax_kwh == 0.0
+    assert state.cycle_hot_liters_by_bucket == defaults.cycle_hot_liters_by_bucket
+    assert state.led_kwh_since_counter == 0.0
+
+
 def test_tank_from_dict_none_and_defaults():
     # Missing/empty → None (nothing stored); a partial payload keeps the rest at
     # its dataclass default, and the nullable baselines stay None.

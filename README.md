@@ -154,33 +154,66 @@ and the final target.
 
 An opt-in, continuously updated **state-of-charge estimate** for the hot-water
 tank: `sensor.<load>_tank_charge` (0–100 %). It tracks the tank's **energy
-deficit below "full at setpoint"** with a minute-by-minute balance:
+deficit below "full at setpoint"** with a minute-by-minute balance, then turns
+that into a percentage:
 
 - **Energy in** from the delivered-energy counter's deltas (cumulative, so
   restarts and HA downtime lose nothing).
 - **Energy out** from the cold-water meter: household liters are first passed
   through a **hot-flow cap** (~8 L/min sustained — hot water only moves through
   taps and showers, so garden hoses and cold-only appliances beyond the cap are
-  attributed cold), then multiplied by a **learned hot fraction**.
+  attributed cold), then multiplied by a **learned hot fraction** — tracked
+  separately for four times of day (night / morning / day / evening), since an
+  evening's showers draw a different share of the household's water than a
+  daytime's toilets and appliances.
 - **Standing loss** as a learned constant wattage.
-- **The calibration anchor**: when the contactor is commanded *on* but the
-  heating-active detector shows the element *idle* for a sustained spell, the
-  tank's own thermostat has tripped — the tank is **100 % full**, and the
-  estimate snaps to it. The inverse also holds: while the element is *actively
-  heating*, the tank is provably below setpoint, so the estimate is capped just
-  under full — only a genuine thermostat trip can show 100 %. Between consecutive anchors the energy balance closes
-  exactly, which is what self-calibrates the hot fraction (large-draw cycles)
-  and the standing loss (near-zero-draw cycles). Every learned parameter is
-  clamped, dirty cycles (meter dropouts) never teach, and until the first
-  anchor the sensor reports `calibrated: false`.
+
+**What "100 %" actually means.** When the contactor is commanded *on* but the
+heating-active detector shows the element *idle* for a sustained spell, the
+tank's own thermostat has just tripped — the tank is genuinely full, and that
+is the *only* moment the sensor reads 100 %:
+
+- **While the element is heating**, the % climbs smoothly toward full and only
+  actually touches 100 at the trip itself — never before it.
+- **Right after a trip, the % starts drifting back down again** — this is
+  expected, not a bug. The tank keeps losing a little energy to standing loss
+  and internal mixing even with the element idle, and the thermostat won't
+  re-engage until that drop is large enough to matter (its own hysteresis) —
+  the estimate tracks that decline so the number keeps meaning something
+  between trips instead of freezing at 100. A short top-up a little while
+  after the trip is normal too; the model has learned roughly how large that
+  usually is and folds it in, so the estimate doesn't overshoot what a brief
+  re-heat can explain.
+- Between two trips the energy balance closes exactly, which is what
+  self-calibrates the hot fraction (large-draw cycles), the standing loss
+  (near-zero-draw cycles) and the thermostat's typical top-up size, every
+  time. Every learned parameter is clamped and adapts slowly on purpose, so a
+  single noisy day can't swing the estimate. The model also tracks its own
+  uncertainty, so the estimate is confident right after a trip and gets
+  softer as more time passes without one. Until the first trip the sensor
+  reports `calibrated: false` and shows a cold-start guess.
 - If the water meter drops out, the model falls back to an occupancy-based draw
   estimate (flagged via the `draw_source` attribute) and reconciles when the
   meter returns, so OCR dropouts neither stall nor double-count.
 
-Attributes carry the full rationale (`deficit_kwh`, `capacity_kwh`,
-`hot_fraction`, `standby_w`, `calibrated`, `last_full`, `draw_source`) plus two
-human-friendly conversions: `liters_40c` (equivalent 40 °C water) and
-`showers_left`.
+Attributes carry the full rationale:
+
+| Attribute | Meaning |
+|---|---|
+| `deficit_kwh` | The displayed energy deficit (kWh) the % is derived from — reads 0 only right at a trip, then grows again as above. |
+| `deficit_raw_kwh` | The underlying value the scheduler feedback actually acts on. |
+| `uncertainty_kwh` | How much slack (kWh) the model currently allows the estimate. |
+| `capacity_kwh` | The tank's full-to-empty energy span, from its configured volume/setpoint/cold-inlet. |
+| `hot_fraction` | The learned average share of metered water attributed to the tank. |
+| `hot_fraction_profile` | That same share, broken out by time of day (night/morning/day/evening). |
+| `standby_w` | The learned standing-loss wattage. |
+| `hysteresis_kwh` | The learned size of the thermostat's post-trip top-up. |
+| `calibrated` | Whether a first trip has happened yet (before that, the estimate is a cold-start guess). |
+| `latched` | Whether the tank is currently sitting right at a trip (contactor on, element idle). |
+| `last_full` | Timestamp of the most recent trip. |
+| `draw_source` | Where this tick's draw came from: the water meter, the occupancy fallback, or none (a brief meter gap). |
+| `liters_40c` | The hot water still available, as an equivalent volume of comfortable 40 °C water. |
+| `showers_left` | The same, expressed as roughly how many showers remain. |
 
 **The charge feeds back into the prediction** (only once calibrated):
 
@@ -207,7 +240,7 @@ controlled switch and water-meter entities are shared with the features above.
 | `sensor.<load>_prediction_error` | Yesterday's \|predicted − actual\| in minutes. |
 | `sensor.<load>_rolling_mae` | Rolling mean absolute error (minutes) over the evaluation window. |
 | `sensor.<load>_sample_count` | How many self-logged days the model has learned from. |
-| `sensor.<load>_tank_charge` | Opt-in: estimated hot-water charge (%). Attributes carry the energy deficit/capacity, learned parameters, calibration state and a "showers left" estimate. |
+| `sensor.<load>_tank_charge` | Opt-in: estimated hot-water charge (%) — 100 % only right at a thermostat trip, drifting down until the next one. Attributes carry the energy deficit/uncertainty, learned per-daypart parameters, calibration/latch state and a "showers left" estimate. |
 | `button.<load>_predict_now` | Recompute the prediction and push it to the scheduler **now** (no need to wait for the daily predict time). |
 
 ### When does it run? Publish time & DST

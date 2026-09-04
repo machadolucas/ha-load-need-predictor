@@ -20,6 +20,16 @@ opted in) so the balance advances regardless of who's watching — mirroring how
 a key owned elsewhere would be silently dropped. This tracker mutates that dict
 and asks the load coordinator to persist.
 
+**Two deficits, two audiences.** The model keeps a clamped *control* ledger and
+a saturation-curve *display* deficit (see :mod:`tank_model`). What we publish as
+``deficit_kwh`` (and therefore the SoC %, litres and showers) is the shown one:
+it reaches exactly 100 % only on a real anchor *transition* and then drifts back
+down as the tank relaxes past the thermostat trip — a latched tank is **not**
+held at 100 %. The raw control ledger rides along as ``deficit_raw_kwh``, which
+is what the SoC→prediction feedback in the load coordinator asks heating for.
+Because ``anchored`` is now the transition tick alone, it is still exactly the
+"learned something, persist now" signal.
+
 **SoC → prediction feedback #2 (low-charge boost).** After each tick, if a
 calibrated tank's SoC has fallen below the load's boost threshold, the tracker
 re-runs the load's predict/push (which, via feedback #1 in the coordinator, folds
@@ -50,9 +60,11 @@ from .tank_model import (
     capacity_kwh,
     initial_state,
     liters_at_temp,
+    profile_of,
     should_boost,
     showers_left,
 )
+from .tank_model import soc as model_soc
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,14 +83,26 @@ _UNKNOWN_STATES = ("unknown", "unavailable")
 
 @dataclass
 class TankResult:
-    """What the tank charge sensor publishes for one load."""
+    """What the tank charge sensor publishes for one load.
+
+    Two deficits are published on purpose: ``deficit_kwh`` is the *shown* one
+    (the saturation-curve display value the SoC % is derived from), while
+    ``deficit_raw_kwh`` is the clamped control ledger the SoC→prediction feedback
+    actually asks heating for. ``uncertainty_kwh`` is the σ that curve uses, so
+    the card can say how much of the reading is model slack.
+    """
 
     soc_pct: float
     deficit_kwh: float
+    deficit_raw_kwh: float
+    uncertainty_kwh: float
+    hysteresis_kwh: float
     capacity_kwh: float
     hot_fraction: float
+    hot_fraction_profile: list[float]
     standby_w: float
     calibrated: bool
+    latched: bool
     last_full: str | None
     draw_source: str
     liters_40c: float
@@ -221,8 +245,10 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
     ) -> tuple[TankResult, bool]:
         """Run one load's tick; returns ``(result, save_now)``.
 
-        ``save_now`` is True when the tick anchored (which is also the only time
-        the model learns) or fired a boost — the events worth persisting promptly.
+        ``save_now`` is True when the tick took an anchor *transition* (which is
+        also the only time the model learns) or fired a boost — the events worth
+        persisting promptly. Ordinary latched ticks are just drift and ride the
+        periodic save.
         """
         params = TankParams(cfg.tank_volume_l, cfg.tank_setpoint_c, cfg.tank_cold_in_c)
         capacity = capacity_kwh(cfg.tank_volume_l, cfg.tank_setpoint_c, cfg.tank_cold_in_c)
@@ -253,6 +279,11 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             e_base=model.e_base,
             e_draw_per_person=model.e_draw_per_person,
             empty_house_factor=model.empty_house_factor,
+            # Display-only smoothing between the energy counter's coarse steps.
+            rated_power_kw=cfg.rated_power_kw,
+            # The daypart hot-fraction buckets are wall-clock buckets (evenings
+            # are showers), so the model needs the *local* hour — ``now`` is UTC.
+            local_hour=dt_util.as_local(now).hour,
         )
 
         tick = apply_tick(state, params, inputs)
@@ -260,8 +291,13 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
 
         boosted = False
         if cfg.tank_boost_soc_pct is not None:
+            # The boost is a *control* decision, so it reads the same clamped raw
+            # ledger the coordinator sizes the ask from — not the display curve.
             fire, boosted_state = should_boost(
-                tick.state, tick.soc, cfg.tank_boost_soc_pct, now_iso
+                tick.state,
+                model_soc(tick.state.deficit_kwh, tick.capacity_kwh),
+                cfg.tank_boost_soc_pct,
+                now_iso,
             )
             # Always store the re-armed/disarmed state so hysteresis + the rate
             # limit persist across ticks, whether or not this one fires.
@@ -277,15 +313,23 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
                 # Re-runs predict/push; feedback #1 folds the measured deficit in.
                 await self._load.async_predict_and_push(only=sid)
 
-        available_kwh = tick.capacity_kwh - tick.state.deficit_kwh
+        # Litres/showers are a *display* figure, so they follow the shown deficit
+        # (the same number the SoC % is derived from) — not the control ledger.
+        available_kwh = tick.capacity_kwh - tick.deficit_shown_kwh
         liters_40c = liters_at_temp(available_kwh, cfg.tank_cold_in_c)
         result = TankResult(
             soc_pct=round(tick.soc * 100.0, 1),
-            deficit_kwh=tick.state.deficit_kwh,
+            deficit_kwh=tick.deficit_shown_kwh,
+            deficit_raw_kwh=tick.state.deficit_kwh,
+            uncertainty_kwh=tick.uncertainty_kwh,
+            hysteresis_kwh=tick.state.hysteresis_kwh,
             capacity_kwh=tick.capacity_kwh,
+            # The profile mean, plus the four per-daypart fractions behind it.
             hot_fraction=tick.state.hot_fraction,
+            hot_fraction_profile=list(profile_of(tick.state)),
             standby_w=tick.state.standby_w,
             calibrated=tick.state.calibrated,
+            latched=tick.latched,
             # The most recent 100 % anchor (incl. one that just fired this tick).
             last_full=tick.state.last_anchor_iso or None,
             draw_source=tick.draw_source,

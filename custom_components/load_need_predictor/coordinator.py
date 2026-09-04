@@ -229,6 +229,10 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             # the commanded-minutes bookkeeping — it self-heals on manual heating,
             # early thermostat trips and skips alike. Over-ask is physically safe
             # (the thermostat just trips). Only a *calibrated* tank overrides.
+            # Note this reads the raw *clamped control* ledger on purpose: the
+            # sensor shows ``deficit_shown_kwh`` (the saturation-curve display
+            # value, which creeps toward "full" while the element runs), but
+            # control wants the plain conservative kWh-below-setpoint number.
             deficit = bookkept_deficit
             tank = self.tanks.get(subentry_id)
             deficit_source = "commanded" if cfg.controlled_switch_entity else None
@@ -484,6 +488,8 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             deficit = state.deficit_minutes if cfg.controlled_switch_entity else 0.0
             # SoC feedback #1: a calibrated tank's measured deficit supersedes the
             # bookkept backlog for the in-force target the sensors/card show.
+            # As in ``async_predict_and_push``, this is the raw clamped control
+            # ledger — the tank sensor's own ``deficit_kwh`` is the display value.
             tank = self.tanks.get(subentry_id)
             if tank is not None and tank.calibrated:
                 deficit = min(

@@ -1,0 +1,6 @@
+# Test fixtures
+
+- **`tank_week_2026-08-28.csv`** — one real week of hot-water-tank telemetry (2026-08-28 11:00 → 2026-09-04 11:30, `+03:00`), replayed tick-by-tick against `tank_model.py` by `tools/replay_tank.py` and asserted in `tests/test_tank_replay.py`. Columns `ts,series,state`; consecutive unchanged states are dropped, so every row is a state change and its `ts` doubles as HA's `last_changed`.
+- **Where from** — exported from the author's Home Assistant recorder via the `/api/history` REST endpoint; rebuild with `python tools/replay_tank.py export --window … -o … <history JSON…>`.
+- **Entity mapping** — `contactor` = `switch.shellypro1_30c6f78b0f24_switch_0`, `heating` = `binary_sensor.leddetector_water_heater` (element LED), `energy_kwh` = `sensor.leddetector_water_heater_energy` (cumulative), `water_m3` = `sensor.water_meter_mac_ocr_water_total` (cumulative), `live_soc_pct` = `sensor.lvv_water_heater_tank_charge` (the v0.8 sensor, reference only).
+- **Licence** — the author's own household telemetry, contributed to this repo under the repo licence; no third-party or personally identifying data (timestamps + counter readings only).
