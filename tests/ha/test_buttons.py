@@ -105,7 +105,8 @@ async def test_forecast_now_triggers_build(hass: HomeAssistant) -> None:
             blocking=True,
         )
         await hass.async_block_till_done()
-    build.assert_awaited_once_with(only=fc_id)
+    # The button also asks for a fresh Wattcast fetch (rate-limited inside).
+    build.assert_awaited_once_with(only=fc_id, fetch=True)
 
 
 async def test_predict_only_restricts_to_one_subentry(hass: HomeAssistant) -> None:

@@ -31,8 +31,25 @@ _REDACT = {
     "wind_entity",
     "weather_entity",
     "temp_history_entity",
+    "price_series_entity",
 }
 _RECENT_ROWS = 14  # last two weeks of rows is plenty to diagnose
+
+
+def _to_dict(obj) -> dict | None:
+    return obj.to_dict() if obj is not None else None
+
+
+def _wattcast_diag(forecast, subentry_id: str) -> dict:
+    series = forecast.wattcast.get(subentry_id)
+    fetched_at = forecast.fetched_at.get(subentry_id)
+    fetch = forecast.fetch.get(subentry_id)
+    return {
+        "made_at": series.made_at.isoformat() if series and series.made_at else None,
+        "fetched_at": fetched_at.isoformat() if fetched_at else None,
+        "forecast_points": len(series.forecast) if series else 0,
+        "fetch": vars(fetch) if fetch else None,
+    }
 
 
 async def async_get_config_entry_diagnostics(
@@ -65,9 +82,13 @@ async def async_get_config_entry_diagnostics(
             forecasts[subentry_id] = {
                 "config": async_redact_data(vars(cfg), _REDACT),
                 "model": model.to_dict() if model else None,
-                "result": vars(result) if result else None,
+                "result": {**vars(result), "slots": result.slots[:8]} if result else None,
                 "log_rows": len(forecast.log.get(subentry_id, [])),
                 "recent_log": forecast.log.get(subentry_id, [])[-_RECENT_ROWS:],
+                "shape": forecast.shape.get(subentry_id),
+                "mapping": _to_dict(forecast.mapping.get(subentry_id)),
+                "retail_pairs": len(forecast.pairs.get(subentry_id, [])),
+                "wattcast": _wattcast_diag(forecast, subentry_id),
             }
 
     return {

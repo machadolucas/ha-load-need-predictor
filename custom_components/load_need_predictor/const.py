@@ -86,9 +86,39 @@ CONF_WEATHER_ENTITY = "weather_entity"  # daily temperature forecast source
 CONF_TEMP_HISTORY_ENTITY = "temp_history_entity"  # actual outdoor temp — for fitting
 CONF_FORECAST_DAYS = "forecast_days"  # how many future days to publish
 CONF_FIT_DAYS = "fit_days"  # LTS lookback used to fit the model
+# Wattcast (wattcast.eu) spot-price forecast — the primary source; the local
+# ridge model above is the fallback beyond its coverage / before a first fetch.
+CONF_USE_WATTCAST = "use_wattcast"
+CONF_WATTCAST_ZONE = "wattcast_zone"
+# Optional real price *series* (e.g. a Nord Pool sensor with data_today /
+# data_tomorrow slot lists): pairs its all-in buy with Wattcast's settled spot
+# to learn the spot → retail mapping, and marks where real prices end.
+CONF_PRICE_SERIES_ENTITY = "price_series_entity"
+CONF_VAT_PCT = "vat_pct"  # seeds the mapping's slope until enough pairs exist
 
-DEFAULT_FORECAST_DAYS = 3
+DEFAULT_FORECAST_DAYS = 7
+MAX_FORECAST_DAYS = 9
 DEFAULT_FIT_DAYS = 365
+DEFAULT_WATTCAST_ZONE = "FI"
+WATTCAST_ZONES = ("FI", "EE", "LV", "LT")
+DEFAULT_VAT_PCT = 25.5
+
+# ── Wattcast API (free, key-less; terms: poll no faster than the hourly re-issue) ─
+WATTCAST_URL = "https://wattcast.eu/v1/forecast"
+WATTCAST_HOURS = 216  # the API's max; 15-min resolution also covers hourly needs
+WATTCAST_TIMEOUT_S = 20
+# Wattcast re-issues hourly at ≈ :25; fetch at the first :32 after the previous
+# fetch — once per issue, and never within the same issue window twice.
+WATTCAST_FETCH_MINUTE = 32
+# Retry ladder after failures (minutes); the last step repeats. A 429's
+# Retry-After is honoured when longer.
+WATTCAST_BACKOFF_MIN = (5, 15, 30, 60)
+WATTCAST_STALE_AFTER_H = 2.0  # cache older than this → "stale" (≥ one missed issue)
+WATTCAST_ISSUE_AFTER_H = 6.0  # consecutive failures this long → a repair issue
+FORECAST_TICK_MINUTES = 5  # cheap due-check cadence; network only when due
+RETAIL_PAIRS_DAYS = 14  # rolling buffer of (spot, buy) pairs for the mapping
+SHAPE_FIT_DAYS = 28  # hourly-LTS window for the local fallback's intraday shape
+HOURLY_LOG_ROWS = 60  # keep per-hour forecast vectors only for the recent rows
 
 # Per-load UI defaults (tuned to the author's ~3 kW LVV; see CLAUDE.md data notes).
 DEFAULT_RATED_POWER_KW = 3.0

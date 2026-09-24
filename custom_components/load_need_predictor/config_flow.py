@@ -38,6 +38,7 @@ from .const import (
     CONF_PERSON_ENTITIES,
     CONF_PREDICT_TIME,
     CONF_PRICE_ENTITY,
+    CONF_PRICE_SERIES_ENTITY,
     CONF_RATED_POWER_KW,
     CONF_SUPPLY_TEMP_ENTITY,
     CONF_TANK_BOOST_SOC_PCT,
@@ -46,7 +47,10 @@ from .const import (
     CONF_TANK_VOLUME_L,
     CONF_TARGET_NUMBER_ENTITY,
     CONF_TEMP_HISTORY_ENTITY,
+    CONF_USE_WATTCAST,
+    CONF_VAT_PCT,
     CONF_WATER_TOTAL_ENTITY,
+    CONF_WATTCAST_ZONE,
     CONF_WEATHER_ENTITY,
     CONF_WIND_ENTITY,
     DEFAULT_CAPTURE_TIME,
@@ -60,9 +64,13 @@ from .const import (
     DEFAULT_TANK_COLD_IN_C,
     DEFAULT_TANK_SETPOINT_C,
     DEFAULT_TANK_VOLUME_L,
+    DEFAULT_VAT_PCT,
+    DEFAULT_WATTCAST_ZONE,
     DOMAIN,
+    MAX_FORECAST_DAYS,
     SUBENTRY_TYPE_LOAD,
     SUBENTRY_TYPE_PRICE_FORECAST,
+    WATTCAST_ZONES,
 )
 
 _SENSOR = selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor"))
@@ -222,20 +230,46 @@ def _forecast_schema(defaults: dict) -> vol.Schema:
     def suggest(key: str) -> dict:
         return {"suggested_value": defaults.get(key)}
 
+    # The weather/wind/temperature inputs only feed the local fallback model, so
+    # they're optional now that Wattcast is the primary source.
     return vol.Schema(
         {
             vol.Required(CONF_NAME, description=suggest(CONF_NAME)): str,
             vol.Required(CONF_PRICE_ENTITY, description=suggest(CONF_PRICE_ENTITY)): _SENSOR,
-            vol.Required(CONF_WIND_ENTITY, description=suggest(CONF_WIND_ENTITY)): _SENSOR,
-            vol.Required(
+            vol.Optional(
+                CONF_PRICE_SERIES_ENTITY, description=suggest(CONF_PRICE_SERIES_ENTITY)
+            ): _SENSOR,
+            vol.Optional(
+                CONF_USE_WATTCAST, default=defaults.get(CONF_USE_WATTCAST, True)
+            ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_WATTCAST_ZONE, default=defaults.get(CONF_WATTCAST_ZONE, DEFAULT_WATTCAST_ZONE)
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=list(WATTCAST_ZONES), mode=selector.SelectSelectorMode.DROPDOWN
+                )
+            ),
+            vol.Optional(
+                CONF_VAT_PCT, default=defaults.get(CONF_VAT_PCT, DEFAULT_VAT_PCT)
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0,
+                    max=50,
+                    step=0.1,
+                    unit_of_measurement="%",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(CONF_WIND_ENTITY, description=suggest(CONF_WIND_ENTITY)): _SENSOR,
+            vol.Optional(
                 CONF_WEATHER_ENTITY, description=suggest(CONF_WEATHER_ENTITY)
             ): selector.EntitySelector(selector.EntitySelectorConfig(domain="weather")),
-            vol.Required(
+            vol.Optional(
                 CONF_TEMP_HISTORY_ENTITY, description=suggest(CONF_TEMP_HISTORY_ENTITY)
             ): _TEMP_SENSOR,
             vol.Optional(
                 CONF_FORECAST_DAYS, default=defaults.get(CONF_FORECAST_DAYS, DEFAULT_FORECAST_DAYS)
-            ): _days_selector(7),
+            ): _days_selector(MAX_FORECAST_DAYS),
             vol.Optional(
                 CONF_FIT_DAYS, default=defaults.get(CONF_FIT_DAYS, DEFAULT_FIT_DAYS)
             ): _days_selector(730),

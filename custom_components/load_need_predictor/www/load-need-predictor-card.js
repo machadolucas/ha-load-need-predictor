@@ -6,7 +6,8 @@
  * read-only diagnostics plus the two "run now" buttons; all the rationale comes
  * from entity attributes the integration publishes:
  *   - load    → the `*_predicted_runtime` sensor's `breakdown` + `metrics` attrs
- *   - forecast → the `*_price_forecast` sensor's `days` + `coefficients` attrs
+ *   - forecast → the `*_price_forecast` sensor's `days`, `source`, `retail_mapping`,
+ *     `mae_by_source` + `coefficients` attrs
  *
  * No build step: a self-contained custom element (vanilla JS + shadow DOM) so it
  * works offline and ships inside the integration. Devices are auto-discovered
@@ -15,7 +16,7 @@
  */
 
 const DOMAIN = "load_need_predictor";
-const CARD_VERSION = "0.8.0";
+const CARD_VERSION = "0.10.0";
 const DOC_URL = "https://github.com/machadolucas/ha-load-need-predictor";
 
 // translation_key values the integration assigns to its entities.
@@ -355,56 +356,66 @@ function loadDetail(bd, m, showContext) {
 }
 
 // ── natural-language composition (forecast) ─────────────────────────────────
+const SRC_LABEL = { wattcast: "Wattcast", wattcast_raw: "Wattcast (raw)", local: "local model" };
+const srcLabel = (s) => SRC_LABEL[s] || s || "—";
+const ct = (x) => (isNum(x) ? (x * 100).toFixed(1) : "—"); // €/kWh → c/kWh
+
 function forecastExplanation(a) {
   const days = a.days || [];
   const parts = [];
   if (days.length) {
-    const first = days[0].buy;
-    const last = days[days.length - 1].buy;
+    const first = days[0].mean;
+    const last = days[days.length - 1].mean;
     const trend =
       last > first + 0.001 ? "rising" : last < first - 0.001 ? "falling" : "roughly steady";
     parts.push(
       `Next ${bold(days.length)} day${days.length === 1 ? "" : "s"}: ${bold(eur(first))}→${bold(
         eur(last)
-      )} €/kWh (${trend})`
+      )} €/kWh daily mean (${trend})`
     );
   } else {
     parts.push("No forecast days available yet");
   }
 
-  let model;
-  if (a.fitted) {
-    model = `Fitted on ${bold(a.model_samples)} days`;
-    if (a.fit_mae_eur_kwh != null) model += ` (±${bold(eur(a.fit_mae_eur_kwh))} €/kWh in-sample)`;
-  } else {
-    model = "Using the seed formula (not enough history yet)";
+  let src = `Source: ${bold(srcLabel(a.source))}`;
+  if (a.source && a.source !== "local" && days.some((d) => d.src === "local")) {
+    src += ", local model beyond its reach";
   }
-
-  let dir = "";
-  const c = a.coefficients;
-  if (c && c.betas) {
-    const phr = [];
-    if (Math.abs(c.betas[1]) > 1e-9) phr.push(`more wind ${c.betas[1] < 0 ? "lowers" : "raises"} price`);
-    if (Math.abs(c.betas[2]) > 1e-9) phr.push(`cold ${c.betas[2] > 0 ? "raises" : "lowers"} price`);
-    if (phr.length) dir = " " + cap(phr.join("; ")) + ".";
+  if (a.stale) {
+    src += ` — <span class="warn">cached ${isNum(a.cache_age_h) ? a.cache_age_h.toFixed(1) : "?"} h ago</span>`;
   }
-  return `<div class="explain">${parts.join(". ")}. ${model}.${dir}</div>`;
+  const m = a.retail_mapping;
+  let map = "";
+  if (m && m.n) {
+    map = ` Spot → your price: ×${bold(m.slope_pos.toFixed(3))} + ~${bold(ct(m.base))} c/kWh (${bold(m.n)} pairs`;
+    map += isNum(m.mae) ? `, ±${ct(m.mae)} c)` : ")";
+    map += ".";
+  }
+  return `<div class="explain">${parts.join(". ")}. ${src}.${map}</div>`;
 }
 
 function forecastDetail(a) {
   const days = a.days || [];
   let dayList = "";
   if (days.length) {
-    const cheapest = Math.min(...days.map((d) => d.buy));
+    const cheapest = Math.min(...days.map((d) => d.mean));
     dayList = days
       .map((d) => {
-        const hl = d.buy === cheapest ? ' class="cheap"' : "";
+        const hl = d.mean === cheapest ? ' class="cheap"' : "";
+        const ctx = [
+          `${ct(d.min)}–${ct(d.max)} c`,
+          d.src ? srcLabel(d.src) : null,
+          d.temp != null ? `${d.temp}°C` : null,
+          d.wind_gw != null ? `${d.wind_gw} GW${d.wind_src === "climatology" ? "*" : ""}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
         return `<div class="day"><span>${esc(d.date)}</span>
-          <span class="muted">${d.temp}°C · ${d.wind_gw} GW</span>
-          <span${hl}>${eur(d.buy)} €/kWh</span></div>`;
+          <span class="muted">${esc(ctx)}</span>
+          <span${hl}>${eur(d.mean)} €/kWh</span></div>`;
       })
       .join("");
-    dayList = `<div class="sub">Forecast days</div><div class="days">${dayList}</div>`;
+    dayList = `<div class="sub">Forecast days (mean, range)</div><div class="days">${dayList}</div>`;
   }
 
   let coeffs = "";
@@ -413,17 +424,40 @@ function forecastDetail(a) {
     const rows = c.features
       .map((f, i) => `<div class="day"><span>${esc(f)}</span><span>${c.betas[i].toFixed(4)}</span></div>`)
       .join("");
-    coeffs = `<div class="sub">Regression coefficients (standardised)</div>
+    coeffs = `<div class="sub">Local fallback model — coefficients (standardised${
+      a.fitted ? `, ${a.model_samples} days` : ", seed"
+    })</div>
       <div class="days">${rows}
       <div class="day"><span>intercept</span><span>${eur(c.intercept)}</span></div></div>`;
   }
 
-  const acc = [
-    chip("Forecast MAE", a.forecast_mae_eur_kwh != null ? `${eur(a.forecast_mae_eur_kwh)} €/kWh` : "—"),
-    chip("Eval samples", a.coefficients ? a.coefficients.n : "—"),
-  ];
+  let bySource = "";
+  const mbs = a.mae_by_source || {};
+  const srcs = Object.keys(mbs);
+  if (srcs.length) {
+    bySource = `<div class="sub">Accuracy by source (last 30 days)</div><div class="days">${srcs
+      .map((s) => {
+        const v = mbs[s] || {};
+        const hl = s === a.source ? ' class="cheap"' : "";
+        return `<div class="day"><span${hl}>${esc(srcLabel(s))}</span>
+          <span class="muted">${v.n} d</span>
+          <span>hourly ${eur(v.hourly_mae)} · daily ${eur(v.daily_mae)}</span></div>`;
+      })
+      .join("")}</div>`;
+  }
 
-  return `${dayList}${coeffs}
+  const primaryN = a.source && mbs[a.source] ? mbs[a.source].n : null;
+  const acc = [
+    chip("Hourly MAE", a.forecast_hourly_mae_eur_kwh != null ? `${eur(a.forecast_hourly_mae_eur_kwh)} €/kWh` : "—"),
+    chip("Daily MAE", a.forecast_mae_eur_kwh != null ? `${eur(a.forecast_mae_eur_kwh)} €/kWh` : "—"),
+    chip("Eval days", primaryN != null ? primaryN : "—"),
+  ];
+  if (a.wattcast_made_at) {
+    acc.push(chip("Wattcast issued", new Date(a.wattcast_made_at).toLocaleString([], { hour: "2-digit", minute: "2-digit", day: "numeric", month: "numeric" })));
+  }
+  if (a.fetch_error) acc.push(chip("Last fetch error", a.fetch_error));
+
+  return `${dayList}${bySource}${coeffs}
     <div class="sub">Accuracy</div><div class="chips">${acc.join("")}</div>`;
 }
 

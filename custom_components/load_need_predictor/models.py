@@ -25,6 +25,7 @@ from .const import (
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PERSON_ENTITIES,
     CONF_PRICE_ENTITY,
+    CONF_PRICE_SERIES_ENTITY,
     CONF_RATED_POWER_KW,
     CONF_SUPPLY_TEMP_ENTITY,
     CONF_TANK_BOOST_SOC_PCT,
@@ -33,7 +34,10 @@ from .const import (
     CONF_TANK_VOLUME_L,
     CONF_TARGET_NUMBER_ENTITY,
     CONF_TEMP_HISTORY_ENTITY,
+    CONF_USE_WATTCAST,
+    CONF_VAT_PCT,
     CONF_WATER_TOTAL_ENTITY,
+    CONF_WATTCAST_ZONE,
     CONF_WEATHER_ENTITY,
     CONF_WIND_ENTITY,
     DEFAULT_DEFICIT_CAP_FACTOR,
@@ -45,6 +49,8 @@ from .const import (
     DEFAULT_TANK_COLD_IN_C,
     DEFAULT_TANK_SETPOINT_C,
     DEFAULT_TANK_VOLUME_L,
+    DEFAULT_VAT_PCT,
+    DEFAULT_WATTCAST_ZONE,
 )
 
 
@@ -133,6 +139,10 @@ class PriceForecastConfig:
     temp_history_entity: str | None  # actual outdoor temp for fitting
     forecast_days: int
     fit_days: int
+    use_wattcast: bool = True
+    wattcast_zone: str = DEFAULT_WATTCAST_ZONE
+    price_series_entity: str | None = None  # real slot series (Nord Pool-shaped)
+    vat: float = DEFAULT_VAT_PCT / 100.0  # fraction, e.g. 0.255
 
 
 def price_forecast_config_from_data(data: Mapping) -> PriceForecastConfig:
@@ -145,4 +155,8 @@ def price_forecast_config_from_data(data: Mapping) -> PriceForecastConfig:
         temp_history_entity=data.get(CONF_TEMP_HISTORY_ENTITY),
         forecast_days=int(data.get(CONF_FORECAST_DAYS, DEFAULT_FORECAST_DAYS)),
         fit_days=int(data.get(CONF_FIT_DAYS, DEFAULT_FIT_DAYS)),
+        use_wattcast=bool(data.get(CONF_USE_WATTCAST, True)),
+        wattcast_zone=str(data.get(CONF_WATTCAST_ZONE, DEFAULT_WATTCAST_ZONE)),
+        price_series_entity=data.get(CONF_PRICE_SERIES_ENTITY),
+        vat=float(data.get(CONF_VAT_PCT, DEFAULT_VAT_PCT)) / 100.0,
     )

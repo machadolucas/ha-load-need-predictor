@@ -1,4 +1,9 @@
-"""Price-forecast coordinator: build → publish slots, and evaluate vs actual."""
+"""Price-forecast coordinator, local-fallback path: build → publish slots, evaluate.
+
+These run with ``use_wattcast: False`` (the Wattcast path lives in
+``test_wattcast.py``), so the published series is the local ridge model shaped
+into 15-min slots.
+"""
 
 from __future__ import annotations
 
@@ -68,6 +73,7 @@ async def _setup(hass: HomeAssistant, forecast_days: int = 2):
                     "weather_entity": "weather.home",
                     "temp_history_entity": "sensor.temp",
                     "forecast_days": forecast_days,
+                    "use_wattcast": False,
                 },
             )
         ],
@@ -78,13 +84,14 @@ async def _setup(hass: HomeAssistant, forecast_days: int = 2):
     return entry, entry.runtime_data.forecast
 
 
-async def test_forecast_builds_on_setup(hass: HomeAssistant) -> None:
+async def test_forecast_builds_on_setup(hass: HomeAssistant, no_wattcast_network) -> None:
     # No explicit build call: setup itself should populate the forecast (so the
     # sensor isn't blank until the next predict time / after a restart).
     entry, fc = await _setup(hass)
     sid = next(iter(fc.forecast_configs()))
     assert fc.slots.get(sid)  # non-empty
     assert fc.data[sid].status == "ok"
+    no_wattcast_network.assert_not_awaited()  # use_wattcast: False never fetches
 
 
 async def test_build_produces_scheduler_shaped_slots(hass: HomeAssistant) -> None:
@@ -93,14 +100,26 @@ async def test_build_produces_scheduler_shaped_slots(hass: HomeAssistant) -> Non
         await fc.async_build_forecast()
     sid = next(iter(fc.forecast_configs()))
     slots = fc.slots[sid]
-    assert len(slots) == 48  # 2 days × 24 h
+    # Today counts as day 0, so the horizon ends at local midnight after day 2.
+    # Today has no temperature forecast (the mock starts tomorrow), so the local
+    # model covers tomorrow + the day after, in 15-min slots (DST-safe count).
+    tomorrow = dt_util.start_of_local_day() + timedelta(days=1)
+    end = dt_util.start_of_local_day() + timedelta(days=3)
+    expected = int((dt_util.as_utc(end) - dt_util.as_utc(tomorrow)).total_seconds() // 900)
+    assert len(slots) == expected
     first = slots[0]
-    assert set(first) == {"start", "end", "buy"}
+    assert set(first) == {"start", "end", "buy", "src"}  # no p10/p90 for local
+    assert {s["src"] for s in slots} == {"local"}
     start = dt_util.parse_datetime(first["start"])
     assert start.tzinfo is not None  # tz-aware, as the scheduler requires
     assert first["buy"] > 0
-    # Beyond-horizon: the first slot is tomorrow's local midnight.
-    assert start == dt_util.start_of_local_day() + timedelta(days=1)
+    # The first forecastable slot is tomorrow's local midnight; the last ends at
+    # the horizon.
+    assert start == tomorrow
+    assert dt_util.parse_datetime(first["end"]) - start == timedelta(minutes=15)
+    assert dt_util.parse_datetime(slots[-1]["end"]) == end
+    assert fc.data[sid].source == "local"
+    assert fc.data[sid].known_until is None  # no real-price series configured
 
 
 async def test_build_uses_fitted_model_when_history_present(hass: HomeAssistant) -> None:
@@ -126,8 +145,9 @@ async def test_sensor_publishes_data_today(hass: HomeAssistant) -> None:
     state = hass.states.get(eid)
     data_today = state.attributes["data_today"]
     assert isinstance(data_today, list) and data_today
-    assert {"start", "end", "buy"} <= set(data_today[0])
+    assert {"start", "end", "buy", "src"} <= set(data_today[0])
     assert state.attributes["status"] == "ok"
+    assert state.attributes["source"] == "local"
 
 
 async def test_evaluate_reconciles_past_forecast(hass: HomeAssistant) -> None:

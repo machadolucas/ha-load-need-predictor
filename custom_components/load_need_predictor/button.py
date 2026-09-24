@@ -61,4 +61,4 @@ class ForecastNowButton(ForecastEntity, ButtonEntity):
         super().__init__(coordinator, subentry_id, subentry, "forecast_now")
 
     async def async_press(self) -> None:
-        await self.coordinator.async_build_forecast(only=self._subentry_id)
+        await self.coordinator.async_build_forecast(only=self._subentry_id, fetch=True)

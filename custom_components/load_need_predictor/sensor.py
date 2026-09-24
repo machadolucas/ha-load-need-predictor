@@ -147,6 +147,14 @@ FORECAST_VALUE_SENSORS: tuple[ForecastSensorDescription, ...] = (
         value_fn=lambda r: r.forecast_mae,
     ),
     ForecastSensorDescription(
+        key="forecast_hourly_mae",
+        translation_key="forecast_hourly_mae",
+        native_unit_of_measurement=_EUR_PER_KWH,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:chart-timeline-variant",
+        value_fn=lambda r: r.hourly_mae,
+    ),
+    ForecastSensorDescription(
         key="forecast_samples",
         translation_key="forecast_samples",
         state_class=SensorStateClass.MEASUREMENT,
@@ -268,6 +276,15 @@ class PriceForecastSensor(ForecastEntity, SensorEntity):
     _attr_native_unit_of_measurement = _EUR_PER_KWH
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:cash-clock"
+    _attr_attribution = (
+        "Prices: Elering (Nord Pool day-ahead). Weather: Open-Meteo.com (CC BY 4.0). "
+        "Forecast: Wattcast (wattcast.eu)."
+    )
+    # ~7 days of 15-min slots is far past the recorder's 16 KB attribute cap;
+    # the history is in the state (mean) and the evaluation sensors anyway.
+    _unrecorded_attributes = frozenset(
+        {"data_today", "days", "coefficients", "mae_by_source", "retail_mapping"}
+    )
 
     def __init__(self, coordinator, subentry_id, subentry) -> None:
         super().__init__(coordinator, subentry_id, subentry, "price_forecast")
@@ -282,16 +299,26 @@ class PriceForecastSensor(ForecastEntity, SensorEntity):
         result = self._result
         if result is None:
             return {}
-        # `data_today` is the contract the Load Scheduler parses; the rest is
-        # human-facing context.
+        # `data_today` is the contract the Load Scheduler parses (15-min slots
+        # from the first one without a real price; `p10`/`p90`/`src` are extra
+        # keys it ignores); the rest is human-facing context.
         return {
             "data_today": result.slots,
             "status": result.status,
+            "source": result.source,
+            "known_until": result.known_until,
+            "stale": result.stale,
+            "wattcast_made_at": result.wattcast_made_at,
+            "cache_age_h": result.cache_age_h,
+            "fetch_error": result.fetch_error,
             "days": result.days,
+            "retail_mapping": result.retail_mapping,
+            "mae_by_source": result.mae_by_source,
             "model_samples": result.model_samples,
             "fit_mae_eur_kwh": result.fit_mae,
             "forecast_mae_eur_kwh": result.forecast_mae,
-            # Rationale for the dashboard card: how the price is modelled.
+            "forecast_hourly_mae_eur_kwh": result.hourly_mae,
+            # Rationale for the dashboard card: how the fallback price is modelled.
             "fitted": result.fitted,
             "coefficients": result.coefficients,
         }

@@ -79,16 +79,17 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 |---|---|---|
 | `predictor.py` | **Pure** load model: features → kWh → minutes, seeds, gain EWMA, prior↔empirical blend, `build_features`, rolling MAE, deficit carryover (`close_cycle`/`open_cycle`) | no |
 | `price_model.py` | **Pure** price model: ridge regression of price on wind+temp with a cold interaction; seed fallback; fit/predict/serialize | no |
+| `spot_forecast.py` | **Pure** Wattcast parse + compact cache (`WattcastSeries`), spot→retail mapping (`fit_retail_mapping`), local intraday shape, DST-safe 15-min `build_slots`, per-hour scoring + `select_primary` | no |
 | `tank_model.py` | **Pure** tank state-of-charge: energy-deficit integration (`apply_tick`), 100 %-anchor + EWMA calibration of `hot_fraction`/`standby_w`, hot-flow cap, meter-misread/fallback guards, boost gating (`should_boost`), liters/showers helpers | no |
 | `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig` | no |
 | `statistics_source.py` | Load delivery from the recorder (daily `change`) + commanded switch on-time over a window (`async_commanded_minutes`, for deficit carryover) | yes |
-| `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price | yes |
+| `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price (daily + hourly); the Wattcast HTTP fetch (never raises → `WattcastFetch`); real-price slot/pair helpers | yes |
 | `occupancy.py` | Duration-based occupancy: residents home ≥12 h over the trailing 24 h (from history) + guests weighted by visit length (next-24 h calendar); instantaneous fallbacks | yes |
 | `persistence.py` | `Store` (load: model+training+eval; forecast uses a `.forecast` file) | yes |
 | `actuation.py` | Resilient `number.set_value` push to the scheduler target | yes |
 | `jobs.py` | The two daily jobs; drives both coordinators | yes |
 | `coordinator.py` | Load `DataUpdateCoordinator`; per-load `LoadResult` | yes |
-| `forecast_coordinator.py` | Price-forecast coordinator: fit → build slots → evaluate; `ForecastResult` | yes |
+| `forecast_coordinator.py` | Price-forecast coordinator: 5-min due-check tick → hourly Wattcast fetch (persisted cache, backoff, repair issue) → mapping refit → build slots → per-source snapshot; daily local refit; nightly per-source scoring; `ForecastResult` | yes |
 | `tank_tracker.py` | 60 s-tick coordinator: reads counters/switch/detector states, drives `tank_model.apply_tick`, publishes per-load `TankResult`, fires the low-charge boost | yes |
 | `runtime.py` | `RuntimeData` (both coordinators) + the `ConfigEntry` type alias | yes |
 | `config_flow.py` | Hub flow + `load` and `price_forecast` subentry wizards | yes |
@@ -98,16 +99,47 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `frontend.py` | Serves + auto-registers the dashboard card (long-cached static path registered first, then an extra JS module with a guarded `?v=<content-hash>` cache-bust that falls back to the bare URL); best-effort, never breaks setup | yes |
 | `www/load-need-predictor-card.js` | The Lovelace diagnostic card (vanilla JS, no build) + its `ha-form` editor | no |
 
-## The price forecast (read before touching `price_model.py`)
+## The price forecast (read before touching `price_model.py` / `spot_forecast.py`)
 
-- **`price_model.py` must stay Home-Assistant-free** (importlib-tested like
-  `predictor.py`). Output contract for the scheduler: a `data_today` attribute of
-  `{start, end, buy}` slots — **tz-aware ISO** starts, `buy` in **€/kWh** — for
-  times beyond the real horizon; the scheduler ignores overlap and adds its own
-  `forecast_price_margin`.
-- Features `[temp, wind, cold_hinge, wind×cold_hinge]`, `cold_hinge = max(0,−temp)`;
-  wind in **GW** (the sensor's series is GW but its state/LTS is MW — normalise).
-  Fit daily on LTS (price/temp/wind), seed formula until enough history.
+- **Two sources, one series.** Wattcast (`wattcast.eu`, free/key-less, server-side
+  gradient-boosted trees + Open-Meteo weather + LLM outage adjustments; ≈ 7 days,
+  15-min, p10/p50/p90 spot €/MWh ex-VAT) is primary; the local ridge (below) is the
+  fallback beyond Wattcast's coverage / before a first fetch. The HA repo
+  `SectorTll/wattcast-homeassistant` is just an API client — there is no model to
+  "replicate" locally; don't try to rebuild their GBT here.
+- **`price_model.py` and `spot_forecast.py` must stay Home-Assistant-free**
+  (importlib-tested like `predictor.py`). Output contract for the scheduler: a
+  `data_today` attribute of 15-min `{start, end, buy[, p10, p90], src}` slots —
+  **tz-aware ISO** starts, `buy` in **€/kWh all-in** — from the first slot without a
+  real price to local midnight after `forecast_days` days; the scheduler ignores
+  overlap/extra keys and adds its own `forecast_price_margin`.
+- **Polling discipline (API terms + user requirement):** one request per hourly issue
+  (the first HH:32 after the last fetch — Wattcast re-issues ≈ :25), only from
+  the 5-minute due-check tick (own `async_track_time_interval`, not `update_interval`).
+  The raw series is **persisted** and only replaced by a newer successful fetch — a
+  failure keeps serving the cache (`stale` once > 2 h). Startup skips the fetch while the
+  cache is from the current issue window. Failures back off 5 → 15 → 30 → 60 min (≥ `Retry-After`);
+  6 h of consecutive failures raises repair issue `wattcast_unreachable_<sid>`,
+  deleted on the next success. The button forces a fetch only if the cache is ≥ 15 min old *and* no failure
+  backoff is in force. The Store is flushed on unload so a reload reads the fresh cache.
+- **Spot → retail mapping** (`fit_retail_mapping`): `buy = a⁺·max(s,0)/1000 +
+  a⁻·min(s,0)/1000 + b[daytype(wd/sat/sun), local hour]`, hierarchically shrunk, on a
+  14-day buffer of (settled spot, real buy) pairs from the optional
+  `price_series_entity` (Nord Pool-shaped slot lists), else the buy-price sensor's
+  current value. Validated 2026-09-24 on the author's contract: recovers ×1.255 VAT +
+  4.70 c night (22–07) / 6.77 c day (07–22) with ~1e-6 residual from 2 days of pairs.
+- **Local fallback:** features `[temp, wind, cold_hinge, wind×cold_hinge]`,
+  `cold_hinge = max(0,−temp)`; wind in **GW** (sensor series GW, state/LTS MW —
+  normalise). Fit daily on LTS; seed formula until enough history. Daily price ×
+  learned intraday shape (per daytype × hour offsets from 28 days of hourly LTS).
+  Days past the wind feed use climatological wind (`days[].wind_src`).
+- **Scoring:** each rebuild upserts, per still-forecast day (≥ 20 forecast hours),
+  per-hour vectors for `wattcast`, `wattcast_raw` (`p50Raw`, i.e. without their LLM
+  adjustments) and `local` → the log keeps the *last pre-publication* forecast. The
+  capture job scores them vs hourly LTS (`scores`, `daily_err`). `select_primary` picks
+  the lowest trailing-14-day hourly MAE once each source has ≥ 7 scored days, else
+  Wattcast. Wattcast's own published live MAE (FI, 2026-09): ~29 €/MWh D+1 → ~41 D+6.
+- Big attributes are `_unrecorded_attributes` (≫ the recorder's 16 KB cap).
 - Forecast *price/opportunity, not demand*: treat the tank as a buffer and let
   the scheduler shift discretionary heating into the forecast-cheap window; the
   minimum-service floor is the safety net.
@@ -280,7 +312,10 @@ shows is published as sensor attributes — the card itself holds no model logic
   explanation can't drift.
 - Forecast: `sensor.<name>_price_forecast` adds `coefficients`
   (`price_model.describe` — feature names + betas + intercept, sign = effect
-  direction) and `fitted`, alongside the existing `days` / `data_today`.
+  direction) and `fitted`, alongside `days` (per-day `mean/min/max/src` + local
+  inputs), `source`, `retail_mapping`, `mae_by_source`, `stale`/`cache_age_h`,
+  `wattcast_made_at`, `fetch_error` and `data_today`. Dashboard plotly cards overlay
+  `data_today` (faded bars + p10–p90 band) where real prices are missing.
 - The card **auto-discovers** devices from the entity registry
   (`platform == "load_need_predictor"`) and classifies each by attribute content
   (`breakdown` ⇒ load, `data_today` ⇒ forecast) — rename-proof, no entity-id

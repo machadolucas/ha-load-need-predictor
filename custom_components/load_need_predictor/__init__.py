@@ -57,13 +57,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigE
     # opted in), independent of the daily jobs.
     tank.async_start()
     entry.async_on_unload(tank.async_shutdown_ticker)
+    # The price forecast's cheap 5-minute due-check (network at most hourly).
+    forecast.async_start()
+    entry.async_on_unload(forecast.async_shutdown_ticker)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
     # Build the price forecast once on setup so the sensor is populated
-    # immediately (and after every restart), not only at the next predict time.
-    # Backgrounded so a slow statistics fit never delays/fails setup.
+    # immediately (and after every restart), not only at the next predict time —
+    # from the persisted Wattcast cache, fetching only if that cache is ≥ 1 h
+    # old. Backgrounded so a slow statistics fit or fetch never delays setup.
     if forecast.has_loads:
         entry.async_create_background_task(
             hass, forecast.async_build_forecast(), "lnp-initial-forecast"
@@ -77,6 +81,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigE
 
 async def async_unload_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> bool:
     """Unload the hub config entry."""
+    # Flush the forecast Store (incl. the Wattcast cache) before a reload's new
+    # coordinator reads it — the debounced save may not have fired yet.
+    if (forecast := entry.runtime_data.forecast) is not None:
+        await forecast.async_flush()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

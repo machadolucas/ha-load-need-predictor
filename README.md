@@ -275,25 +275,81 @@ automation:
 
 ## Beyond-horizon price forecast
 
-Nord Pool only publishes prices through tomorrow. This capability estimates the
-*day after* (and beyond) so the scheduler can plan further out.
+Nord Pool only publishes prices through tomorrow (around 14:00 Finnish time). This
+capability forecasts the next **~7 days at 15-minute resolution** so the scheduler
+can plan across days. The same series can be drawn on dashboards (e.g. faded bars
+for tomorrow before it's published).
 
-Add a **price forecast** subentry and point it at: your actual buy-price sensor
-(€/kWh, for fitting + evaluation), the Finland wind-production forecast sensor,
-a `weather` entity (daily temperature forecast), and an outdoor-temperature
-sensor (history for fitting). It publishes one `sensor.<name>_price_forecast`
-whose attributes carry a `data_today` list of `{start, end, buy}` slots — the
-exact shape Nord Pool sensors use — covering roughly the next few days. Set that
-sensor as the scheduler's `forecast_price_entity` and tune its confidence margin.
-A `button.<name>_forecast_now` rebuilds the forecast on demand.
+Add a **price forecast** subentry. It publishes `sensor.<name>_price_forecast`,
+whose `data_today` attribute is a list of `{start, end, buy, p10, p90, src}`
+slots, all in €/kWh. That is the slot shape Nord Pool sensors use, plus a few extra
+keys the scheduler ignores. The list starts at the first slot without a real price
+and runs `forecast_days` past today. Set this sensor as the scheduler's
+`forecast_price_entity` and tune its margin. `button.<name>_forecast_now`
+rebuilds on demand and pulls a fresh forecast if the cache is over 15 minutes old.
 
-**Model.** A small, explainable regression of daily price on wind + temperature
-with a **cold-weather interaction**, fit on long-term statistics. On ~356 days
-(incl. a full winter): more wind ⇒ lower price (r ≈ −0.23, −0.49 below −5 °C),
-colder ⇒ higher price (r ≈ −0.45), jointly R² ≈ 0.37 — so the model leans on
-temperature most in the cold and on wind most in the cold band. Daily price is
-expanded into flat hourly slots; the scheduler's margin absorbs the coarseness.
-`sensor.<name>_forecast_mae` / `_forecast_error` log forecast-vs-actual price.
+**Sources.**
+
+- **[Wattcast](https://wattcast.eu)** (primary, on by default) is a free, key-less
+  hosted forecast for FI/EE/LV/LT. It uses gradient-boosted trees trained on
+  settled Nord Pool prices, calendar features and Open-Meteo weather (wind at
+  100 m, temperature and solar across FI/SE/Baltics). It comes with a p10–p90
+  band and corrections for known events such as nuclear outages. Their live
+  hourly MAE is about 29 €/MWh for tomorrow, rising to about 41 €/MWh six days
+  out.
+  - **Fetching:** once per hourly issue, at HH:32 just after Wattcast's
+    ≈ :25 re-issue, matching their terms. A 5-minute check makes no request
+    unless one is due.
+  - **Caching:** the response is persisted, so it survives restarts. It is kept
+    until a newer fetch succeeds, which means an outage still leaves you with
+    the last forecast.
+  - **Failures:** retries back off (5 → 15 → 30 → 60 min, honouring
+    `Retry-After`). After 6 h of failures a **repair issue** appears, and it
+    clears itself on the next success.
+  - **Attribution:** prices from Elering (Nord Pool day-ahead), weather from
+    Open-Meteo.com (CC BY 4.0), forecast by Wattcast.
+- **Local model** (fallback) is a small, explainable regression of daily price
+  on wind + temperature, with a cold-weather interaction, fit on long-term
+  statistics. On ~356 days it found wind r ≈ −0.23 (−0.49 below −5 °C) and
+  temperature r ≈ −0.45, R² ≈ 0.37. A learned intraday profile (per hour ×
+  weekday/Saturday/Sunday, from the last 28 days) shapes it into slots. It fills
+  whatever Wattcast doesn't cover. Days past the wind feed's ~3.5-day reach use
+  climatological wind.
+
+**Your price, not the spot price.** Wattcast forecasts the ex-VAT spot price
+(€/MWh). The integration learns how that maps to *your* all-in €/kWh: VAT, the
+retailer margin, and any time-of-use transfer tariff. The fit is
+`buy = a⁺·max(spot,0) + a⁻·min(spot,0) + b[hour, day type]`, using the last 14
+days of pairs between Wattcast's settled spot and your real prices. Pairs come
+from the optional **price series entity** (a Nord Pool-shaped sensor with
+`data_today` / `data_tomorrow` slot lists), or failing that from the buy-price
+sensor's current value. Until enough pairs exist, the slope is seeded from the
+configured VAT.
+
+**Scoring.** Before real prices exist for a day, each rebuild snapshots that
+day's per-hour forecast from every source: `wattcast`, `wattcast_raw` (Wattcast
+without its LLM adjustments) and `local`. The nightly capture job then scores
+each snapshot against the realised hourly prices. `mae_by_source` shows the
+last-30-day hourly and daily MAE for each source. Once every source has at least
+7 scored days, the one with the lowest recent hourly MAE becomes the published
+**primary**; otherwise Wattcast is primary. The existing sensors report the
+primary's errors: `sensor.<name>_forecast_mae` (daily mean) and
+`_forecast_error`. A new sensor, `_forecast_hourly_mae`, reports its hourly
+MAE.
+
+**Other attributes:**
+
+| Attribute | What it holds |
+|---|---|
+| `source` | the primary source |
+| `known_until` | where real prices end |
+| `stale`, `cache_age_h` | whether the cache is stale, and its age in hours |
+| `wattcast_made_at` | when Wattcast issued the cached forecast |
+| `fetch_error` | the last fetch error |
+| `retail_mapping` | slope, base, pairs and fit MAE |
+| `days` | per-day mean/min/max/source |
+
+The large attributes are excluded from the recorder.
 
 ## Dashboard card
 
@@ -351,6 +407,12 @@ Copy `custom_components/load_need_predictor` into your Home Assistant
    **tank charge %** estimate, also set the **heating-active detector** and the
    tank volume / set temperature / cold-inlet temperature (and, optionally, the
    low-charge boost threshold).
+3. **Add a price forecast** (optional): your all-in buy-price sensor. Optionally
+   add a real price series sensor (e.g. the Nord Pool sensor the scheduler
+   uses), which lets it learn the spot → your-price mapping within a day. Wattcast
+   is on by default (zone FI, VAT 25.5 %). Wind, weather and outdoor-temperature
+   entities are optional; they feed only the local fallback model. Then set
+   `sensor.<name>_price_forecast` as the scheduler's `forecast_price_entity`.
 
 The predictor is resilient if the Load Scheduler isn't installed yet: it keeps
 predicting and publishing its sensor, and simply skips the push.

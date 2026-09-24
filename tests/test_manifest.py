@@ -25,7 +25,15 @@ def test_manifest_domain_and_version():
     # HACS requires a version string; check the SemVer shape rather than pinning
     # the value (a pinned value silently fails on every release bump).
     assert re.fullmatch(r"\d+\.\d+\.\d+", data["version"])
+    # …but never below the release that introduced the Wattcast price source.
+    assert tuple(int(p) for p in data["version"].split(".")) >= (0, 10, 0)
     assert data["config_flow"] is True
+
+
+def test_manifest_iot_class():
+    # The price forecast polls the Wattcast cloud API (hourly), so the
+    # integration is no longer purely "calculated".
+    assert _manifest()["iot_class"] == "cloud_polling"
 
 
 def test_manifest_dependencies():

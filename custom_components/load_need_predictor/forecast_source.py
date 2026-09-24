@@ -13,6 +13,12 @@ Three sources, all reaching ~72 h (unlike Nord Pool's day-ahead horizon):
 - **History for fitting** — daily-mean long-term statistics for the price, the
   temperature and the wind sensors.
 
+Plus the primary source, the **Wattcast** spot forecast (``wattcast.eu``, free,
+no key): one HTTP GET per hour at most, parsed by the pure ``spot_forecast``
+module. The fetch never raises — failures come back as a :class:`WattcastFetch`
+with the error (and any ``Retry-After``) so the coordinator can back off and
+keep serving its cache.
+
 Unit note: the wind sensor's *state / LTS is in MW* (~2138) — both the new and
 legacy sensors keep MW there — while the *forecast series is normalised to
 GW* here so the model sees one consistent scale.
@@ -22,11 +28,17 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
-from homeassistant.core import HomeAssistant
+import aiohttp
+from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
+
+from .const import WATTCAST_HOURS, WATTCAST_TIMEOUT_S, WATTCAST_URL
+from .spot_forecast import WattcastSeries, parse_wattcast
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -189,3 +201,142 @@ async def async_daily_price_mean(
     if target_ms in per_day:
         return per_day[target_ms]
     return per_day[min(per_day)]
+
+
+# ── Hourly statistics (intraday shape + hourly evaluation) ──────────────────
+
+
+async def async_hourly_price_rows(
+    hass: HomeAssistant, price_entity: str, start: datetime, end: datetime | None = None
+) -> list[tuple[datetime, float]]:
+    """Hourly-mean realised price rows ``(local hour start, €/kWh)`` from LTS."""
+    try:
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.statistics import statistics_during_period
+    except ImportError:
+        return []
+    try:
+        instance = get_instance(hass)
+    except KeyError:
+        return []
+    stats = await instance.async_add_executor_job(
+        statistics_during_period, hass, start, end, {price_entity}, "hour", None, {"mean"}
+    )
+    rows: list[tuple[datetime, float]] = []
+    for row in stats.get(price_entity, []):
+        mean = row.get("mean")
+        if mean is None:
+            continue
+        rows.append((dt_util.as_local(datetime.fromtimestamp(row["start"], tz=UTC)), float(mean)))
+    return rows
+
+
+# ── Wattcast ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class WattcastFetch:
+    """Outcome of one fetch: a parsed series, or why there isn't one."""
+
+    series: WattcastSeries | None
+    error: str | None = None
+    retry_after_s: int | None = None  # from a 429's Retry-After header
+
+
+async def async_fetch_wattcast(hass: HomeAssistant, zone: str) -> WattcastFetch:
+    """GET the 15-min forecast for ``zone``. Never raises."""
+    session = async_get_clientsession(hass)
+    params = {"zone": zone, "resolution": "15min", "hours": str(WATTCAST_HOURS)}
+    try:
+        async with session.get(
+            WATTCAST_URL,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=WATTCAST_TIMEOUT_S),
+            headers={"Accept": "application/json"},
+        ) as resp:
+            if resp.status == 429:
+                retry = resp.headers.get("Retry-After")
+                return WattcastFetch(
+                    None,
+                    "rate limited (HTTP 429)",
+                    int(retry) if retry and retry.isdigit() else None,
+                )
+            if resp.status != 200:
+                return WattcastFetch(None, f"HTTP {resp.status}")
+            payload = await resp.json(content_type=None)
+    except TimeoutError:
+        return WattcastFetch(None, "timeout")
+    except (aiohttp.ClientError, ValueError) as err:
+        return WattcastFetch(None, f"{type(err).__name__}: {err}")
+    series = parse_wattcast(payload)
+    if series is None:
+        return WattcastFetch(None, "unparseable response")
+    return WattcastFetch(series)
+
+
+# ── Real price series (Nord Pool-shaped slot lists) ─────────────────────────
+
+_SERIES_ATTRS = ("data_yesterday", "data_today", "data_tomorrow")
+
+
+def real_price_slots(state: State | None) -> list[tuple[datetime, datetime, float]]:
+    """``(start UTC, end UTC, buy €/kWh)`` from a slot-list price entity's attrs."""
+    if state is None:
+        return []
+    out: list[tuple[datetime, datetime, float]] = []
+    for attr in _SERIES_ATTRS:
+        items = state.attributes.get(attr)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            try:
+                start = dt_util.parse_datetime(str(item["start"]))
+                end = dt_util.parse_datetime(str(item["end"])) if item.get("end") else None
+                buy = float(item["buy"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if start is None or start.tzinfo is None:
+                continue
+            start = dt_util.as_utc(start)
+            end = dt_util.as_utc(end) if end is not None else start + timedelta(minutes=15)
+            out.append((start, end, buy))
+    out.sort(key=lambda row: row[0])
+    return out
+
+
+def retail_pairs(
+    real: list[tuple[datetime, datetime, float]], series: WattcastSeries | None
+) -> list[tuple[int, float, float]]:
+    """``(start ms, spot €/MWh, buy €/kWh)`` where a real buy meets a settled spot."""
+    if series is None or not real:
+        return []
+    spot = {int(p.start.timestamp() * 1000): p.eur_mwh for p in series.known}
+    step_ms = series.slot_minutes * 60_000
+    pairs: list[tuple[int, float, float]] = []
+    for start, _end, buy in real:
+        ms = int(start.timestamp() * 1000)
+        # An hourly Wattcast series covers four real quarters.
+        value = spot.get(ms)
+        if value is None and step_ms > 900_000:
+            value = spot.get(ms - ms % step_ms)
+        if value is not None:
+            pairs.append((ms, value, buy))
+    return pairs
+
+
+def current_pair(
+    state: State | None, series: WattcastSeries | None, now: datetime
+) -> tuple[int, float, float] | None:
+    """Fallback pair: the buy-price sensor's current value vs the spot now."""
+    if state is None or series is None:
+        return None
+    try:
+        buy = float(state.state)
+    except (TypeError, ValueError):
+        return None
+    step = timedelta(minutes=series.slot_minutes)
+    for point in series.known:
+        if point.start <= now < point.start + step:
+            ms = int(point.start.timestamp() * 1000)
+            return (ms, point.eur_mwh, buy)
+    return None

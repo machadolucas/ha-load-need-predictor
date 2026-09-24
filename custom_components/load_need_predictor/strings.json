@@ -92,23 +92,31 @@
       "step": {
         "init": {
           "title": "Beyond-horizon price forecast",
-          "description": "Estimate electricity prices beyond Nord Pool's day-ahead horizon from wind + temperature, and publish them for the scheduler's forecast_price_entity. The model is fit on long-term statistics of the price/temperature/wind history.",
+          "description": "Forecast electricity prices beyond Nord Pool's day-ahead horizon at 15-minute resolution and publish them for the scheduler's forecast_price_entity. The primary source is the free Wattcast forecast (wattcast.eu — prices: Elering/Nord Pool, weather: Open-Meteo), converted to your all-in price with a mapping learned from your real prices. A local wind + temperature model fills in beyond Wattcast's coverage or when it is unreachable.",
           "data": {
             "name": "Name",
             "price_entity": "Actual buy-price sensor (€/kWh — fit + evaluate)",
-            "wind_entity": "Finland wind-production forecast sensor",
-            "weather_entity": "Weather entity (daily temperature forecast)",
-            "temp_history_entity": "Outdoor temperature sensor (for fitting)",
+            "price_series_entity": "Real price series sensor (optional, e.g. Nord Pool day-ahead)",
+            "use_wattcast": "Use the Wattcast forecast",
+            "wattcast_zone": "Wattcast bidding zone",
+            "vat_pct": "VAT (%)",
+            "wind_entity": "Finland wind-production forecast sensor (local fallback)",
+            "weather_entity": "Weather entity (daily temperature forecast, local fallback)",
+            "temp_history_entity": "Outdoor temperature sensor (for fitting the local fallback)",
             "forecast_days": "Days ahead to publish",
             "fit_days": "History window to fit on (days)"
           },
           "data_description": {
-            "price_entity": "Your real all-in buy-price sensor (€/kWh). The model is fit on its history and its accuracy is evaluated against it.",
-            "wind_entity": "Finland wind-production forecast sensor — more wind generally means lower prices.",
-            "weather_entity": "Weather entity providing the daily temperature forecast — colder means higher prices, especially in deep cold.",
-            "temp_history_entity": "Outdoor temperature sensor whose recorded history is used to fit the price model.",
-            "forecast_days": "How many days ahead to publish the price estimate (beyond Nord Pool's day-ahead horizon).",
-            "fit_days": "How many days of history to fit the price model on."
+            "price_entity": "Your real all-in buy-price sensor (€/kWh). The local model is fit on its history and every forecast source is evaluated against it.",
+            "price_series_entity": "A sensor whose attributes carry the real price slots (data_yesterday / data_today / data_tomorrow with start + buy, like the Load Scheduler's buy-price entity). Used to learn the spot → all-in price mapping (VAT, margin, transfer tariff) and to know where real prices end. Without it the mapping learns slowly from the buy-price sensor's current value.",
+            "use_wattcast": "Fetch the Wattcast spot-price forecast (about 7 days, 15-min, with a p10–p90 band) once an hour. Results are cached, survive restarts, and are kept until a newer forecast arrives.",
+            "wattcast_zone": "Nord Pool bidding zone to forecast.",
+            "vat_pct": "VAT applied to the spot price. Only seeds the mapping until enough real prices have been paired with Wattcast's settled spot.",
+            "wind_entity": "Finland wind-production forecast sensor — more wind generally means lower prices. Only used by the local fallback model.",
+            "weather_entity": "Weather entity providing the daily temperature forecast — colder means higher prices. Only used by the local fallback model.",
+            "temp_history_entity": "Outdoor temperature sensor whose recorded history is used to fit the local fallback model.",
+            "forecast_days": "How many days after today to publish (Wattcast covers about 7; the local model fills any remainder).",
+            "fit_days": "How many days of history to fit the local price model on."
           }
         }
       }
@@ -126,11 +134,18 @@
       "price_forecast": { "name": "Price forecast" },
       "forecast_error": { "name": "Forecast error" },
       "forecast_mae": { "name": "Forecast MAE" },
-      "forecast_samples": { "name": "Forecast samples" }
+      "forecast_samples": { "name": "Forecast samples" },
+      "forecast_hourly_mae": { "name": "Forecast hourly MAE" }
     },
     "button": {
       "predict_now": { "name": "Predict now" },
       "forecast_now": { "name": "Update forecast now" }
+    }
+  },
+  "issues": {
+    "wattcast_unreachable": {
+      "title": "Wattcast price forecast unreachable",
+      "description": "The Wattcast price forecast for zone {zone} could not be fetched for more than {hours} hours (last success: {last_success}; last error: {error}). The last cached forecast is still being used while it lasts, and the local model fills the rest. This clears automatically once a fetch succeeds."
     }
   }
 }
