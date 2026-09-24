@@ -126,7 +126,8 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   a⁻·min(s,0)/1000 + b[daytype(wd/sat/sun), local hour]`, hierarchically shrunk, on a
   14-day buffer of (settled spot, real buy) pairs from the optional
   `price_series_entity` (Nord Pool-shaped slot lists), else the buy-price sensor's
-  current value. Validated 2026-09-24 on the author's contract: recovers ×1.255 VAT +
+  current value. Refit on every successful fetch *and* on every build/reload (from the
+  cached settled spot), so a reconfigure takes effect immediately. Validated 2026-09-24 on the author's contract: recovers ×1.255 VAT +
   4.70 c night (22–07) / 6.77 c day (07–22) with ~1e-6 residual from 2 days of pairs.
 - **Local fallback:** features `[temp, wind, cold_hinge, wind×cold_hinge]`,
   `cold_hinge = max(0,−temp)`; wind in **GW** (sensor series GW, state/LTS MW —

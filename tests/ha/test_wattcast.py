@@ -1097,3 +1097,24 @@ async def test_disabling_wattcast_clears_its_state(hass: HomeAssistant, freezer,
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
     result = new.data[sid]
     assert result.stale is False and result.cache_age_h is None and result.fetch_error is None
+
+
+async def test_reconfigure_refits_mapping_from_cache_without_fetch(
+    hass: HomeAssistant, freezer, wattcast
+):
+    # Start without a price series (one current-price pair), then add one via
+    # reconfigure: the reload must relearn the mapping from the *cached* settled
+    # spot straight away, not wait for the next hourly fetch.
+    entry, fc, sid = await _setup(hass, freezer, series_entity=False)
+    assert fc.mapping[sid].n == 1
+    calls = wattcast.await_count
+    await fc.async_flush()
+    subentry = entry.subentries[sid]
+    hass.config_entries.async_update_subentry(
+        entry, subentry, data={**subentry.data, "price_series_entity": "sensor.nordpool"}
+    )
+    await hass.async_block_till_done()
+    new = entry.runtime_data.forecast
+    assert wattcast.await_count == calls  # cache is from the current issue → no request
+    assert new.mapping[sid].n == _KNOWN_Q
+    assert new.mapping[sid].slope_pos == pytest.approx(_SLOPE, abs=5e-3)

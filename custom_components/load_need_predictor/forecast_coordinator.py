@@ -429,6 +429,12 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
                 continue
             await self._refit_local(subentry_id, cfg)
             await self._refresh_local(subentry_id, cfg)
+            series = self.wattcast.get(subentry_id) if cfg.use_wattcast else None
+            if series is not None:
+                # Refit the retail mapping from the cached settled spot too, so a
+                # reconfigure/restart (e.g. a newly set price series entity)
+                # takes effect now rather than at the next hourly fetch.
+                self._update_mapping(subentry_id, cfg, series, dt_util.utcnow())
             if fetch and cfg.use_wattcast:
                 # A manual refresh may pull early, but never through a failure
                 # backoff / Retry-After, and not more than every 15 minutes.
