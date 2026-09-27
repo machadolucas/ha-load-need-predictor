@@ -50,7 +50,7 @@ Assistant's statistics threw away, and it's what lets the model improve.
 ```
 predicted_kWh = occupancy_factor × [ E_base + E_draw_per_person × people_home ]
               + guest_bonus × guests_present
-predicted_kWh × = gain            # online EWMA correction (actual ÷ predicted)
+predicted_kWh × = gain            # online EWMA correction → your actual ÷ model ratio
 predicted_min  = clamp( predicted_kWh / rated_kW × 60 , min , max )
 ```
 
@@ -58,10 +58,13 @@ predicted_min  = clamp( predicted_kWh / rated_kW × 60 , min , max )
   builds the features, computes minutes (today's need plus any carried-over
   backlog — see *Catching up after a skipped day*), writes the Load Scheduler
   target, and publishes its own `sensor.<load>_predicted_runtime`.
-- **Capture + log** runs late each evening: it reads the day's *actual* delivered
-  energy from the recorder, completes the training row, updates the calibration
-  gain (only from *clean* days — see below), and recomputes the evaluation
-  metrics.
+- **Capture + log** runs late each evening: it reads the *actual* energy
+  delivered over the **day ending at the capture time** from the recorder — up
+  to the last 5-minute block already recorded, each capture starting exactly
+  where the previous one ended (DST days included), so no hour is ever
+  dropped or counted twice — completes the training row, updates
+  the calibration gain (only from *clean* days — see below), and recomputes the
+  evaluation metrics.
 
 ### How the runtime is calculated (worked example)
 
@@ -109,18 +112,23 @@ Two things then adjust these numbers over time:
 
 - **Calibration gain** (`× gain`; starts 1.0, clamped 0.7–1.5, ~6-day EWMA
   half-life) nudges the whole prediction toward your *actual* delivered energy —
-  if the model runs ~10 % hot, the gain drifts toward ~0.9 and every figure above
+  if the model runs ~10 % hot, the gain settles at ~0.9 and every figure above
   scales down ~10 %.
-- **Refit** — once ≥14 clean days are logged, `E_base` and `E_draw_per_person`
-  are re-fit from *your own* `actual_kWh` vs `people_home` history (blended toward
-  the seeds by sample count). So "+44 min per person" is only the starting point;
-  it becomes whatever your household's data says.
+- **Refit** — once ≥14 clean days are logged (including at least one day with
+  nobody home and one with two or more residents), `E_base` and
+  `E_draw_per_person` are re-fit from *your own* history of delivered energy vs
+  `people_home` — with each day's gain, guest bonus and empty-house scaling
+  taken back out first, so the refit and the gain never count the same thing
+  twice — and blended toward the seeds by sample count. So "+44 min per person"
+  is only the starting point; it becomes whatever your household's data says.
 
 > Residents look at the **trailing 24 h** (history); guests look at the **next
 > 24 h** (calendar). The **pushed** target — and the row logged for training — is
-> computed at the predict time; `sensor.<load>_predicted_runtime` is recomputed on
-> every coordinator refresh (predict, capture, restart). Thresholds (12 h, 6 h) and
-> the guest weights (0.5 / 2.0) live in `occupancy.py`.
+> computed at the predict time, and `sensor.<load>_predicted_runtime` shows exactly
+> the last *successfully* pushed value — kept across restarts and reloads (it is
+> only computed live before a load's first push, or after you point it at a
+> different scheduler target). Thresholds (12 h, 6 h) and the guest weights
+> (0.5 / 2.0) live in `occupancy.py`.
 
 ### Catching up after a skipped day
 
@@ -140,9 +148,16 @@ predict-to-predict cycle and carries any shortfall forward — so a skipped day 
 - The backlog is **bounded** (default: twice the daily maximum) so a long outage
   can't make it run away, and the per-day cap still limits one day's catch-up — a
   deep deficit is recovered over several days, not in one giant run.
+- The backlog is settled **once a day**: the first predict of each day closes
+  the previous day's cycle. Pressing **Predict now** (or a low-charge boost)
+  later the same day just re-plans today's target — it never counts the hours
+  that haven't happened yet as a skip.
 - The calibration gain only learns from **clean** days: ones with no backlog being
   worked off *and* where the load ran roughly the full target. So a price-driven
-  skip or defer can no longer trick the model into predicting less.
+  skip or defer can no longer trick the model into predicting less. With a
+  calibrated tank charge (below) every day can teach: demand is then computed
+  from the energy balance — energy delivered minus the change in the tank's
+  charge over the same 24 h — so refill and skip days count too.
 
 Leave the controlled switch empty to disable catch-up — the predictor then behaves
 exactly as the plain daily model above. When enabled,
@@ -158,8 +173,12 @@ deficit below "full at setpoint"** with a minute-by-minute balance, then turns
 that into a percentage:
 
 - **Energy in** from the delivered-energy counter's deltas (cumulative, so
-  restarts and HA downtime lose nothing).
-- **Energy out** from the cold-water meter: household liters are first passed
+  restarts and HA downtime lose nothing). Any energy unit HA knows (Wh, kWh,
+  MWh, …) is converted.
+- **Energy out** from the cold-water meter (any volume unit HA knows — L, m³,
+  gal, ft³, …; slow meters that publish a big step every few minutes are
+  handled too). A counter with a missing or unrecognised unit is ignored (with
+  one log warning) rather than guessed. Household liters are first passed
   through a **hot-flow cap** (~8 L/min sustained — hot water only moves through
   taps and showers, so garden hoses and cold-only appliances beyond the cap are
   attributed cold), then multiplied by a **learned hot fraction** — tracked
@@ -194,7 +213,10 @@ is the *only* moment the sensor reads 100 %:
   reports `calibrated: false` and shows a cold-start guess.
 - If the water meter drops out, the model falls back to an occupancy-based draw
   estimate (flagged via the `draw_source` attribute) and reconciles when the
-  meter returns, so OCR dropouts neither stall nor double-count.
+  meter returns, so OCR dropouts neither stall nor double-count. A counter that
+  is unavailable right at a trip, or whose entity you change in the load's
+  settings, simply restarts from its next reading (that cycle isn't used for
+  learning) — so neither can make the tank jump to full.
 
 Attributes carry the full rationale:
 
@@ -215,20 +237,33 @@ Attributes carry the full rationale:
 | `liters_40c` | The hot water still available, as an equivalent volume of comfortable 40 °C water. |
 | `showers_left` | The same, expressed as roughly how many showers remain. |
 
+The minute-by-minute attributes (`deficit_kwh`, `deficit_raw_kwh`,
+`uncertainty_kwh`, `latched`, `draw_source`, `liters_40c`, `showers_left`) are
+live-only — they aren't written to the recorder, so they don't bloat the
+database; the charge % itself and the learned parameters keep their history.
+
 **The charge feeds back into the prediction** (only once calibrated):
 
 - At predict time, the **measured** tank deficit replaces the commanded-minutes
   backlog bookkeeping — it self-heals on manual boosts, early thermostat trips
-  and skipped days alike.
+  and skipped days alike. Clearing the heating-active detector turns this off
+  again (the stored charge is then ignored).
+- At capture time, the charge is snapshotted so the next day's calibration can
+  learn from true demand (energy in minus the change in charge).
 - An optional **low-charge boost** re-runs predict + push immediately when the
   charge falls below a threshold (default 20 %), so the scheduler plans more
   heating before the tank runs cold. It re-arms only after the charge recovers
-  and fires at most once per six hours.
+  (15 points above the threshold, or a full tank for high thresholds) and fires
+  at most once per six hours. If the push fails (e.g. the scheduler target is
+  unavailable) the boost isn't used up: it retries every 15 minutes until a push
+  goes through.
 
 Enable it by setting the load's **heating-active detector** (a binary sensor
 that is on only while the element actually draws power — e.g. an LED or current
 detector) plus the tank volume, set temperature and cold-inlet temperature. The
-controlled switch and water-meter entities are shared with the features above.
+controlled switch (**required** with the detector — the charge is calibrated at
+"contactor on + element idle") and water-meter entities are shared with the
+features above.
 
 ## Entities (per load)
 
@@ -236,7 +271,7 @@ controlled switch and water-meter entities are shared with the features above.
 |---|---|
 | `sensor.<load>_predicted_runtime` | The pushed target in minutes — today's need plus any carried-over backlog (also the forward-compatible "target source"). |
 | `sensor.<load>_predicted_energy` | The forecast in kWh. |
-| `sensor.<load>_last_delivered` | Actual delivered energy captured for the previous day (kWh). |
+| `sensor.<load>_last_delivered` | Actual delivered energy captured over the last capture's one-day window (kWh). |
 | `sensor.<load>_prediction_error` | Yesterday's \|predicted − actual\| in minutes. |
 | `sensor.<load>_rolling_mae` | Rolling mean absolute error (minutes) over the evaluation window. |
 | `sensor.<load>_sample_count` | How many self-logged days the model has learned from. |
@@ -302,10 +337,19 @@ rebuilds on demand and pulls a fresh forecast if the cache is over 15 minutes ol
     unless one is due.
   - **Caching:** the response is persisted, so it survives restarts. It is kept
     until a newer fetch succeeds, which means an outage still leaves you with
-    the last forecast.
+    the last forecast. A response that would make things worse (no forecast
+    left in it, or an older issue than the cached one) is not used; it shows up
+    in `fetch_error`, and the next try waits for the next hourly issue (the
+    button won't force it sooner). The same issue fetched again only replaces
+    the cache if it reaches further. Slots
+    that have already passed drop out of the list even while fetches fail.
   - **Failures:** retries back off (5 → 15 → 30 → 60 min, honouring
-    `Retry-After`). After 6 h of failures a **repair issue** appears, and it
-    clears itself on the next success.
+    `Retry-After`). The backoff survives restarts and reloads. After 6 h of
+    failures a **repair issue** appears. It clears itself on the next success,
+    and when you remove the price forecast.
+  - **Changing the zone** (or the price entities) throws away what was learned
+    for the old one: the cached forecast, the price mapping and the scores. The
+    new zone is fetched right away.
   - **Attribution:** prices from Elering (Nord Pool day-ahead), weather from
     Open-Meteo.com (CC BY 4.0), forecast by Wattcast.
 - **Local model** (fallback) is a small, explainable regression of daily price
@@ -314,7 +358,15 @@ rebuilds on demand and pulls a fresh forecast if the cache is over 15 minutes ol
   temperature r ≈ −0.45, R² ≈ 0.37. A learned intraday profile (per hour ×
   weekday/Saturday/Sunday, from the last 28 days) shapes it into slots. It fills
   whatever Wattcast doesn't cover. Days past the wind feed's ~3.5-day reach use
-  climatological wind.
+  climatological wind. Temperatures are handled in °C, so a weather entity or
+  sensor set to °F works too.
+
+Each slot comes from the best source that covers it. If your Nord Pool sensor
+lags behind Wattcast's settled day-ahead prices, those hours use Wattcast's
+settled price, converted to your price (`src: "wattcast_known"`, no band).
+Next comes the primary forecast source. Where it has no data, the other source
+fills in: for example, the local model when Wattcast's coverage ends, or
+Wattcast for days past the local model's weather forecast.
 
 **Your price, not the spot price.** Wattcast forecasts the ex-VAT spot price
 (€/MWh). The integration learns how that maps to *your* all-in €/kWh: VAT, the
@@ -329,7 +381,9 @@ configured VAT.
 **Scoring.** Before real prices exist for a day, each rebuild snapshots that
 day's per-hour forecast from every source: `wattcast`, `wattcast_raw` (Wattcast
 without its LLM adjustments) and `local`. The nightly capture job then scores
-each snapshot against the realised hourly prices. `mae_by_source` shows the
+each snapshot against the realised hourly prices. A day is scored only after its
+local midnight has passed and when at least 20 of its hours have recorded
+prices. A day that still can't be scored a week later is skipped for good. `mae_by_source` shows the
 last-30-day hourly and daily MAE for each source. Once every source has at least
 7 scored days, the one with the lowest recent hourly MAE becomes the published
 **primary**; otherwise Wattcast is primary. The existing sensors report the
@@ -401,10 +455,12 @@ Copy `custom_components/load_need_predictor` into your Home Assistant
 1. **Add the hub** and (optionally) adjust the predict/capture times.
 2. **Add a load** and follow the wizard: the Load Scheduler target `number` to
    drive, the delivered-energy sensor, the load's rated power, the people and
-   guests-calendar entities, optional log-only context sensors, the minute clamp,
-   and — to enable catch-up after skipped days — the load's **controlled switch**
-   (the relay the scheduler drives) plus an optional backlog cap. To enable the
-   **tank charge %** estimate, also set the **heating-active detector** and the
+   guests-calendar entities, optional log-only context sensors, the minute clamp
+   (it must contain at least one whole 15-minute step, e.g. 45 — min = max = 40
+   is rejected), and — to enable catch-up after skipped days — the load's
+   **controlled switch** (the relay the scheduler drives) plus an optional
+   backlog cap. To enable the **tank charge %** estimate, also set the
+   **heating-active detector** (which requires the controlled switch) and the
    tank volume / set temperature / cold-inlet temperature (and, optionally, the
    low-charge boost threshold).
 3. **Add a price forecast** (optional): your all-in buy-price sensor. Optionally

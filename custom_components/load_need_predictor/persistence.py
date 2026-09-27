@@ -125,6 +125,12 @@ def tank_to_dict(state: TankState) -> dict:
         "cycle_relax_kwh": state.cycle_relax_kwh,
         "cycle_hot_liters_by_bucket": list(state.cycle_hot_liters_by_bucket),
         "led_kwh_since_counter": state.led_kwh_since_counter,
+        # Water-meter step timing + which entity each baseline belongs to (all
+        # default to "unknown" on load, so older files keep loading unchanged).
+        "water_changed_iso": state.water_changed_iso,
+        "water_cadence_min": state.water_cadence_min,
+        "energy_source": state.energy_source,
+        "water_source": state.water_source,
         "version": state.version,
     }
 
@@ -184,5 +190,9 @@ def tank_from_dict(data: dict | None) -> TankState | None:
         led_kwh_since_counter=float(
             data.get("led_kwh_since_counter", defaults.led_kwh_since_counter)
         ),
+        water_changed_iso=str(data.get("water_changed_iso", defaults.water_changed_iso)),
+        water_cadence_min=float(data.get("water_cadence_min", defaults.water_cadence_min)),
+        energy_source=str(data.get("energy_source", defaults.energy_source)),
+        water_source=str(data.get("water_source", defaults.water_source)),
         version=str(data.get("version", defaults.version)),
     )

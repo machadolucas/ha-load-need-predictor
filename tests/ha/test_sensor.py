@@ -179,3 +179,35 @@ async def test_tank_soc_attribute_contract(hass: HomeAssistant) -> None:
     # …and nothing extra beyond the documented keys + HA-managed ones.
     assert set(state.attributes) - _TANK_ATTRS <= _HA_MANAGED
     assert "breakdown" not in state.attributes  # not a load runtime sensor
+
+
+def test_tank_soc_volatile_attributes_are_unrecorded() -> None:
+    """Per-tick diagnostics stay out of the recorder; learned params stay in.
+
+    Without this every 60 s tick wrote a new attributes row. The volatile set
+    must stay a subset of the published contract (a typo would silently record).
+    """
+    from custom_components.load_need_predictor.sensor import TankSocSensor
+
+    volatile = {
+        "deficit_kwh",
+        "deficit_raw_kwh",
+        "uncertainty_kwh",
+        "latched",
+        "draw_source",
+        "liters_40c",
+        "showers_left",
+    }
+    unrecorded = TankSocSensor._unrecorded_attributes
+    assert volatile <= unrecorded
+    assert unrecorded <= _TANK_ATTRS
+    kept = {
+        "capacity_kwh",
+        "hot_fraction",
+        "hot_fraction_profile",
+        "standby_w",
+        "hysteresis_kwh",
+        "calibrated",
+        "last_full",
+    }
+    assert not (kept & unrecorded)

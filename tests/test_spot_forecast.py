@@ -304,6 +304,26 @@ def test_fit_constant_spot_falls_back_to_seed_slope():
     assert m.apply(50.0, start) == pytest.approx(0.15, abs=1e-9)
 
 
+def test_fit_single_pair_buckets_are_shrunk_not_memorised():
+    # 24 hourly pairs = one per bucket (day 1 of an hourly series). Constant
+    # spot pins the slope to the seed, so the offsets carry only the noise
+    # around a true *flat* 5 c margin: they must shrink toward the base instead
+    # of each hour memorising its own noise (the reported MAE was ~1e-19).
+    rng = random.Random(7)
+    start = datetime(2026, 9, 1, tzinfo=HEL)  # a Tuesday
+    noise = [rng.gauss(0.0, 0.01) for _ in range(24)]
+    pairs = [(start + timedelta(hours=h), 50.0, 1.255 * 0.05 + 0.05 + noise[h]) for h in range(24)]
+    m = sf.fit_retail_mapping(pairs, VAT)
+    assert m.slope_pos == pytest.approx(1.255)
+    mean_noise = sum(noise) / len(noise)
+    assert m.base == pytest.approx(0.05 + mean_noise, abs=1e-9)
+    worst = max(abs(n - mean_noise) for n in noise)
+    devs = [abs(m.offsets[f"wd:{h:02d}"] - m.base) for h in range(24)]
+    # λ = SHRINK_LAMBDA at both hierarchy levels → at most (1/5 + 4/5·1/5) of it.
+    assert max(devs) <= 0.37 * worst
+    assert m.mae > 0.5 * sum(abs(n - mean_noise) for n in noise) / 24
+
+
 # ── intraday shape ───────────────────────────────────────────────────────────
 
 
@@ -443,6 +463,55 @@ def test_build_slots_pure_local_with_shape():
     assert {s["src"] for s in slots} == {"local"}
     assert slots[0]["buy"] == pytest.approx(0.06)
     assert slots[48]["buy"] == pytest.approx(0.14)
+
+
+def test_build_slots_settled_spot_beats_forecast_and_local():
+    # The real-price entity lags: Wattcast's *settled* spot (known) still
+    # covers the next hours, so those slots use it (mapped, zero-width band,
+    # own src tag) instead of the local fallback — and it wins over a forecast
+    # point for the same slot too.
+    t0 = _utc(2026, 9, 24, 10)
+    known = [sf.SpotPoint(t0 + timedelta(minutes=15 * i), 40.0 + i) for i in range(4)]
+    series = _series([(t0 + timedelta(minutes=45), 1.0, 2.0, 3.0)], known=known)
+    slots = sf.build_slots(
+        start=t0,
+        end=t0 + timedelta(hours=2),
+        tz=HEL,
+        wattcast=series,
+        variant="wattcast",
+        mapping=sf.seed_mapping(VAT),
+        local_daily={date(2026, 9, 24): 0.2},
+        shape=None,
+    )
+    assert [s["src"] for s in slots] == ["wattcast_known"] * 4 + ["local"] * 4
+    for i, slot in enumerate(slots[:4]):
+        buy = round(1.255 * (40.0 + i) / 1000, 5)
+        assert slot["buy"] == slot["p10"] == slot["p90"] == buy
+    assert slots[4]["buy"] == 0.2
+
+
+def test_build_slots_prefer_local_falls_back_per_slot():
+    # A local primary that has weather inputs for one day only must not drop
+    # the Wattcast days beyond it (the src tag stays truthful per slot).
+    series = _series(
+        [(_utc(2026, 9, 24, 21) + timedelta(minutes=15 * i), 1.0, 20.0, 30.0) for i in range(192)]
+    )
+    kwargs = dict(
+        start=_utc(2026, 9, 24, 21),  # 00:00 local, 25 Sep
+        end=_utc(2026, 9, 26, 21),
+        tz=HEL,
+        wattcast=series,
+        variant="wattcast",
+        mapping=sf.seed_mapping(VAT),
+        local_daily={date(2026, 9, 25): 0.3},
+        shape=None,
+    )
+    slots = sf.build_slots(prefer_local=True, **kwargs)
+    assert [s["src"] for s in slots] == ["local"] * 96 + ["wattcast"] * 96
+    assert slots[0]["buy"] == 0.3
+    assert slots[96]["buy"] == round(1.255 * 20.0 / 1000, 5)
+    # Default precedence: Wattcast wherever it covers.
+    assert {s["src"] for s in sf.build_slots(**kwargs)} == {"wattcast"}
 
 
 @pytest.mark.parametrize(("day", "quarters"), [(date(2026, 10, 25), 100), (date(2026, 3, 29), 92)])

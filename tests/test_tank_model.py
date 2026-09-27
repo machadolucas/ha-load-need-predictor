@@ -1565,6 +1565,392 @@ def test_boost_disarmed_below_threshold_does_not_fire():
     assert out.boost_armed is False
 
 
+def test_boost_rearm_capped_at_full_for_high_thresholds():
+    # Threshold 90 + margin 15 = 105 % is unreachable; the re-arm level is capped
+    # at 100, which the control ledger reads exactly at an anchor.
+    st = _state(calibrated=True, boost_armed=False)
+    fire, out = tank.should_boost(
+        st, soc_value=0.995, threshold_pct=90.0, now_iso="2026-07-16T10:00:00+03:00"
+    )
+    assert out.boost_armed is False  # 99.5 % is not full
+    fire, out = tank.should_boost(
+        st,
+        soc_value=tank.soc(0.0, CAP),  # an anchor: deficit 0 → exactly 1.0
+        threshold_pct=90.0,
+        now_iso="2026-07-16T10:00:00+03:00",
+    )
+    assert fire is False
+    assert out.boost_armed is True
+
+
+def test_boost_rearm_uncapped_below_the_cap_is_unchanged():
+    # 20 + 15 = 35 < 100 → the ordinary margin still applies.
+    st = _state(calibrated=True, boost_armed=False)
+    _, out = tank.should_boost(
+        st, soc_value=0.34, threshold_pct=20.0, now_iso="2026-07-16T10:00:00+03:00"
+    )
+    assert out.boost_armed is False
+    _, out = tank.should_boost(
+        st, soc_value=0.35, threshold_pct=20.0, now_iso="2026-07-16T10:00:00+03:00"
+    )
+    assert out.boost_armed is True
+
+
+# ── counters unavailable across an anchor ─────────────────────────────────────
+
+
+def _anchor_inputs(**over) -> TickInputs:
+    base = dict(
+        now_iso=_iso(0),
+        elapsed_s=60.0,
+        contactor_on=True,
+        heating_on=False,
+        contactor_on_for_s=200.0,
+        heating_off_for_s=120.0,
+    )
+    base.update(over)
+    return _inputs(**base)
+
+
+def _wet_cycle_state(**over) -> TankState:
+    base = dict(
+        deficit_kwh=6.0,
+        cycle_unclamped_kwh=1.0,
+        calibrated=True,
+        cycle_clean=True,
+        cycle_liters=100.0,
+        cycle_hot_liters_by_bucket=(0.0, 0.0, 0.0, 100.0),
+        cycle_gross_kwh=10.0,
+        cycle_start_iso="2026-07-16T00:00:00+03:00",
+        energy_baseline_kwh=200.0,
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(-1),
+        standby_w=0.0,
+        hot_fraction=0.25,
+    )
+    base.update(over)
+    return _state(**base)
+
+
+def test_anchor_with_energy_counter_unavailable_drops_baseline_and_skips_learning():
+    st = _wet_cycle_state(pending_fallback_kwh=0.3)
+    res = tank.apply_tick(
+        st, PARAMS, _anchor_inputs(energy_counter_kwh=None, water_counter_l=1000.0)
+    )
+    assert res.anchored is True
+    assert res.state.deficit_kwh == 0.0
+    # The closed cycle's balance is missing the in-flight energy → no learning.
+    assert res.state.hot_fraction_profile == st.hot_fraction_profile
+    assert res.state.residual_ratio == st.residual_ratio
+    # Baseline dropped, pending (the closed cycle's) cleared, new cycle dirty.
+    assert res.state.energy_baseline_kwh is None
+    assert res.state.pending_fallback_kwh == 0.0
+    assert res.state.cycle_clean is False
+    # The counter returns having counted +6 kWh before the anchor: adopted, not
+    # credited against the new cycle.
+    back = tank.apply_tick(
+        res.state,
+        PARAMS,
+        _inputs(
+            now_iso=_iso(30), elapsed_s=1740.0, energy_counter_kwh=206.0, water_counter_l=1000.0
+        ),
+    )
+    assert back.energy_in_kwh == 0.0
+    assert back.state.energy_baseline_kwh == 206.0
+    assert back.state.cycle_unclamped_kwh >= 0.0  # no −6 kWh bogus "over-full"
+
+
+def test_anchor_with_both_counters_present_still_learns():
+    # Control for the test above: the same cycle with the counter present learns.
+    st = _wet_cycle_state()
+    res = tank.apply_tick(
+        st, PARAMS, _anchor_inputs(energy_counter_kwh=200.0, water_counter_l=1000.0)
+    )
+    assert res.anchored is True
+    assert res.state.hot_fraction_profile != ()
+    assert res.state.cycle_clean is True
+    assert res.state.energy_baseline_kwh == 200.0
+
+
+def test_anchor_with_water_meter_unavailable_drops_its_baseline():
+    st = _wet_cycle_state(pending_fallback_kwh=0.4)
+    res = tank.apply_tick(
+        st, PARAMS, _anchor_inputs(energy_counter_kwh=200.0, water_counter_l=None)
+    )
+    assert res.anchored is True
+    assert res.state.hot_fraction_profile == st.hot_fraction_profile  # no learning
+    assert res.state.water_baseline_l is None
+    assert res.state.pending_fallback_kwh == 0.0
+    assert res.state.cycle_clean is False
+    assert res.state.energy_baseline_kwh == 200.0  # the present counter is kept
+    # The meter returns 80 L higher (pre-anchor draw): adopted with zero draw.
+    back = tank.apply_tick(
+        res.state,
+        PARAMS,
+        _inputs(now_iso=_iso(1), energy_counter_kwh=200.0, water_counter_l=1080.0),
+    )
+    assert back.draw_kwh == 0.0
+    assert back.draw_source == "none"
+    assert back.state.water_baseline_l == 1080.0
+
+
+def test_energy_outage_across_two_anchors_keeps_cycles_dirty():
+    # The counter drops out, then two anchors pass before it returns. By the
+    # second anchor the baseline is already gone — the cycle it opens must still
+    # be dirty, or a later long cycle would learn from draws + standby with zero
+    # delivered energy recorded.
+    st = _wet_cycle_state()
+    first = tank.apply_tick(
+        st, PARAMS, _anchor_inputs(energy_counter_kwh=None, water_counter_l=1000.0)
+    )
+    assert first.anchored and first.state.cycle_clean is False
+    assert first.state.energy_baseline_kwh is None
+    # The contactor drops (latch releases), then a second trip — counter still out.
+    off = tank.apply_tick(
+        first.state,
+        PARAMS,
+        _inputs(now_iso=_iso(60), elapsed_s=3600.0, water_counter_l=1000.0, contactor_on=False),
+    )
+    second = tank.apply_tick(
+        off.state,
+        PARAMS,
+        _anchor_inputs(now_iso=_iso(300), energy_counter_kwh=None, water_counter_l=1000.0),
+    )
+    assert second.anchored is True
+    assert second.state.cycle_clean is False  # still dirty: energy never came back
+    # The counter returns mid-cycle: adopted, but this cycle stays dirty…
+    back = tank.apply_tick(
+        second.state,
+        PARAMS,
+        _inputs(now_iso=_iso(301), energy_counter_kwh=250.0, water_counter_l=1000.0),
+    )
+    assert back.state.energy_baseline_kwh == 250.0
+    assert back.state.cycle_clean is False
+    # …and the next anchor, with the counter present, opens a clean one.
+    off2 = tank.apply_tick(
+        back.state,
+        PARAMS,
+        _inputs(
+            now_iso=_iso(360),
+            elapsed_s=3540.0,
+            energy_counter_kwh=250.0,
+            water_counter_l=1000.0,
+            contactor_on=False,
+        ),
+    )
+    third = tank.apply_tick(
+        off2.state,
+        PARAMS,
+        _anchor_inputs(now_iso=_iso(600), energy_counter_kwh=251.0, water_counter_l=1000.0),
+    )
+    assert third.anchored is True
+    assert third.state.cycle_clean is True
+
+
+def test_anchor_without_a_water_reading_opens_a_dirty_cycle():
+    # Unavailable at the anchor — with or without an existing baseline — is a gap.
+    st = _wet_cycle_state(water_baseline_l=None, water_baseline_iso="")
+    res = tank.apply_tick(
+        st, PARAMS, _anchor_inputs(energy_counter_kwh=200.0, water_counter_l=None)
+    )
+    assert res.anchored is True
+    assert res.state.cycle_clean is False
+
+
+# ── first water reading ───────────────────────────────────────────────────────
+
+
+def test_first_water_reading_adopts_baseline_without_fallback():
+    st = _state(deficit_kwh=5.0, calibrated=True, standby_w=0.0, pending_fallback_kwh=0.2)
+    res = tank.apply_tick(st, PARAMS, _inputs(water_counter_l=41536.0))
+    assert res.draw_source == "none"
+    assert res.draw_kwh == 0.0
+    assert res.state.cycle_clean is True
+    assert res.state.water_baseline_l == 41536.0
+    assert res.state.pending_fallback_kwh == 0.0
+    # …and the next reading is an ordinary metered delta.
+    nxt = tank.apply_tick(res.state, PARAMS, _inputs(now_iso=_iso(1), water_counter_l=41540.0))
+    assert nxt.draw_source == "meter"
+    assert nxt.draw_kwh == pytest.approx(tank.draw_kwh_from_liters(4.0, 0.25, 75.0, 12.0))
+
+
+# ── slow water meters ─────────────────────────────────────────────────────────
+
+
+def _meter_tick(state, minute, reading, changed_minute):
+    return tank.apply_tick(
+        state,
+        PARAMS,
+        _inputs(
+            now_iso=_iso(minute),
+            elapsed_s=60.0,
+            water_counter_l=reading,
+            water_changed_iso=_iso(changed_minute),
+        ),
+    )
+
+
+def test_slow_meter_steps_are_rated_over_their_own_interval():
+    # A meter publishing a 50 L step every 10 min during a long shower (5 L/min).
+    # Its first step after idle can't be told from a burst (one-tick span →
+    # misread), but once one 10-min interval has been seen the steps pass the
+    # misread guard and the hot-flow cap sees 5 L/min, not 50 L/min.
+    st = _state(
+        deficit_kwh=5.0,
+        calibrated=True,
+        standby_w=0.0,
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(-1),
+        water_changed_iso=_iso(-600),  # idle for hours before the shower
+    )
+    reading = 1000.0
+    sources = []
+    hot_liters = []
+    for minute in range(1, 41):
+        if minute % 10 == 0:
+            reading += 50.0
+        changed = (minute // 10) * 10 if minute >= 10 else -600
+        res = _meter_tick(st, minute, reading, changed)
+        if minute % 10 == 0:
+            sources.append(res.draw_source)
+            hot_liters.append(res.state.cycle_liters - st.cycle_liters)
+        st = res.state
+    assert sources[0] == "fallback"  # first step after idle: indistinguishable
+    assert sources[1:] == ["meter", "meter", "meter"]
+    assert hot_liters[1:] == [pytest.approx(50.0)] * 3  # not clipped to 8 L
+    assert st.water_cadence_min == pytest.approx(10.0)
+
+
+def test_fast_meter_keeps_one_tick_caps():
+    # A responsive meter (2 L every 30 s) teaches a sub-minute cadence, so its
+    # first 20 L step after idle is still clipped at 8 L/tick like before.
+    st = _state(
+        deficit_kwh=5.0,
+        calibrated=True,
+        standby_w=0.0,
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(29),  # read (unchanged) every tick while idle
+        water_changed_iso=_iso(0),
+        water_cadence_min=0.5,
+    )
+    res = _meter_tick(st, 30, 1020.0, 29.9)  # after 30 min idle
+    assert res.draw_source == "meter"
+    assert res.state.cycle_liters - st.cycle_liters == pytest.approx(8.0)
+
+
+def test_isolated_small_draws_never_raise_the_cadence():
+    # A responsive meter with isolated 2 L draws 10 min apart: every step is
+    # plausible over one tick, so nothing evidences batching — an unknown cadence
+    # stays at one tick (0) and a learned sub-minute one doesn't creep up.
+    for start_cadence in (0.0, 0.5):
+        st = _state(
+            deficit_kwh=5.0,
+            water_baseline_l=1000.0,
+            water_baseline_iso=_iso(-1),
+            water_changed_iso=_iso(-10),
+            water_cadence_min=start_cadence,
+        )
+        reading = 1000.0
+        for minute in range(60):
+            if minute % 10 == 0:
+                reading += 2.0
+            st = _meter_tick(st, minute, reading, (minute // 10) * 10).state
+        assert st.water_cadence_min == start_cadence
+
+
+def test_rejected_readings_do_not_train_the_cadence():
+    base = dict(
+        deficit_kwh=5.0,
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(-1),
+        water_changed_iso=_iso(-10),
+    )
+    # Rollback / reset (negative delta) → misread, cadence untouched.
+    res = _meter_tick(_state(**base), 0, 900.0, 0)
+    assert res.draw_source == "fallback"
+    assert res.state.water_cadence_min == 0.0
+    # A spike implausible even over the meter's own 10-min interval (100 L/min).
+    res = _meter_tick(_state(**base), 0, 2000.0, 0)
+    assert res.draw_source == "fallback"
+    assert res.state.water_cadence_min == 0.0
+    # A first-reading adoption doesn't train it either.
+    res = _meter_tick(_state(deficit_kwh=5.0), 0, 1000.0, 0)
+    assert res.state.water_cadence_min == 0.0
+
+
+def test_batched_step_raises_cadence_but_is_itself_rejected():
+    # 60 L one tick after a change 12 min ago: impossible over 1 min, plausible
+    # (5 L/min) over the meter's own interval → the cadence learns 12 min, while
+    # the step itself isn't charged (it can't yet be told from an OCR spike).
+    st = _state(
+        deficit_kwh=5.0,
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(-1),
+        water_changed_iso=_iso(-12),
+    )
+    res = _meter_tick(st, 0, 1060.0, 0)
+    assert res.draw_source == "fallback"
+    assert res.state.water_cadence_min == pytest.approx(12.0)
+
+
+def test_unchanged_reading_keeps_the_change_stamp():
+    st = _state(
+        deficit_kwh=5.0,
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(-1),
+        water_changed_iso=_iso(-5),
+    )
+    res = tank.apply_tick(st, PARAMS, _inputs(now_iso=_iso(0), water_counter_l=1000.0))
+    assert res.state.water_baseline_iso == _iso(0)  # read time advances
+    assert res.state.water_changed_iso == _iso(-5)  # change time doesn't
+
+
+# ── counter source changes ────────────────────────────────────────────────
+
+
+def test_rebind_sources_rebaselines_a_changed_entity():
+    st = _state(
+        energy_baseline_kwh=100.0,
+        energy_source="sensor.lvv_energy",
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(-1),
+        water_source="sensor.water",
+        pending_fallback_kwh=0.2,
+        cycle_clean=True,
+    )
+    out = tank.rebind_sources(st, "sensor.lvv_energy_2", "sensor.water")
+    assert out.energy_source == "sensor.lvv_energy_2"
+    assert out.energy_baseline_kwh is None
+    assert out.water_baseline_l == 1000.0  # unchanged source kept
+    assert out.pending_fallback_kwh == 0.2
+    assert out.cycle_clean is False
+    # The new counter's (much higher) first reading is adopted, not credited.
+    res = tank.apply_tick(out, PARAMS, _inputs(energy_counter_kwh=8115.0))
+    assert res.energy_in_kwh == 0.0
+    assert res.state.energy_baseline_kwh == 8115.0
+
+
+def test_rebind_sources_water_change_and_unchanged_noop():
+    st = _state(water_baseline_l=1000.0, water_source="sensor.water", pending_fallback_kwh=0.2)
+    assert tank.rebind_sources(st, "", "sensor.water") is st  # nothing changed
+    out = tank.rebind_sources(st, "", "sensor.water_new")
+    assert out.water_baseline_l is None
+    assert out.pending_fallback_kwh == 0.0
+    assert out.cycle_clean is False
+
+
+def test_rebind_sources_adopts_when_nothing_was_recorded():
+    # State saved before sources were recorded: adopt the configured entities
+    # without re-baselining, so the upgrade loses no energy.
+    st = _state(energy_baseline_kwh=100.0, water_baseline_l=1000.0)
+    out = tank.rebind_sources(st, "sensor.lvv_energy", "sensor.water")
+    assert out.energy_source == "sensor.lvv_energy"
+    assert out.water_source == "sensor.water"
+    assert out.energy_baseline_kwh == 100.0
+    assert out.water_baseline_l == 1000.0
+    assert out.cycle_clean is True
+
+
 # ── deficit_minutes_from_kwh ──────────────────────────────────────────────────
 
 

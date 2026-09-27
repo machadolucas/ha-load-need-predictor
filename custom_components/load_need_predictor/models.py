@@ -86,6 +86,17 @@ class LoadConfig:
     controlled_switch_entity: str | None
     deficit_cap_minutes: float
 
+    @property
+    def tank_tracking_enabled(self) -> bool:
+        """Whether this load's tank state-of-charge is tracked.
+
+        The single predicate for "the tank model is live for this load": the
+        tracker ticks only these, and the coordinator only trusts a restored
+        tank deficit for these — so clearing the detector really turns the
+        tank feedback off instead of leaving a frozen calibrated state in force.
+        """
+        return bool(self.heating_active_entity)
+
 
 def _as_tuple(value) -> tuple[str, ...]:
     """Normalise an EntitySelector(multiple) value to a tuple of entity ids."""

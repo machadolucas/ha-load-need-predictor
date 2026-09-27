@@ -81,14 +81,14 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `price_model.py` | **Pure** price model: ridge regression of price on wind+temp with a cold interaction; seed fallback; fit/predict/serialize | no |
 | `spot_forecast.py` | **Pure** Wattcast parse + compact cache (`WattcastSeries`), spot→retail mapping (`fit_retail_mapping`), local intraday shape, DST-safe 15-min `build_slots`, per-hour scoring + `select_primary` | no |
 | `tank_model.py` | **Pure** tank state-of-charge: energy-deficit integration (`apply_tick`), 100 %-anchor + EWMA calibration of `hot_fraction`/`standby_w`, hot-flow cap, meter-misread/fallback guards, boost gating (`should_boost`), liters/showers helpers | no |
-| `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig` | no |
-| `statistics_source.py` | Load delivery from the recorder (daily `change`) + commanded switch on-time over a window (`async_commanded_minutes`, for deficit carryover) | yes |
+| `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig`; `LoadConfig.tank_tracking_enabled` is the one "is the tank live?" predicate | no |
+| `statistics_source.py` | Load delivery from the recorder (`change` over an arbitrary window via the singular `statistic_during_period`, kWh-normalised) + commanded switch on-time over a window (`async_commanded_minutes`, for deficit carryover); every helper returns `None` on a recorder error, never raises | yes |
 | `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price (daily + hourly); the Wattcast HTTP fetch (never raises → `WattcastFetch`); real-price slot/pair helpers | yes |
 | `occupancy.py` | Duration-based occupancy: residents home ≥12 h over the trailing 24 h (from history) + guests weighted by visit length (next-24 h calendar); instantaneous fallbacks | yes |
 | `persistence.py` | `Store` (load: model+training+eval; forecast uses a `.forecast` file) | yes |
 | `actuation.py` | Resilient `number.set_value` push to the scheduler target | yes |
-| `jobs.py` | The two daily jobs; drives both coordinators | yes |
-| `coordinator.py` | Load `DataUpdateCoordinator`; per-load `LoadResult` | yes |
+| `jobs.py` | The two daily jobs; drives both coordinators (each capability step isolated — one failing never skips the other) | yes |
+| `coordinator.py` | Load `DataUpdateCoordinator`; per-load `LoadResult` + the push-time `PublishedTarget` cache; predict/capture serialised by one lock, per-load work isolated | yes |
 | `forecast_coordinator.py` | Price-forecast coordinator: 5-min due-check tick → hourly Wattcast fetch (persisted cache, backoff, repair issue) → mapping refit → build slots → per-source snapshot; daily local refit; nightly per-source scoring; `ForecastResult` | yes |
 | `tank_tracker.py` | 60 s-tick coordinator: reads counters/switch/detector states, drives `tank_model.apply_tick`, publishes per-load `TankResult`, fires the low-charge boost | yes |
 | `runtime.py` | `RuntimeData` (both coordinators) + the `ConfigEntry` type alias | yes |
@@ -104,7 +104,12 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 - **Two sources, one series.** Wattcast (`wattcast.eu`, free/key-less, server-side
   gradient-boosted trees + Open-Meteo weather + LLM outage adjustments; ≈ 7 days,
   15-min, p10/p50/p90 spot €/MWh ex-VAT) is primary; the local ridge (below) is the
-  fallback beyond Wattcast's coverage / before a first fetch. The HA repo
+  fallback beyond Wattcast's coverage / before a first fetch. `build_slots` picks the
+  source **per slot**: Wattcast's cached *settled* spot first (where the real-price
+  entity lags it — mapped to retail, `p10 = p90 = buy`, `src: "wattcast_known"`,
+  never snapshotted/scored), then the primary, then the other forecast source
+  (`prefer_local` when local is primary, so its short weather reach doesn't drop the
+  Wattcast days beyond). The HA repo
   `SectorTll/wattcast-homeassistant` is just an API client — there is no model to
   "replicate" locally; don't try to rebuild their GBT here.
 - **`price_model.py` and `spot_forecast.py` must stay Home-Assistant-free**
@@ -117,27 +122,61 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   (the first HH:32 after the last fetch — Wattcast re-issues ≈ :25), only from
   the 5-minute due-check tick (own `async_track_time_interval`, not `update_interval`).
   The raw series is **persisted** and only replaced by a newer successful fetch — a
-  failure keeps serving the cache (`stale` once > 2 h). Startup skips the fetch while the
-  cache is from the current issue window. Failures back off 5 → 15 → 30 → 60 min (≥ `Retry-After`);
+  failure keeps serving the cache (`stale` once > 2 h). Every 200 is judged against the
+  cache (`_judge`): issue order (`made_at`) is enforced whatever the cache's coverage —
+  an **older** issue is *degraded*; the **same** issue is *unchanged* unless it strictly
+  extends coverage (forecast or settled); a newer issue without forecast still ahead is
+  *degraded* while the cache is usable. *Degraded* keeps the cache, sets `fetch_error`,
+  starts the failure clock and waits for the **next issue**, not the retry ladder (the
+  same issue would come back — no extra requests). *Unchanged* keeps the cache, mapping
+  and failure bookkeeping, only moving `fetched_at` + the next-issue deadline. Startup
+  skips the fetch while the cache is from the current issue window. A known-only series
+  stays in use while its settled spot reaches past the slot start. Failures back off
+  5 → 15 → 30 → 60 min (≥ `Retry-After`); the whole fetch state (`next_fetch`,
+  `failures`, `failing_since`, `last_error`) persists, so a reload keeps a backoff (a
+  restored deadline > 7 days out is treated as corruption, not a multi-day
+  `Retry-After`).
   6 h of consecutive failures raises repair issue `wattcast_unreachable_<sid>`,
-  deleted on the next success. The button forces a fetch only if the cache is ≥ 15 min old *and* no failure
-  backoff is in force. The Store is flushed on unload so a reload reads the fresh cache.
+  deleted on the next success, when Wattcast is turned off, and by a setup-time sweep
+  once its subentry is gone (`async_delete_stale_wattcast_issues`). The button forces a
+  fetch only if the cache is ≥ 15 min old *and* no failure backoff or degraded
+  deadline is in force (`failures == 0` and no `last_error`). The
+  Store is flushed on unload — under the lock, then closed to further saves, so a
+  fetch still awaiting HTTP can't overwrite the reloaded cache — so a reload reads the fresh cache. The tick also rebuilds
+  (no fetch) once the first published slot is over or at local midnight, so an outage
+  ages expired slots out instead of publishing them as `ok`.
+- **Config fingerprint:** each subentry's state is stamped with the config it was
+  learned under (`zone`, `price_entity`, `price_series_entity`, captured at load — not
+  at the unload flush, which already sees the new config). On a mismatch at load the
+  dependent state is dropped: any key → pairs + mapping; zone/price entity → the
+  scored log; zone → the Wattcast cache + fetch state (fetch now); price entity → the
+  local model + shape. A payload without a fingerprint is adopted, not wiped.
 - **Spot → retail mapping** (`fit_retail_mapping`): `buy = a⁺·max(s,0)/1000 +
   a⁻·min(s,0)/1000 + b[daytype(wd/sat/sun), local hour]`, hierarchically shrunk, on a
   14-day buffer of (settled spot, real buy) pairs from the optional
   `price_series_entity` (Nord Pool-shaped slot lists), else the buy-price sensor's
   current value. Refit on every successful fetch *and* on every build/reload (from the
-  cached settled spot), so a reconfigure takes effect immediately. Validated 2026-09-24 on the author's contract: recovers ×1.255 VAT +
+  cached settled spot), so a reconfigure takes effect immediately. A level whose
+  groups hold one pair each (day 1 of an hourly series) can't separate noise from
+  signal, so it is shrunk with the full `SHRINK_LAMBDA` (not treated as noise-free). Validated 2026-09-24 on the author's contract: recovers ×1.255 VAT +
   4.70 c night (22–07) / 6.77 c day (07–22) with ~1e-6 residual from 2 days of pairs.
 - **Local fallback:** features `[temp, wind, cold_hinge, wind×cold_hinge]`,
   `cold_hinge = max(0,−temp)`; wind in **GW** (sensor series GW, state/LTS MW —
   normalise). Fit daily on LTS; seed formula until enough history. Daily price ×
   learned intraday shape (per daytype × hour offsets from 28 days of hourly LTS).
-  Days past the wind feed use climatological wind (`days[].wind_src`).
+  Days past the wind feed use climatological wind (`days[].wind_src`). Temperatures are
+  °C throughout: the weather forecast is converted from the entity's
+  `temperature_unit`, and LTS is requested with `units={"temperature": "°C"}`. Recorder
+  errors in `forecast_source` are caught (→ `{}`/`[]`/None), never abort a build.
 - **Scoring:** each rebuild upserts, per still-forecast day (≥ 20 forecast hours),
   per-hour vectors for `wattcast`, `wattcast_raw` (`p50Raw`, i.e. without their LLM
   adjustments) and `local` → the log keeps the *last pre-publication* forecast. The
-  capture job scores them vs hourly LTS (`scores`, `daily_err`). `select_primary` picks
+  capture job scores them vs hourly LTS (`scores`, `daily_err`) — only once the day's
+  **next local midnight** has passed (a 25-h DST day isn't final at bucket + 24 h) and
+  ≥ `EVAL_MIN_ACTUAL_HOURS` (20) realised hours exist; a day with no hourly LTS falls
+  back to that exact day's daily mean (LTS `start` is epoch **seconds**; never a
+  neighbouring day). Still unscorable `EVAL_GIVE_UP_DAYS` (7) after it ended → marked
+  `unscorable` and skipped, so nights don't re-query it forever. `select_primary` picks
   the lowest trailing-14-day hourly MAE once each source has ≥ 7 scored days, else
   Wattcast. Wattcast's own published live MAE (FI, 2026-09): ~29 €/MWh D+1 → ~41 D+6.
 - Big attributes are `_unrecorded_attributes` (≫ the recorder's 16 KB cap).
@@ -154,12 +193,27 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 - **Seeds** (cold start, day 1): `E_base = 3.0` kWh, `E_draw_per_person = 2.2`,
   `guest_bonus = 2.5`, `gain = 1.0`, `empty_house_factor = 0.4`.
 - **Online gain**: `r = clamp(actual/predicted, 0.5, 2.0)`,
-  `gain = clamp((1−β)·gain + β·r, 0.7, 1.5)`, `β = 0.15` (~6-day half-life). The
-  clamps are the anti-drift guardrail — the gain corrects ±50% but can't run away.
+  `target = g_pred · r`, `gain = clamp((1−β)·gain + β·target, 0.7, 1.5)`,
+  `β = 0.15` (~6-day half-life). `g_pred` is the gain the prediction was made
+  with (the row's `gain`; the current gain for legacy rows): `predicted_kwh`
+  already includes it, so EWMA-ing the raw `r` has the fixed point `g = true/g`
+  (→ √true). The clamps are the anti-drift guardrail — the gain corrects ±50%
+  but can't run away. A closed-loop test pins convergence to the true ratio.
 - **Prior→empirical blend**: `θ = (n_prior·θ_prior + n·θ_emp)/(n_prior+n)`,
-  `n_prior = 10`. Structural refit needs ≥1 zero-person and ≥1 multi-person day.
+  `n_prior = 10`. The structural refit (`refit_occupancy_params`) must invert
+  `predict_kwh`'s own equation: `y = kwh/row_gain − guest_bonus·guests`, and
+  `÷ empty_house_factor` for `p == 0` rows, then OLS `y ~ p` — fitting raw
+  actuals biased `E_base`/`E_draw` and made the gain double-apply. Rows must be
+  `data_quality` **and** `clean_cycle` (missing key = legacy = clean); the
+  target is `demand_kwh` when the row has one. Needs ≥ `MIN_REFIT_SAMPLES` rows
+  incl. ≥1 zero-person **and** ≥1 multi-person (`p ≥ 2`) day, else `None`.
 - **Safety floor** (`min_minutes`, default 40 ≈ 2 kWh) always wins: even a
-  "nobody home" prediction keeps standby + one shower's worth.
+  "nobody home" prediction keeps standby + one shower's worth. The one
+  exception is a degenerate band with no 15-min step inside `[min, max]`
+  (e.g. min = max = 40): `clamp_minutes` then returns the floor-rounded
+  **max** (never above `max_minutes`, never < 0). The config flow now rejects
+  such bands — and a heating detector without the controlled switch (the
+  tank could never anchor) — so only legacy entries hit this.
 - **Data-quality gate**: ignore days with delivered energy ≤ 0.2 or > 18 kWh
   (meter resets/outliers) when calibrating.
 - **Deficit carryover** (opt-in via a load's `controlled_switch_entity`): a
@@ -177,6 +231,73 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   *and* the switch ran ≈ the full ask — `CLEAN_CYCLE_TOL_MINUTES`), so a skip/defer
   no longer drags it down. No switch / no recorder → backlog stays 0 = the plain
   daily predictor.
+- **Cycles are daily.** Only the first predict of a local day closes/opens a
+  cycle. A same-day re-predict (the "Predict now" button, the tank's
+  low-charge boost) *re-plans*: no `close_cycle`, keeps `cycle_start_iso` and
+  `deficit_minutes`, recomputes `pending_owed` via `open_cycle(need, deficit)`
+  and pushes. (Closing a few-hours-old cycle found little on-time and rolled
+  ~the whole ask into backlog on top of a fresh need.)
+- **Capture window** = `statistics_source.capture_window(now)`, read with
+  `statistic_during_period` (blends 5-min short-term stats) — a calendar-day
+  read at 23:55 never counted 23:00–24:00. `end = floor₅ₘᵢₙ(utcnow − 1 min)`
+  (23:55:00 → 23:50: the last bucket is compiled ~10 s *after* its period, and
+  the API silently returns what exists; flooring also drops seconds/µs);
+  `start` = the same local wall-clock time on the previous day, so daily
+  captures **tile exactly** — including DST days, where that is 23/25 elapsed
+  hours (a fixed 24 h would leave a 1-hour hole/overlap). Endpoints are UTC.
+  Commanded on-time for the clean gate uses the same window; the row stays
+  keyed by today's date and records `capture_window_start`/`_end`.
+- **Energy-balance demand** (tank-tracked + calibrated loads): each capture
+  snapshots the control ledger `tank.deficit_kwh` onto the row as
+  `tank_deficit_end_kwh` + `tank_deficit_end_at` (when sampled). When the
+  previous date's row has one too **and** its timestamp is within
+  `ENERGY_BALANCE_TOL` (15 min) of this window's start (and this snapshot of
+  its end) — a same-date row alone doesn't prove the spans meet —
+  `demand_kwh = max(0, actual + end_today − end_prev)` (energy in − ΔSoC over the
+  same 24 h; pure `energy_balance_demand`) is stored and is what the gain, eval
+  errors and refit learn from, with the row counted **clean** — the backlog is
+  accounted for, so the heavy-draw refill days (~40 % on a calibrated tank)
+  stop being thrown away and biasing the gain low. `is_valid_delivery` still
+  gates on the raw actual. Without both snapshots the clean-cycle gate above
+  applies unchanged. **A captured row is immutable**: a re-predict after the
+  capture on the same date still pushes and publishes, but leaves the row
+  (gain, features, prediction) alone — the observation was judged against it,
+  and a refit divides it by the row's gain.
+- **Tank deficit only when tracked**: the tank override (predict, the live
+  result, the balance snapshot) applies only when
+  `LoadConfig.tank_tracking_enabled` (the tracker's own predicate —
+  `heating_active_entity` set); clearing the detector no longer leaves a
+  restored calibrated state overriding the backlog forever.
+- **Published runtime = what was pushed.** A predict caches a
+  `PublishedTarget` (pushed minutes, kWh, deficit, `explain_load` rationale from
+  the same features/deficit — so `target_minutes` equals the pushed value) only
+  when the push **succeeded** (or the load is publish-only); a failed push keeps
+  the previous value (`last_push_ok` shows the failure). It is persisted as a
+  `"published"` key in the per-subentry Store payload (with target entity +
+  date; additive, `STORAGE_VERSION` stays 1) and restored only while the load
+  still targets the same entity. `_build_results` serves it (metrics always
+  fresh) and builds a live snapshot only for a load with no cache. So a
+  capture's gain step, a restart or an unrelated reload can't show a target
+  the scheduler never got, and a predict doesn't query history/calendar/stats
+  twice.
+- **Coordinator contract**: `async_predict_and_push` returns True iff every
+  attempted push succeeded (vacuously True for publish-only loads; a load that
+  raised counts as failed). Predict and capture share one `asyncio.Lock`
+  (read-state → await → write-back would otherwise drop a concurrent capture's
+  gain step); the trailing refresh runs outside it. Per-load work is isolated
+  (logged, others proceed, persist still runs); a failing `_build_results` load
+  keeps its previous result instead of failing the coordinator.
+- **Unload**: the tank tick is stopped and in-flight boost tasks are drained
+  (`tank.async_drain()`, bounded — a boost finishing after the flush would lose
+  its cooldown and re-fire on reload), the forecast tick is stopped, then
+  `async_flush` takes the lock
+  (draining an in-flight predict/capture), sets `_closing` — after which
+  predict/capture/`async_persist` on this coordinator are no-ops, so no
+  delayed write lands behind the reloaded one — and saves the final snapshot
+  (`Store.async_save` cancels any pending delayed write). Flush errors are
+  logged, never abort the unload; if the platform unload fails,
+  `async_reopen()` + `tank.async_start()` (and the forecast's
+  `async_reopen()` + `async_start()`) resume writes and the ticks.
 
 ## The tank model (read before touching `tank_model.py` / `tank_tracker.py`)
 
@@ -187,10 +308,60 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   user's 7–8 h full-heat observation validates 300 L × ΔT63 ≈ 22 kWh at 3 kW).
 - **Inputs are cumulative counters** (energy kWh, water litres) — deltas are
   lossless across restarts/downtime; negative deltas mean resets → re-baseline,
-  never negative energy. Water litres pass a rate-based misread guard
-  (`MAX_PLAUSIBLE_FLOW_LPM` over the span since baseline) and a **hot-flow cap**
-  (`MAX_HOT_FLOW_LPM`, taps/showers only — garden/appliance cold draws beyond it
-  are attributed cold) before `hot_fraction` applies.
+  never negative energy. The tracker converts each counter from its
+  `unit_of_measurement` with HA's `EnergyConverter`/`VolumeConverter` (Wh, MWh,
+  m³, gal, ft³, mL, … — plus legacy `liters`-style spellings); a missing or
+  unsupported unit reads as **unavailable** (warned once), never guessed. Water
+  litres pass a rate-based misread guard (`MAX_PLAUSIBLE_FLOW_LPM`) and a
+  **hot-flow cap** (`MAX_HOT_FLOW_LPM`, taps/showers only — garden/appliance
+  cold draws beyond it are attributed cold) before `hot_fraction` applies.
+- **Rate spans + slow meters**: both water guards rate a delta over the time
+  since the last *read* (a dropout/restart gap counts in full), stretched back
+  over the meter's own change-to-change interval (its `last_changed`, passed as
+  `TickInputs.water_changed_iso`) only as far as the meter's learned publish
+  cadence `water_cadence_min`, capped at `WATER_RATE_WINDOW_MIN` (15 min). The
+  cadence starts at one tick (0 = unknown) and is **raised only on evidence of
+  batching**: a step impossible over the current span (> `MAX_PLAUSIBLE_FLOW_LPM`
+  — no plumbing does that, so it's an OCR spike or a batch) yet plausible over
+  the meter's own change interval. That evidencing step is still rejected
+  (fallback, dirty) — it can't yet be told from a spike — and the next step
+  settles it. It is *lowered* by a valid step arriving faster than it. The
+  8 L/min hot-flow cap is deliberately not the trigger (a > 8 L/min tick is a
+  real hose/appliance, not batching). Rollbacks/resets (negative deltas),
+  adoptions, steps implausible even over their own interval, and ordinary valid
+  steps slower than the cadence (isolated small draws minutes apart) never raise
+  it. An unchanged re-report advances the read stamp but **not** the change
+  stamp. So a meter publishing a 50 L step every 10 min is rated at 5 L/min from
+  its second step on, while a responsive meter keeps one-tick caps. **Don't
+  stretch to the raw change interval, or creep the cadence on slow intervals**:
+  on the replayed week (a fast meter) stretching over-attributed ~0.5 kWh/week of
+  evening flow and worsened the trip residuals (rms 1.17 → 1.24);
+  `test_tank_replay` asserts the fixture's cadence stays ≤ 1 min on *every* tick
+  (it stays 0 — the replay is identical to the pre-cadence model). The first
+  water reading (no baseline) is adopted with zero draw, source `none`, cycle
+  still clean — not treated as a misread.
+- **Counter gaps across an anchor**: a counter that is unavailable *on* the
+  anchor tick has an unknown delta straddling the trip, so that cycle doesn't
+  learn, its baseline (if any) is dropped (the returning reading is adopted with
+  no delta — otherwise pre-anchor kWh/litres are credited again to the new
+  cycle), the new cycle opens dirty, and `pending_fallback_kwh` is always
+  cleared at an anchor (it belongs to the closed ledger). This is **regardless
+  of whether a baseline exists**: an outage spanning several anchors has none by
+  the second, and that cycle must still open dirty or a later long cycle learns
+  from draws + standby with zero delivered energy. Cycles stay dirty until an
+  anchor sees the counter back. With no counter configured nothing learns
+  (that balance is missing a side anyway).
+- **Counter source changes**: `TankState.energy_source`/`water_source` record
+  the entity each baseline came from; `rebind_sources` (called by the tracker
+  before each tick) drops the baseline of a counter whose configured entity
+  changed and dirties the cycle, so e.g. a powercalc `_2` re-add reading higher
+  can't dump its whole difference into one tick. An empty stored source (state
+  saved before this existed) is adopted without re-baselining. There is
+  deliberately **no "implausibly fast" energy-delta guard**: after a restart a
+  stale intermediate reading followed by the authoritative one looks exactly
+  like a jump, and it would silently discard delivered energy — the failure the
+  replay exists to catch. Entity swaps are `rebind_sources`' job, units the
+  tracker's.
 - **Three ledgers, three jobs** (v0.9.0 — a real-week replay showed the old
   single clamped `deficit_kwh` was discarding information, not adding safety):
   - `deficit_kwh` — clamped to `[0, E_cap]`, drives *control* (the
@@ -262,7 +433,12 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   SoC→prediction feedback actually uses), `uncertainty_kwh` (σ),
   `hysteresis_kwh`, `hot_fraction_profile`, `latched`, plus the pre-existing
   `capacity_kwh`, `hot_fraction`, `standby_w`, `calibrated`, `last_full`,
-  `draw_source`, `liters_40c`, `showers_left`.
+  `draw_source`, `liters_40c`, `showers_left`. The per-tick-volatile ones
+  (`deficit_kwh`, `deficit_raw_kwh`, `uncertainty_kwh`, `latched`,
+  `draw_source`, `liters_40c`, `showers_left`) are `_unrecorded_attributes` —
+  otherwise the recorder writes a new attributes row every minute; nothing
+  reads their history (the card reads them live, the replay only the state).
+  The slow learned params stay recorded.
 - **SoC → prediction feedback**, gated on `calibrated`, still reads the raw
   **control ledger** (`deficit_raw_kwh`/`state.deficit_kwh`), never the
   saturated display value — the curve is for the human-facing %, not for what
@@ -271,14 +447,27 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   commanded-minutes `close_cycle` backlog (which still runs as the fallback;
   the training row records `deficit_source`), and the tracker's low-charge
   boost (`tank_boost_soc_pct`) re-runs `async_predict_and_push` — hysteresis +
-  ≥ 6 h rate limit live in `should_boost`. Over-ask is physically safe: the
-  tank thermostat trips and the element idles.
+  ≥ 6 h rate limit live in `should_boost` (the re-arm level is
+  `min(threshold + 15, 100)`, so a high threshold still re-arms at an anchor,
+  where the control ledger reads exactly 100). The push runs as its own entry
+  task (`_async_boost` — predict/recorder/scheduler can outlast a 60 s tick);
+  while it's in flight that load's boost isn't re-evaluated, so no duplicate
+  predict queues behind the coordinator lock. Only on success
+  (`async_predict_and_push` returns a bool; `None` counts as success, a raise
+  as failure) are the **boost fields alone** (disarm + `last_boost_iso`)
+  applied — onto the *latest* tank state, never a snapshot from before the
+  await (that would undo intervening anchors/learning/counter moves). A failed
+  push keeps the trigger armed and retries no sooner than 15 min after it
+  *completed* (`BOOST_RETRY_INTERVAL`, in-memory). Over-ask is physically
+  safe: the tank thermostat trips and the element idles.
 - Persistence: a `"tank"` key inside the load's existing per-subentry Store dict
   (`tank_to_dict`/`tank_from_dict`, defaults-tolerant, `STORAGE_VERSION` still
   1) — the v2 fields (`hot_fraction_profile`, `hysteresis_kwh`,
   `residual_ratio`, `cycle_unclamped_kwh`, `cycle_relax_kwh`,
-  `led_kwh_since_counter`, …) all default so a pre-v2 payload loads as a flat
-  profile with no learning history. `TankState` lives in
+  `led_kwh_since_counter`, `water_changed_iso`,
+  `water_cadence_min`, `energy_source`/`water_source`, …) all default so a
+  pre-v2 payload loads as a flat profile with no learning history (and the
+  counter timing/sources as "unknown" = the old behaviour). `TankState` lives in
   `LoadNeedPredictorCoordinator.tanks` because `_runtime_snapshot` rebuilds the
   whole dict on every save — state owned elsewhere would be dropped. Saves:
   immediately on anchor/learn/boost, else every ~15 ticks (the cumulative

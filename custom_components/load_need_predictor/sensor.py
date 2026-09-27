@@ -179,7 +179,7 @@ async def async_setup_entry(
             ]
             # The tank charge sensor is opt-in: only for loads with a heating
             # detector configured (i.e. tank tracking enabled).
-            tank_enabled = load_config_from_data(subentry.data).heating_active_entity
+            tank_enabled = load_config_from_data(subentry.data).tank_tracking_enabled
             if runtime.tank is not None and tank_enabled:
                 entities.append(TankSocSensor(runtime.tank, subentry_id, subentry))
             async_add_entities(entities, config_subentry_id=subentry_id)
@@ -238,6 +238,21 @@ class TankSocSensor(TankEntity, SensorEntity):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:water-percent"
     _attr_suggested_display_precision = 0
+    # The per-tick diagnostics change almost every minute, so recording them made
+    # the recorder write a fresh attributes row per tick. Nothing reads their
+    # history (the card reads them live; the replay tool uses only the state), so
+    # keep them out; the slow-moving learned params stay recorded.
+    _unrecorded_attributes = frozenset(
+        {
+            "deficit_kwh",
+            "deficit_raw_kwh",
+            "uncertainty_kwh",
+            "latched",
+            "draw_source",
+            "liters_40c",
+            "showers_left",
+        }
+    )
 
     def __init__(self, coordinator, subentry_id, subentry) -> None:
         super().__init__(coordinator, subentry_id, subentry, "tank_soc")

@@ -324,6 +324,9 @@ def replay(
     max_plateau_run = 0
     plateau_key: tuple[float, ...] | None = None
     last_trip: datetime | None = None
+    # The slow-meter rate window must never loosen a responsive meter's caps, at
+    # any point in the run (not just by the end of it).
+    max_water_cadence = 0.0
 
     now = start
     while now <= end:
@@ -331,7 +334,8 @@ def replay(
         heating_on, heating_held = _as_tristate(*cursors[HEATING].at(now), now)
         contactor_on, contactor_held = _as_tristate(*cursors[CONTACTOR].at(now), now)
         energy = _as_float(cursors[ENERGY].at(now)[0])
-        water = _as_float(cursors[WATER].at(now)[0])
+        water_state, water_changed_at = cursors[WATER].at(now)
+        water = _as_float(water_state)
         live = _as_float(cursors[LIVE_SOC].at(now)[0])
 
         inputs = tank.TickInputs(
@@ -350,6 +354,13 @@ def replay(
             e_draw_per_person=E_DRAW_PER_PERSON,
             empty_house_factor=EMPTY_HOUSE_FACTOR,
             rated_power_kw=RATED_POWER_KW,
+            # The meter's own ``last_changed``, as the tracker passes it — rates
+            # are taken over the meter's change-to-change interval.
+            water_changed_iso=(
+                water_changed_at.isoformat()
+                if water is not None and water_changed_at is not None
+                else None
+            ),
         )
         before = state
         result = tank.apply_tick(state, params, inputs)
@@ -364,6 +375,7 @@ def replay(
                 residual_ratio=tank.SEED_RESIDUAL_RATIO,
             )
         soc_pct = result.soc * 100.0
+        max_water_cadence = max(max_water_cadence, result.state.water_cadence_min)
         ticks += 1
         if heating_on:
             heating_minutes += 1
@@ -457,6 +469,7 @@ def replay(
         "heating_ticks": len(heating_socs),
         "max_plateau_run": max_plateau_run,
         "live_mean_abs_diff": (sum(live_diffs) / len(live_diffs) if live_diffs else None),
+        "max_water_cadence_min": max_water_cadence,
         "final_state": state,
     }
 

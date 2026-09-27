@@ -102,6 +102,30 @@ def test_tank_from_dict_pre_v2_payload_defaults():
     assert state.led_kwh_since_counter == 0.0
 
 
+def test_tank_counter_timing_and_sources_round_trip():
+    # The step stamps / cadence floor / source entity ids survive a save+load.
+    state = TankState(
+        deficit_kwh=5.5,
+        water_changed_iso="2026-07-16T10:00:00+00:00",
+        water_cadence_min=9.5,
+        energy_source="sensor.lvv_energy",
+        water_source="sensor.water",
+    )
+    assert tank_from_dict(tank_to_dict(state)) == state
+
+
+def test_tank_from_dict_without_counter_timing_keys_defaults_to_unknown():
+    # A payload saved before these fields existed loads them as "unknown" — which
+    # the tracker treats as "adopt the configured entity" (no re-baseline) and the
+    # model as "one-tick spans" (the old behaviour).
+    state = tank_from_dict({"deficit_kwh": 3.0, "energy_baseline_kwh": 100.0})
+    assert state.energy_source == ""
+    assert state.water_source == ""
+    assert state.water_changed_iso == ""
+    assert state.water_cadence_min == 0.0
+    assert state.energy_baseline_kwh == 100.0
+
+
 def test_tank_from_dict_none_and_defaults():
     # Missing/empty → None (nothing stored); a partial payload keeps the rest at
     # its dataclass default, and the nullable baselines stay None.

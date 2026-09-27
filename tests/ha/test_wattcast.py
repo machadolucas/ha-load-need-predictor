@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import pathlib
@@ -143,7 +144,7 @@ def _nordpool_attrs() -> dict:
     return {"data_today": _slot_items(_KNOWN_START, [_spot(i) for i in range(_KNOWN_Q)])}
 
 
-def _local_inputs(hass: HomeAssistant) -> None:
+def _local_inputs(hass: HomeAssistant, temp_days: int = 12) -> None:
     """Weather + wind so the local fallback covers ~12 days from today."""
     today_utc = dt_util.as_utc(dt_util.start_of_local_day())
     data = [[int((today_utc + timedelta(hours=h)).timestamp() * 1000), 2.0] for h in range(24 * 12)]
@@ -158,7 +159,7 @@ def _local_inputs(hass: HomeAssistant) -> None:
                         "temperature": 5 + d,
                         "templow": 5 + d,
                     }
-                    for d in range(12)
+                    for d in range(temp_days)
                 ]
             }
         }
@@ -183,6 +184,7 @@ async def _setup(
     freezer,
     *,
     local: bool = False,
+    temp_days: int = 12,
     series_entity: bool = True,
     **data,
 ):
@@ -194,7 +196,7 @@ async def _setup(
     if series_entity:
         sub["price_series_entity"] = "sensor.nordpool"
     if local:
-        _local_inputs(hass)
+        _local_inputs(hass, temp_days)
         sub.update(_LOCAL)
     sub.update(data)
     entry = MockConfigEntry(
@@ -422,8 +424,8 @@ async def test_success_publishes_15min_wattcast_slots(hass: HomeAssistant, freez
 async def test_start_is_now_without_real_prices(hass: HomeAssistant, freezer, wattcast):
     # Nothing marks where real prices end → the start is just "now" floored.
     entry, fc, sid = await _setup(hass, freezer, series_entity=False, forecast_days=1)
-    wattcast.return_value = WattcastFetch(
-        parse_wattcast({**_payload(), "known": []})  # no settled spot at all
+    wattcast.return_value = WattcastFetch(  # a newer issue with no settled spot at all
+        parse_wattcast({**_payload(made_at=_NOW), "known": []})
     )
     freezer.tick(timedelta(minutes=20))  # past the button's 15-min refetch guard
     await fc.async_build_forecast(only=sid, fetch=True)
@@ -447,12 +449,22 @@ async def test_real_prices_in_the_past_do_not_pin_start(hass: HomeAssistant, fre
     freezer.tick(timedelta(minutes=5))
     await fc.async_tick()  # real end moved (backwards) → rebuild
     assert fc.known_until[sid] == _KNOWN_START + 8 * _Q
-    # 08:47Z floored → 08:45Z = 11:45 local; the local model fills today until
-    # Wattcast's forecast takes over at 01:00 tomorrow.
-    assert fc.slots[sid][0]["start"] == "2026-09-24T11:45:00+03:00"
-    assert fc.slots[sid][0]["src"] == "local"
-    first_wc = next(s for s in fc.slots[sid] if s["src"] == "wattcast")
+    # 08:47Z floored → 08:45Z = 11:45 local. The series entity lags, but
+    # Wattcast's cached *settled* spot covers today until 01:00 tomorrow, so
+    # those slots are priced from it (not the local fallback), then the
+    # forecast takes over.
+    slots = fc.slots[sid]
+    assert slots[0]["start"] == "2026-09-24T11:45:00+03:00"
+    idx = int((_NOW.replace(minute=45) - _KNOWN_START) // _Q)
+    assert slots[0]["src"] == "wattcast_known"
+    assert slots[0]["buy"] == slots[0]["p10"] == slots[0]["p90"]
+    assert slots[0]["buy"] == round(fc.mapping[sid].apply(_spot(idx), dt_util.as_local(_NOW)), 5)
+    assert {s["src"] for s in slots if dt_util.parse_datetime(s["start"]) < _FC_START} == {
+        "wattcast_known"
+    }
+    first_wc = next(s for s in slots if s["src"] == "wattcast")
     assert first_wc["start"] == _local_iso(_FC_START)
+    assert "local" not in {s["src"] for s in slots[:60]}
 
 
 async def test_mapping_learned_from_series_pairs(hass: HomeAssistant, freezer, wattcast):
@@ -492,6 +504,10 @@ async def test_mapping_seed_with_few_fixture_pairs(hass: HomeAssistant, freezer,
     entry, fc, sid = await _setup(hass, freezer)
     hass.states.async_set("sensor.nordpool", "0.1", {"data_today": items})
     fc.pairs[sid] = []
+    # A newer issue (the same one again would be "unchanged": no refit).
+    wattcast.return_value = WattcastFetch(
+        dataclasses.replace(series, made_at=series.made_at + timedelta(hours=1))
+    )
     fc.fetch[sid].next_fetch = _NOW  # force a fetch → pairs + refit
     await fc.async_tick()
     mapping = fc.mapping[sid]
@@ -1118,3 +1134,354 @@ async def test_reconfigure_refits_mapping_from_cache_without_fetch(
     assert wattcast.await_count == calls  # cache is from the current issue → no request
     assert new.mapping[sid].n == _KNOWN_Q
     assert new.mapping[sid].slope_pos == pytest.approx(_SLOPE, abs=5e-3)
+
+
+# ── audit regressions ────────────────────────────────────────────────────────
+
+
+async def test_zone_change_discards_the_old_zones_state(hass: HomeAssistant, freezer, wattcast):
+    # FI → EE must not restore FI's cached prices / pairs / scores, and must
+    # fetch EE straight away even though the FI cache is from this issue.
+    entry, fc, sid = await _setup(hass, freezer)
+    fc.log[sid].insert(0, _past_entry(dt_util.start_of_local_day() - timedelta(days=3)))
+    fc.eval_errors[sid] = [0.01]
+    await fc.async_flush()
+    calls = wattcast.await_count
+    ee_made = _NOW - timedelta(minutes=5)
+    wattcast.return_value = _ok(made_at=ee_made)
+    subentry = entry.subentries[sid]
+    hass.config_entries.async_update_subentry(
+        entry, subentry, data={**subentry.data, "wattcast_zone": "EE"}
+    )
+    await hass.async_block_till_done()
+    new = entry.runtime_data.forecast
+    assert wattcast.await_count == calls + 1
+    assert wattcast.await_args.args[1] == "EE"
+    assert new.wattcast[sid].made_at == ee_made
+    assert new.eval_errors[sid] == []
+    assert all(e.get("predicted") is not None for e in new.log[sid])  # old rows gone
+    assert new._runtime_snapshot()[sid]["fingerprint"]["zone"] == "EE"
+
+
+async def test_unchanged_or_legacy_fingerprint_keeps_state(hass: HomeAssistant, freezer, wattcast):
+    entry, fc, sid = await _setup(hass, freezer)
+    snapshot = fc._runtime_snapshot()
+    del snapshot[sid]["fingerprint"]  # a pre-fingerprint payload: adopt, don't wipe
+    await fc._store.async_save_now(snapshot)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    new = entry.runtime_data.forecast
+    assert wattcast.await_count == 1
+    assert new.pairs[sid] == fc.pairs[sid]
+    assert new.wattcast[sid].to_dict() == fc.wattcast[sid].to_dict()
+
+
+@pytest.mark.parametrize(
+    ("degraded", "error"),
+    [
+        (lambda: _ok(forecast_quarters=0, made_at=_NOW), "response without forecast"),
+        (lambda: _ok(made_at=_NOW - timedelta(hours=3)), "response older than the cached forecast"),
+    ],
+)
+async def test_degraded_200_keeps_cache_without_extra_requests(
+    hass: HomeAssistant, freezer, wattcast, degraded, error
+):
+    entry, fc, sid = await _setup(hass, freezer)
+    cached = fc.wattcast[sid]
+    wattcast.return_value = degraded()
+    freezer.move_to(fc.fetch[sid].next_fetch)
+    now = dt_util.utcnow()
+    await fc.async_tick()
+    assert wattcast.await_count == 2
+    assert fc.wattcast[sid] is cached  # a usable cache is never downgraded
+    assert fc.fetched_at[sid] == _NOW
+    state = fc.fetch[sid]
+    assert state.last_error == error
+    assert state.failing_since == now
+    # No retry ladder: the same (old/empty) issue would come back until the
+    # next re-issue, so the next request waits for it — as after a success.
+    assert state.next_fetch == _next_issue_fetch(now)
+    assert fc.data[sid].fetch_error == error
+    # The next good (newer) issue clears it.
+    wattcast.return_value = _ok(made_at=state.next_fetch - timedelta(minutes=7))
+    freezer.move_to(state.next_fetch)
+    await fc.async_tick()
+    assert state.last_error is None and state.failing_since is None
+    assert fc.wattcast[sid] is not cached
+
+
+async def test_reload_keeps_failure_backoff(hass: HomeAssistant, freezer, wattcast):
+    # A 429 with a 1 h Retry-After, then a reload: no request before it expires,
+    # and the button still sees the failure.
+    wattcast.return_value = WattcastFetch(None, "rate limited (HTTP 429)", 3600)
+    entry, fc, sid = await _setup(hass, freezer)
+    assert wattcast.await_count == 1
+    until = fc.fetch[sid].next_fetch
+    assert until == _NOW + timedelta(hours=1)
+    await fc.async_flush()
+    freezer.tick(timedelta(minutes=10))
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    new = entry.runtime_data.forecast
+    assert wattcast.await_count == 1
+    assert new.fetch[sid].next_fetch == until
+    assert new.fetch[sid].failures == 1
+    await new.async_build_forecast(only=sid, fetch=True)
+    assert wattcast.await_count == 1  # the button respects the restored backoff
+    freezer.move_to(until)
+    await new.async_tick()
+    assert wattcast.await_count == 2
+
+
+async def test_local_primary_keeps_wattcast_beyond_local_reach(
+    hass: HomeAssistant, freezer, wattcast
+):
+    # Local scores best but has temperatures for today + tomorrow only: the
+    # days beyond come from Wattcast instead of vanishing.
+    entry, fc, sid = await _setup(hass, freezer, local=True, temp_days=2)
+    start = dt_util.start_of_local_day()
+    fc.log[sid] = [
+        _past_entry(
+            start - timedelta(days=d),
+            predicted=0.1,
+            actual=0.1,
+            scores={"wattcast": 0.05, "wattcast_raw": 0.05, "local": 0.01},
+        )
+        for d in range(9, 1, -1)
+    ] + fc.log[sid]
+    await fc.async_tick(force_rebuild=True)
+    assert fc.primary[sid] == "local"
+    days = {d["date"]: d["src"] for d in fc.data[sid].days}
+    assert days["2026-09-25"] == "local"
+    assert {days[d] for d in days if d > "2026-09-25"} == {"wattcast"}
+    assert fc.slots[sid][-1]["end"] == "2026-10-02T00:00:00+03:00"
+    for prev, cur in zip(fc.slots[sid], fc.slots[sid][1:], strict=False):
+        assert prev["end"] == cur["start"]
+
+
+async def test_outage_ages_expired_slots_out(hass: HomeAssistant, freezer, wattcast):
+    # Fetches failing and the real-price boundary unchanged: the published
+    # series must still drop slots that are over, once per slot boundary.
+    entry, fc, sid = await _setup(hass, freezer)
+    wattcast.return_value = _FAIL
+    freezer.move_to(_FC_START + timedelta(minutes=20))
+    await fc.async_tick()
+    assert fc.known_until[sid] == _FC_START  # the boundary didn't move
+    assert fc.slots[sid][0]["start"] == _local_iso(_FC_START + _Q)
+    with patch.object(fc, "_rebuild", wraps=fc._rebuild) as rebuild:
+        freezer.tick(timedelta(minutes=5))  # 22:25Z: the 22:15 slot isn't over
+        await fc.async_tick()
+        assert rebuild.call_count == 0
+        freezer.tick(timedelta(minutes=5))  # 22:30Z: now it is
+        await fc.async_tick()
+        assert rebuild.call_count == 1
+    assert fc.slots[sid][0]["start"] == _local_iso(_FC_START + 2 * _Q)
+
+
+async def test_settled_spot_slots_are_not_snapshotted(hass: HomeAssistant, freezer, wattcast):
+    # The series entity lags at 03:00 local; the cached settled spot prices the
+    # rest of today. Those near-truth slots must not become today's
+    # "forecast" snapshot (it would flatter Wattcast's score).
+    entry, fc, sid = await _setup(hass, freezer)
+    fc.log[sid] = []
+    freezer.move_to(_KNOWN_START + timedelta(hours=2))
+    hass.states.async_set(
+        "sensor.nordpool",
+        "0.1",
+        {"data_today": _slot_items(_KNOWN_START, [_spot(i) for i in range(8)])},
+    )
+    await fc.async_tick(force_rebuild=True)
+    today = [s for s in fc.slots[sid] if s["start"].startswith("2026-09-24")]
+    assert len(today) == 84 and {s["src"] for s in today} == {"wattcast_known"}
+    assert "2026-09-24" not in {e["date"] for e in fc.log[sid]}
+
+
+async def test_evaluate_waits_for_the_25_hour_days_real_midnight(
+    hass: HomeAssistant, freezer, wattcast
+):
+    # 2026-10-25 (EEST → EET) has 25 hours: bucket + 24 h is 23:00 local, so the
+    # 23:55 capture must not finalise it with its last hour missing.
+    entry, fc, sid = await _setup(hass, freezer)
+    day = dt_util.as_local(datetime(2026, 10, 24, 21, 0, tzinfo=UTC))
+    fc.log[sid] = [_past_entry(day, predicted=0.11, hourly={"wattcast": [0.11] * 24})]
+    rows = [
+        (dt_util.as_local(datetime(2026, 10, 24, 21, tzinfo=UTC) + timedelta(hours=h)), 0.11)
+        for h in range(24)
+    ]
+    mock = AsyncMock(return_value=rows)
+    freezer.move_to(datetime(2026, 10, 25, 21, 55, tzinfo=UTC))  # 23:55 EET
+    with patch(f"{_MOD}.async_hourly_price_rows", new=mock):
+        await fc.async_evaluate()
+    mock.assert_not_awaited()
+    assert fc.log[sid][0]["actual"] is None
+
+
+async def test_evaluate_partial_day_retries_then_gives_up(hass: HomeAssistant, freezer, wattcast):
+    entry, fc, sid = await _setup(hass, freezer)
+    day = dt_util.start_of_local_day() - timedelta(days=1)
+    fc.log[sid] = [
+        _past_entry(day, predicted=0.1, hourly={"wattcast": [0.1] * 24}, daily={"wattcast": 0.1})
+    ]
+    y_utc = dt_util.as_utc(day)
+    partial = [(dt_util.as_local(y_utc + timedelta(hours=h)), 0.2) for h in range(15)]
+    hourly = AsyncMock(return_value=partial)
+    daily = AsyncMock(return_value=0.2)
+    with (
+        patch(f"{_MOD}.async_hourly_price_rows", new=hourly),
+        patch(f"{_MOD}.async_daily_price_mean", new=daily),
+    ):
+        await fc.async_evaluate()
+        row = fc.log[sid][0]
+        assert row["actual"] is None and "scores" not in row  # 15 h: not final
+        assert not row.get("unscorable")
+        daily.assert_not_awaited()  # the daily mean of a partial day is just as partial
+
+        freezer.tick(timedelta(days=8))
+        await fc.async_evaluate()
+        assert row["unscorable"] is True
+        assert row["actual"] is None
+        calls = hourly.await_count
+        await fc.async_evaluate()
+        assert hourly.await_count == calls  # never re-queried
+
+
+async def test_stale_repair_issues_swept_on_setup(hass: HomeAssistant, freezer, wattcast):
+    from custom_components.load_need_predictor.forecast_coordinator import (
+        async_delete_stale_wattcast_issues,
+    )
+
+    def _issue(issue_id: str) -> None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="wattcast_unreachable",
+        )
+
+    _issue("wattcast_unreachable_removed_subentry")
+    entry, fc, sid = await _setup(hass, freezer)
+    registry = ir.async_get(hass)
+    assert registry.async_get_issue(DOMAIN, "wattcast_unreachable_removed_subentry") is None
+    live = f"wattcast_unreachable_{sid}"
+    _issue(live)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert registry.async_get_issue(DOMAIN, live) is not None  # still configured → kept
+    # Removing the hub: its async_remove_entry drops the hub's issues too.
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert registry.async_get_issue(DOMAIN, live) is None
+    _issue(live)
+    async_delete_stale_wattcast_issues(hass)  # hub gone → nothing keeps it
+    assert registry.async_get_issue(DOMAIN, live) is None
+
+
+async def test_button_respects_the_degraded_deadline(hass: HomeAssistant, freezer, wattcast):
+    # After a degraded 200 the next request waits for the next issue; pressing
+    # the button (cache ≥ 15 min old, failures == 0) must not re-fetch it.
+    entry, fc, sid = await _setup(hass, freezer)
+    wattcast.return_value = _ok(forecast_quarters=0, made_at=_NOW)
+    freezer.move_to(fc.fetch[sid].next_fetch)
+    await fc.async_tick()
+    assert fc.fetch[sid].last_error == "response without forecast"
+    assert fc.fetch[sid].failures == 0
+    calls, deadline = wattcast.await_count, fc.fetch[sid].next_fetch
+    for _ in range(3):
+        freezer.tick(timedelta(minutes=16))
+        await fc.async_build_forecast(only=sid, fetch=True)
+    assert wattcast.await_count == calls
+    assert fc.fetch[sid].next_fetch == deadline
+
+
+async def test_reload_keeps_a_multi_day_retry_after(hass: HomeAssistant, freezer, wattcast):
+    wattcast.return_value = WattcastFetch(None, "rate limited (HTTP 429)", 172_800)
+    entry, fc, sid = await _setup(hass, freezer)
+    until = fc.fetch[sid].next_fetch
+    assert until == _NOW + timedelta(days=2)
+    await fc.async_flush()
+    freezer.tick(timedelta(hours=1))
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    new = entry.runtime_data.forecast
+    assert wattcast.await_count == 1  # no cache, but the server said wait 2 days
+    assert new.fetch[sid].next_fetch == until
+
+
+async def test_issue_order_is_enforced_even_for_an_expired_cache(
+    hass: HomeAssistant, freezer, wattcast
+):
+    # The cached issue's forecast has run out; an *older* issue still must not
+    # replace it (nor reset the failure bookkeeping).
+    entry, fc, sid = await _setup(hass, freezer)
+    cached = fc.wattcast[sid]
+    freezer.move_to(cached.coverage_end + timedelta(minutes=40))
+    wattcast.return_value = _ok(made_at=_NOW - timedelta(hours=5))
+    fc.fetch[sid].next_fetch = dt_util.utcnow()
+    await fc.async_tick()
+    assert fc.wattcast[sid] is cached
+    assert fc.fetch[sid].last_error == "response older than the cached forecast"
+
+
+async def test_same_issue_again_is_unchanged_not_a_replacement(
+    hass: HomeAssistant, freezer, wattcast
+):
+    # The cached issue again, with truncated coverage: keep the cache and its
+    # bookkeeping; only the contact time and the next-issue deadline move.
+    entry, fc, sid = await _setup(hass, freezer)
+    cached = fc.wattcast[sid]
+    mapping = fc.mapping[sid]
+    fc.fetch[sid].failures, fc.fetch[sid].last_error = 2, "timeout"
+    wattcast.return_value = _ok(forecast_quarters=8)  # same made_at, shorter
+    freezer.tick(timedelta(minutes=50))
+    now = dt_util.utcnow()
+    fc.fetch[sid].next_fetch = now
+    await fc.async_tick()
+    assert fc.wattcast[sid] is cached
+    assert fc.mapping[sid] is mapping
+    assert fc.fetched_at[sid] == now
+    assert fc.fetch[sid].next_fetch == _next_issue_fetch(now)
+    assert (fc.fetch[sid].failures, fc.fetch[sid].last_error) == (2, "timeout")
+    # The same issue that *extends* coverage is taken.
+    wattcast.return_value = _ok(forecast_quarters=700)
+    fc.fetch[sid].next_fetch = now
+    await fc.async_tick()
+    assert fc.wattcast[sid] is not cached
+    assert len(fc.wattcast[sid].forecast) == 700
+
+
+async def test_known_only_series_prices_lagging_hours(hass: HomeAssistant, freezer, wattcast):
+    # Startup with a known-only response (no forecast yet) and a lagging
+    # real-price entity: the settled spot still publishes those hours.
+    wattcast.return_value = _ok(forecast_quarters=0)
+    entry, fc, sid = await _setup(hass, freezer, local=True, forecast_days=1)
+    hass.states.async_set(
+        "sensor.nordpool",
+        "0.1",
+        {"data_today": _slot_items(_KNOWN_START, [_spot(i) for i in range(8)])},
+    )
+    await fc.async_tick(force_rebuild=True)
+    assert fc.wattcast[sid].coverage_end is None
+    srcs = [s["src"] for s in fc.slots[sid]]
+    assert srcs[0] == "wattcast_known"
+    first_local = srcs.index("local")
+    assert fc.slots[sid][first_local]["start"] == _local_iso(_FC_START)
+    assert set(srcs[:first_local]) == {"wattcast_known"}
+
+
+async def test_flush_closes_writes_so_a_late_tick_cannot_overwrite(
+    hass: HomeAssistant, freezer, wattcast, hass_storage
+):
+    """A tick finishing after the unload flush must not schedule another save."""
+    entry, fc, sid = await _setup(hass, freezer)
+    await fc.async_flush()
+    key = f"{DOMAIN}.{entry.entry_id}.forecast"
+    before = hass_storage.get(key)
+    fc.async_persist()  # e.g. an in-flight fetch completing after the flush
+    freezer.tick(timedelta(minutes=5))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert hass_storage.get(key) == before
+    fc.async_reopen()  # a failed unload resumes writes
+    assert fc._closing is False

@@ -17,8 +17,9 @@ time-of-use transfer tariff). So this module:
    grid is exactly the shape of a day/night transfer tariff;
 3. learns an intraday shape for the local (weather-regression) fallback, which
    only predicts a *daily* mean (``fit_intraday_shape``);
-4. merges the two into 15-min ``{start, end, buy}`` slots, DST-safe
-   (``build_slots``), and scores sources per day so the best one is published
+4. merges Wattcast's settled spot, its forecast and the local fallback into
+   15-min ``{start, end, buy}`` slots, per-slot and DST-safe (``build_slots``),
+   and scores sources per day so the best one is published
    (``hourly_vectors`` / ``hourly_mae`` / ``select_primary``).
 
 All time stepping is done in UTC; local time is only used for bucketing and for
@@ -420,7 +421,16 @@ def _shrunk_level(resid: Sequence[float], groups: Sequence[str]) -> dict[str, fl
     raw_between = sum(counts[g] * means[g] ** 2 for g in means) / n_total if n_total else 0.0
     # The group means themselves carry σ²_w/n of noise; don't count it as signal.
     between = max(0.0, raw_between - within * len(means) / max(n_total, 1))
-    noise_share = within / (within + between) if within + between > 1e-30 else 0.0
+    if dof <= 0:
+        # One pair per group (e.g. day 1 of an hourly series): the noise can't
+        # be told apart from a real deviation, so ``within = 0`` would read as
+        # "deterministic" and let every group absorb its own noise. Shrink
+        # fully instead — a genuine tariff re-emerges as more pairs arrive.
+        noise_share = 1.0
+    elif within + between > 1e-30:
+        noise_share = within / (within + between)
+    else:
+        noise_share = 0.0
     lam = SHRINK_LAMBDA * noise_share
     return {g: means[g] * counts[g] / (counts[g] + lam) for g in means}
 
@@ -593,9 +603,18 @@ def build_slots(
     mapping: RetailMapping,
     local_daily: Mapping[date, float],
     shape: Mapping[str, float] | None,
+    prefer_local: bool = False,
 ) -> list[dict]:
-    """15-min retail slots over ``[start, end)``: Wattcast where it covers,
-    the local daily forecast (shaped) beyond it, nothing where neither does.
+    """15-min retail slots over ``[start, end)``, source chosen per slot.
+
+    Precedence: Wattcast's *settled* spot (``known``, mapped to retail, tagged
+    ``src="wattcast_known"`` with ``p10 = p90 = buy``) wherever it exists —
+    it's the real day-ahead price, only the retail mapping is estimated, so it
+    beats any forecast when the real-price entity lags behind Wattcast. Then
+    the forecast sources: Wattcast's forecast and the local daily forecast
+    (shaped), in that order — or the reverse with ``prefer_local`` (the local
+    model scored best), so each still fills the slots the other can't reach.
+    Nothing where no source covers.
 
     Stepping is in UTC, so a DST day yields 92 or 100 quarters, not 96. An
     hourly Wattcast series fills all four quarters of each hour. ``variant``
@@ -603,37 +622,55 @@ def build_slots(
     """
     use_raw = variant == "wattcast_raw"
     cover: dict[int, ForecastPoint] = {}
+    settled: dict[int, SpotPoint] = {}
     step = 900
     if wattcast is not None:
         step = wattcast.slot_minutes * 60
         cover = {_epoch(p.start): p for p in wattcast.forecast}
+        settled = {_epoch(p.start): p for p in wattcast.known}
+
+    def _wattcast(point: ForecastPoint, local: datetime) -> dict[str, Any]:
+        buy = mapping.apply(point.p50_raw if use_raw else point.p50, local)
+        # The mapping is monotone, but the raw median can sit outside the
+        # adjusted band; keep the invariant p10 ≤ buy ≤ p90 for consumers.
+        p10 = min(mapping.apply(point.p10, local), buy)
+        p90 = max(mapping.apply(point.p90, local), buy)
+        return {"buy": round(buy, 5), "p10": round(p10, 5), "p90": round(p90, 5), "src": "wattcast"}
+
+    def _local(local: datetime) -> dict[str, Any] | None:
+        value = _num(local_daily.get(local.date()))
+        if value is None:
+            return None
+        return {"buy": round(apply_shape(shape, value, local), 5), "src": "local"}
 
     out: list[dict] = []
     t = _floor_quarter(_aware(start, tz))
     stop = _aware(end, tz).astimezone(UTC)
     while t < stop:
         local = t.astimezone(tz)
-        item: dict[str, Any] = {
-            "start": local.isoformat(),
-            "end": (t + SLOT).astimezone(tz).isoformat(),
-        }
         epoch = _epoch(t)
-        point = cover.get(epoch - epoch % step)
-        if point is not None:
-            buy = mapping.apply(point.p50_raw if use_raw else point.p50, local)
-            # The mapping is monotone, but the raw median can sit outside the
-            # adjusted band; keep the invariant p10 ≤ buy ≤ p90 for consumers.
-            p10 = min(mapping.apply(point.p10, local), buy)
-            p90 = max(mapping.apply(point.p90, local), buy)
-            item.update(buy=round(buy, 5), p10=round(p10, 5), p90=round(p90, 5), src="wattcast")
+        key = epoch - epoch % step
+        fields: dict[str, Any] | None = None
+        known = settled.get(key)
+        if known is not None:
+            buy = round(mapping.apply(known.eur_mwh, local), 5)
+            fields = {"buy": buy, "p10": buy, "p90": buy, "src": "wattcast_known"}
         else:
-            daily = local_daily.get(local.date())
-            value = _num(daily)
-            if value is None:
-                t += SLOT
-                continue
-            item.update(buy=round(apply_shape(shape, value, local), 5), src="local")
-        out.append(item)
+            point = cover.get(key)
+            if prefer_local:
+                fields = _local(local)
+                if fields is None and point is not None:
+                    fields = _wattcast(point, local)
+            else:
+                fields = _wattcast(point, local) if point is not None else _local(local)
+        if fields is not None:
+            out.append(
+                {
+                    "start": local.isoformat(),
+                    "end": (t + SLOT).astimezone(tz).isoformat(),
+                    **fields,
+                }
+            )
         t += SLOT
     return out
 

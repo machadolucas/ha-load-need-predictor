@@ -93,6 +93,13 @@ def test_tank_fields_round_trip():
     assert cfg.tank_boost_soc_pct == 20.0
 
 
+def test_tank_tracking_enabled_follows_heating_detector():
+    # The shared "is the tank live?" predicate (tracker + coordinator feedback).
+    assert load_config_from_data({CONF_NAME: "LVV"}).tank_tracking_enabled is False
+    on = load_config_from_data({CONF_NAME: "LVV", CONF_HEATING_ACTIVE_ENTITY: "binary_sensor.led"})
+    assert on.tank_tracking_enabled is True
+
+
 def test_tank_boost_empty_string_disables():
     cfg = load_config_from_data({CONF_NAME: "LVV", CONF_TANK_BOOST_SOC_PCT: ""})
     assert cfg.tank_boost_soc_pct is None

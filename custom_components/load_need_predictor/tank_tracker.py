@@ -3,8 +3,10 @@
 The pure energy balance lives in :mod:`tank_model`; this is the thin Home
 Assistant shell that feeds it. Once per :data:`TANK_TICK_SECONDS` it reads each
 tank-load's counters/meter/binary states straight from ``hass.states`` (never the
-recorder — the tank math is purely instantaneous), unit-normalises the water
-meter, computes sustained-state durations from ``last_changed``, calls
+recorder — the tank math is purely instantaneous), unit-normalises both
+counters (energy → kWh, water → L, via HA's own converters; an unknown unit reads
+as unavailable, never guessed), re-baselines a counter whose configured entity
+changed, computes sustained-state durations from ``last_changed``, calls
 :func:`tank_model.apply_tick`, and publishes a :class:`TankResult`.
 
 **Why a self-driven tick instead of ``update_interval``.** A polling
@@ -34,19 +36,27 @@ Because ``anchored`` is now the transition tick alone, it is still exactly the
 calibrated tank's SoC has fallen below the load's boost threshold, the tracker
 re-runs the load's predict/push (which, via feedback #1 in the coordinator, folds
 the measured deficit into a bigger target) so the scheduler books more heating
-before the tank empties. Hysteresis + a rate limit live in the pure model.
+before the tank empties. Hysteresis + a rate limit live in the pure model; the
+push runs as its own task (it can outlast a tick; while it is in flight that
+load's boost isn't re-evaluated), the disarm is applied onto the *latest* tank
+state only once the push actually succeeded (a dead scheduler target must not
+consume the trigger), and a failed push is retried at most every
+:data:`BOOST_RETRY_INTERVAL` after it completed, so it can't re-plan every tick.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
+from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import BaseUnitConverter, EnergyConverter, VolumeConverter
 
 from . import occupancy
 from .const import DOMAIN, TANK_TICK_SECONDS
@@ -61,6 +71,7 @@ from .tank_model import (
     initial_state,
     liters_at_temp,
     profile_of,
+    rebind_sources,
     should_boost,
     showers_left,
 )
@@ -73,10 +84,13 @@ TICK_INTERVAL = timedelta(seconds=TANK_TICK_SECONDS)
 # stretch of drift still survives a restart within ~15 minutes.
 PERSIST_EVERY_TICKS = 15
 
-# Water-meter unit strings already in litres; anything else (the OCR meter reports
-# m³) is scaled up. Only litres and m³ are expected in practice.
-_LITER_UNITS = frozenset({"L", "l", "liter", "liters", "Liter"})
-_LITERS_PER_M3 = 1000.0
+# A failed boost push (scheduler target unavailable) keeps the trigger armed but
+# is retried no more often than this, so a dead target can't re-plan every tick.
+BOOST_RETRY_INTERVAL = timedelta(minutes=15)
+
+# Spellings of "litres" seen on template/legacy meters that HA's VolumeConverter
+# (which only knows ``L``) would otherwise reject; accepted as before.
+_LITER_ALIASES = frozenset({"l", "liter", "liters", "Liter", "litre", "litres"})
 
 _UNKNOWN_STATES = ("unknown", "unavailable")
 
@@ -127,13 +141,24 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         self._load = load
         self._unsub: callable | None = None
         self._ticks = 0
+        # Per-load "don't retry the boost push before" after a failed push
+        # (in memory: a restart may retry at once, which is harmless).
+        self._boost_retry_at: dict[str, datetime] = {}
+        # Loads whose boost push is running right now (see ``_async_boost``).
+        self._boost_in_flight: set[str] = set()
+        # Their tasks, so unload can drain them before the final flush (a boost
+        # finishing after it would lose its cooldown and re-fire on reload).
+        self._boost_tasks: set[asyncio.Task] = set()
+        # (entity_id, unit) pairs already warned about, so a misconfigured unit
+        # logs once instead of every minute.
+        self._warned_units: set[tuple[str, str | None]] = set()
 
     # ── config access ──────────────────────────────────────────────────────────
 
     def tank_configs(self) -> dict[str, LoadConfig]:
-        """Loads that opted into tank tracking (``heating_active_entity`` set)."""
+        """Loads that opted into tank tracking (``LoadConfig.tank_tracking_enabled``)."""
         return {
-            sid: cfg for sid, cfg in self._load.load_configs().items() if cfg.heating_active_entity
+            sid: cfg for sid, cfg in self._load.load_configs().items() if cfg.tank_tracking_enabled
         }
 
     @property
@@ -163,20 +188,21 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
 
     # ── state reads (instantaneous — no recorder) ───────────────────────────────
 
-    def _float_state(self, entity_id: str | None) -> float | None:
-        """Current numeric state of an entity, or ``None`` if missing/unparseable."""
-        if not entity_id:
-            return None
-        state = self.hass.states.get(entity_id)
-        if state is None or state.state in _UNKNOWN_STATES:
-            return None
-        try:
-            return float(state.state)
-        except (TypeError, ValueError):
-            return None
+    def _counter(
+        self,
+        entity_id: str | None,
+        converter: type[BaseUnitConverter],
+        target_unit: str,
+        aliases: dict[str, str] | None = None,
+    ) -> float | None:
+        """A cumulative counter normalised to ``target_unit``, or ``None``.
 
-    def _water_liters(self, entity_id: str | None) -> float | None:
-        """Cold-meter reading normalised to litres (m³ → ×1000), or ``None``."""
+        The model's baselines are in kWh / L, so a Wh counter stepping 500 must
+        read as 0.5 kWh, not 500 — the unit comes from ``unit_of_measurement`` via
+        HA's own converter. A missing or unsupported unit is treated as
+        *unavailable* (logged once), never guessed: a wrong guess is a bogus
+        delta the balance can't take back, whereas "unavailable" just waits.
+        """
         if not entity_id:
             return None
         state = self.hass.states.get(entity_id)
@@ -187,10 +213,37 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         except (TypeError, ValueError):
             return None
         unit = state.attributes.get("unit_of_measurement")
-        if unit in _LITER_UNITS:
-            return value
-        # Assume m³ (the OCR water meter's native unit) → litres.
-        return value * _LITERS_PER_M3
+        unit = (aliases or {}).get(unit, unit)
+        if unit not in converter.VALID_UNITS:
+            if (entity_id, unit) not in self._warned_units:
+                self._warned_units.add((entity_id, unit))
+                _LOGGER.warning(
+                    "Tank counter %s has unit %r, which can't be converted to %s; "
+                    "ignoring its readings until the unit is fixed",
+                    entity_id,
+                    unit,
+                    target_unit,
+                )
+            return None
+        return converter.convert(value, unit, target_unit)
+
+    def _energy_kwh(self, entity_id: str | None) -> float | None:
+        """Delivered-energy counter in kWh (Wh/MWh/J/… converted), or ``None``."""
+        return self._counter(entity_id, EnergyConverter, UnitOfEnergy.KILO_WATT_HOUR)
+
+    def _water_liters(self, entity_id: str | None) -> float | None:
+        """Cold-meter reading in litres (m³/gal/ft³/mL/… converted), or ``None``."""
+        return self._counter(
+            entity_id,
+            VolumeConverter,
+            UnitOfVolume.LITERS,
+            aliases=dict.fromkeys(_LITER_ALIASES, UnitOfVolume.LITERS),
+        )
+
+    def _changed_iso(self, entity_id: str | None) -> str | None:
+        """When the entity's state last changed (ISO), or ``None`` if unknown."""
+        state = self.hass.states.get(entity_id) if entity_id else None
+        return state.last_changed.isoformat() if state is not None else None
 
     def _bool_and_duration(
         self, entity_id: str | None, now: datetime
@@ -246,13 +299,17 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         """Run one load's tick; returns ``(result, save_now)``.
 
         ``save_now`` is True when the tick took an anchor *transition* (which is
-        also the only time the model learns) or fired a boost — the events worth
-        persisting promptly. Ordinary latched ticks are just drift and ride the
-        periodic save.
+        also the only time the model learns) — the event worth persisting
+        promptly (a successful boost persists from its own task). Ordinary
+        latched ticks are just drift and ride the periodic save.
         """
         params = TankParams(cfg.tank_volume_l, cfg.tank_setpoint_c, cfg.tank_cold_in_c)
         capacity = capacity_kwh(cfg.tank_volume_l, cfg.tank_setpoint_c, cfg.tank_cold_in_c)
         state = self._load.tanks.get(sid) or initial_state(capacity)
+        # A baseline belongs to one entity: a reconfigured counter re-baselines.
+        state = rebind_sources(
+            state, cfg.delivered_energy_entity or "", cfg.water_total_entity or ""
+        )
 
         # Elapsed since the last tick — restart reconciliation is just this same
         # arithmetic over the (possibly long) gap since the persisted timestamp.
@@ -265,11 +322,12 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         heating_on, heating_off_for_s = self._bool_and_duration(cfg.heating_active_entity, now)
 
         model = self._load.model_for(sid)
+        water_l = self._water_liters(cfg.water_total_entity)
         inputs = TickInputs(
             now_iso=now_iso,
             elapsed_s=elapsed_s,
-            energy_counter_kwh=self._float_state(cfg.delivered_energy_entity),
-            water_counter_l=self._water_liters(cfg.water_total_entity),
+            energy_counter_kwh=self._energy_kwh(cfg.delivered_energy_entity),
+            water_counter_l=water_l,
             contactor_on=contactor_on,
             heating_on=heating_on,
             contactor_on_for_s=contactor_on_for_s,
@@ -284,34 +342,54 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             # The daypart hot-fraction buckets are wall-clock buckets (evenings
             # are showers), so the model needs the *local* hour — ``now`` is UTC.
             local_hour=dt_util.as_local(now).hour,
+            # The meter's own step time, so a slow meter's step is rated over
+            # its real interval rather than the tick it happened to land in.
+            water_changed_iso=(
+                self._changed_iso(cfg.water_total_entity) if water_l is not None else None
+            ),
         )
 
         tick = apply_tick(state, params, inputs)
         self._load.tanks[sid] = tick.state
 
-        boosted = False
-        if cfg.tank_boost_soc_pct is not None:
+        if cfg.tank_boost_soc_pct is not None and sid not in self._boost_in_flight:
             # The boost is a *control* decision, so it reads the same clamped raw
             # ledger the coordinator sizes the ask from — not the display curve.
+            # While a boost push is in flight nothing is evaluated: another fire
+            # would only queue a duplicate predict behind the coordinator lock.
             fire, boosted_state = should_boost(
                 tick.state,
                 model_soc(tick.state.deficit_kwh, tick.capacity_kwh),
                 cfg.tank_boost_soc_pct,
                 now_iso,
             )
-            # Always store the re-armed/disarmed state so hysteresis + the rate
-            # limit persist across ticks, whether or not this one fires.
-            self._load.tanks[sid] = boosted_state
-            if fire:
-                boosted = True
+            retry_at = self._boost_retry_at.get(sid)
+            if fire and retry_at is not None and now < retry_at:
+                # A recent push failed: don't re-plan before the retry time, and
+                # commit nothing — ``boosted_state`` is the disarmed one, while
+                # the tick's own state is still armed for the retry.
+                pass
+            elif not fire:
+                # Store any re-arm so hysteresis persists across ticks.
+                self._load.tanks[sid] = boosted_state
+            else:
                 _LOGGER.info(
                     "Tank charge for %s fell to %.0f%% (< %.0f%%); requesting an early re-plan",
                     sid,
                     tick.soc * 100.0,
                     cfg.tank_boost_soc_pct,
                 )
-                # Re-runs predict/push; feedback #1 folds the measured deficit in.
-                await self._load.async_predict_and_push(only=sid)
+                # The push (predict → recorder → scheduler) can outlast a tick, so
+                # it runs as its own task: the tick loop keeps integrating, and
+                # nothing is committed until the push reports back.
+                self._boost_in_flight.add(sid)
+                task = self.config_entry.async_create_task(
+                    self.hass,
+                    self._async_boost(sid, boosted_state.last_boost_iso),
+                    name=f"{DOMAIN}_tank_boost_{sid}",
+                )
+                self._boost_tasks.add(task)
+                task.add_done_callback(self._boost_tasks.discard)
 
         # Litres/showers are a *display* figure, so they follow the shown deficit
         # (the same number the SoC % is derived from) — not the control ledger.
@@ -336,4 +414,42 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             liters_40c=liters_40c,
             showers_left=showers_left(liters_40c),
         )
-        return result, (tick.anchored or boosted)
+        return result, tick.anchored
+
+    async def async_drain(self, timeout: float = 30.0) -> None:
+        """Wait (bounded) for in-flight boost pushes — call after stopping the tick."""
+        if self._boost_tasks:
+            await asyncio.wait(set(self._boost_tasks), timeout=timeout)
+
+    async def _async_boost(self, sid: str, fired_iso: str) -> None:
+        """Run one boost re-plan and commit its bookkeeping only on success.
+
+        Feedback #1 folds the measured deficit into the push. On success only
+        the boost fields (disarm + the rate-limit stamp) are applied — onto the
+        *latest* tank state, because ticks kept running during the await and may
+        have anchored, learned or moved the counters. On failure nothing is
+        committed (the trigger stays armed) and the retry waits
+        :data:`BOOST_RETRY_INTERVAL` from *completion*, so a push that hung for
+        a while doesn't retry the moment it gives up.
+        """
+        try:
+            try:
+                pushed = await self._load.async_predict_and_push(only=sid)
+            except Exception:  # noqa: BLE001 - a failed push must not lose the trigger
+                _LOGGER.exception("Boost re-plan failed for load %s", sid)
+                pushed = False
+            # ``None`` (an older signature) counts as success: it can't report
+            # failure, and never disarming would re-plan every tick.
+            if pushed is False:
+                self._boost_retry_at[sid] = dt_util.utcnow() + BOOST_RETRY_INTERVAL
+                _LOGGER.warning(
+                    "Boost push for %s failed; will retry in %s", sid, BOOST_RETRY_INTERVAL
+                )
+                return
+            self._boost_retry_at.pop(sid, None)
+            latest = self._load.tanks.get(sid)
+            if latest is not None:
+                self._load.tanks[sid] = replace(latest, boost_armed=False, last_boost_iso=fired_iso)
+                self._load.async_persist()
+        finally:
+            self._boost_in_flight.discard(sid)

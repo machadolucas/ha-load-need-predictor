@@ -11,7 +11,7 @@
         },
         "data_description": {
           "predict_time": "Time of day to compute the prediction and push it to the scheduler target — set it just after tomorrow's day-ahead prices publish.",
-          "capture_time": "Time of day to record the day's actual delivered energy as a training sample (typically end of day)."
+          "capture_time": "Time of day to record the actual delivered energy — the day ending at this time — as a training sample (typically end of day)."
         }
       },
       "reconfigure": {
@@ -23,7 +23,7 @@
         },
         "data_description": {
           "predict_time": "Time of day to compute the prediction and push it to the scheduler target — set it just after tomorrow's day-ahead prices publish.",
-          "capture_time": "Time of day to record the day's actual delivered energy as a training sample (typically end of day)."
+          "capture_time": "Time of day to record the actual delivered energy — the day ending at this time — as a training sample (typically end of day)."
         }
       }
     }
@@ -81,6 +81,10 @@
             "deficit_cap_minutes": "Largest backlog the catch-up can accumulate (minutes). Defaults to twice the daily cap — enough to recover a couple of skipped days without runaway after a long outage. Only used when a controlled switch is set."
           }
         }
+      },
+      "error": {
+        "invalid_runtime_band": "No whole 15-minute step fits between the minimum and maximum minutes/day (e.g. min 40 / max 40). Widen the range so it contains at least one multiple of 15 (e.g. 45).",
+        "heating_needs_switch": "The heating-active detector needs the controlled switch too: the tank charge is calibrated at 'contactor on + element idle', which can't be seen without the switch."
       }
     },
     "price_forecast": {

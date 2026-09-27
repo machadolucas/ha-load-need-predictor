@@ -16,7 +16,7 @@
  */
 
 const DOMAIN = "load_need_predictor";
-const CARD_VERSION = "0.10.0";
+const CARD_VERSION = "0.11.0";
 const DOC_URL = "https://github.com/machadolucas/ha-load-need-predictor";
 
 // translation_key values the integration assigns to its entities.
@@ -54,6 +54,8 @@ class LoadNeedPredictorCard extends HTMLElement {
     this._hass = null;
     this._toggled = new Map(); // deviceId → explicit open/closed (overrides default)
     this._fingerprint = null;
+    this._discovery = null; // memoised _devices() result + the inputs it was built from
+    this._watched = null; // state objects the last render read (identity fast path)
     // One delegated listener survives innerHTML re-renders (it's on the root).
     this.shadowRoot.addEventListener("click", (ev) => this._onClick(ev));
   }
@@ -61,6 +63,7 @@ class LoadNeedPredictorCard extends HTMLElement {
   setConfig(config) {
     this._config = config || {};
     this._fingerprint = null; // force a rebuild on next render
+    this._discovery = null;
     if (this._hass) this._render();
   }
 
@@ -79,9 +82,28 @@ class LoadNeedPredictorCard extends HTMLElement {
   }
 
   // ── discovery ─────────────────────────────────────────────────────────────
+  // HA pushes `hass` on every state change anywhere, but only swaps the
+  // `entities`/`devices` objects when a registry changes — so discovery (a scan
+  // of every entity in the install) is memoised on their identity.
   _devices() {
     const hass = this._hass;
     if (!hass || !hass.entities) return [];
+    const d = this._discovery;
+    if (d && d.entities === hass.entities && d.devices === hass.devices) return d.out;
+    const out = this._discover();
+    this._discovery = {
+      entities: hass.entities,
+      devices: hass.devices,
+      out,
+      // Names + entity mapping join the fingerprint so a rename re-renders
+      // (otherwise a button could keep calling its old entity id).
+      sig: JSON.stringify(out.map((x) => [x.deviceId, x.name, x.keys])),
+    };
+    return out;
+  }
+
+  _discover() {
+    const hass = this._hass;
     const filter = this._config.devices && this._config.devices.length
       ? new Set(this._config.devices)
       : null;
@@ -122,22 +144,37 @@ class LoadNeedPredictorCard extends HTMLElement {
     if (!this._hass) return;
     const devices = this._devices();
 
+    // The tank-charge sensor updates every minute, unlike the daily primary —
+    // it must be watched too or the bar would go stale until midnight.
+    const eids = devices.flatMap((d) => {
+      const ids = [d.keys[d.type === "load" ? TK.loadPrimary : TK.forecastPrimary]];
+      if (d.keys[TK.tankSoc]) ids.push(d.keys[TK.tankSoc]);
+      return ids;
+    });
+    const watched = eids.map((eid) => this._hass.states[eid]);
+    // State objects are immutable and replaced on change, so an identity match
+    // means nothing this card shows moved — skip even building the fingerprint.
+    const prev = this._watched;
+    const same =
+      this._fingerprint !== null &&
+      prev &&
+      prev.length === watched.length &&
+      watched.every((s, i) => s === prev[i]);
+    this._watched = watched;
+    if (same && this._fpDiscovery === this._discovery) return;
+
     // Only rebuild when something the card shows actually changed — avoids
     // thrashing the DOM on every unrelated state update HA pushes.
     const fp = JSON.stringify({
       cfg: this._config,
       exp: [...this._toggled.entries()].sort(),
-      st: devices.flatMap((d) => {
-        // The tank-charge sensor updates every minute, unlike the daily primary —
-        // it must join the fingerprint or the bar would go stale until midnight.
-        const eids = [d.keys[d.type === "load" ? TK.loadPrimary : TK.forecastPrimary]];
-        if (d.keys[TK.tankSoc]) eids.push(d.keys[TK.tankSoc]);
-        return eids.map((eid) => {
-          const s = this._hass.states[eid];
-          return [eid, s ? s.state + "@" + s.last_updated : "none"];
-        });
+      dev: this._discovery ? this._discovery.sig : "",
+      st: eids.map((eid, i) => {
+        const s = watched[i];
+        return [eid, s ? s.state + "@" + s.last_updated : "none"];
       }),
     });
+    this._fpDiscovery = this._discovery;
     if (fp === this._fingerprint) return;
     this._fingerprint = fp;
 
@@ -247,6 +284,7 @@ class LoadNeedPredictorCard extends HTMLElement {
     if (el.dataset.action === "toggle") {
       const id = el.dataset.device;
       this._toggled.set(id, !this._isOpen(id));
+      this._fingerprint = null; // defeat the identity fast path: the view changed
       this._render();
     } else if (el.dataset.action === "service" && this._hass) {
       const [domain, service] = el.dataset.service.split(".");
@@ -356,7 +394,12 @@ function loadDetail(bd, m, showContext) {
 }
 
 // ── natural-language composition (forecast) ─────────────────────────────────
-const SRC_LABEL = { wattcast: "Wattcast", wattcast_raw: "Wattcast (raw)", local: "local model" };
+const SRC_LABEL = {
+  wattcast: "Wattcast",
+  wattcast_raw: "Wattcast (raw)",
+  wattcast_known: "Wattcast (settled)",
+  local: "local model",
+};
 const srcLabel = (s) => SRC_LABEL[s] || s || "—";
 const ct = (x) => (isNum(x) ? (x * 100).toFixed(1) : "—"); // €/kWh → c/kWh
 
@@ -387,7 +430,7 @@ function forecastExplanation(a) {
   const m = a.retail_mapping;
   let map = "";
   if (m && m.n) {
-    map = ` Spot → your price: ×${bold(m.slope_pos.toFixed(3))} + ~${bold(ct(m.base))} c/kWh (${bold(m.n)} pairs`;
+    map = ` Spot → your price: ×${bold(isNum(m.slope_pos) ? m.slope_pos.toFixed(3) : "—")} + ~${bold(ct(m.base))} c/kWh (${bold(m.n)} pairs`;
     map += isNum(m.mae) ? `, ±${ct(m.mae)} c)` : ")";
     map += ".";
   }
@@ -422,7 +465,7 @@ function forecastDetail(a) {
   const c = a.coefficients;
   if (c && c.betas && c.features) {
     const rows = c.features
-      .map((f, i) => `<div class="day"><span>${esc(f)}</span><span>${c.betas[i].toFixed(4)}</span></div>`)
+      .map((f, i) => `<div class="day"><span>${esc(f)}</span><span>${isNum(c.betas[i]) ? c.betas[i].toFixed(4) : "—"}</span></div>`)
       .join("");
     coeffs = `<div class="sub">Local fallback model — coefficients (standardised${
       a.fitted ? `, ${a.model_samples} days` : ", seed"

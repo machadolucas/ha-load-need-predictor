@@ -14,6 +14,7 @@ is a calibrated constant gated by occupancy:
     predicted_kWh = occupancy_factor × [E_base + E_draw_per_person × people_home]
                     + guest_bonus × guests
     predicted_kWh ×= gain                      # online EWMA drift correction
+                                               # (→ true actual/pre-gain ratio)
     minutes = clamp(predicted_kWh / rated_kW × 60, min, max)
 
 ``E_base`` / ``E_draw_per_person`` are seeded from priors and refined from
@@ -178,12 +179,17 @@ def clamp_minutes(
 
     The bounds are pulled *inward* to the nearest step multiple (ceil the low
     bound, floor the high bound) so the result is always a valid step value that
-    still respects the safety floor and the cap.
+    still respects the safety floor and the cap. If no step multiple fits the
+    band, the floor-rounded cap wins (never above ``max_minutes``, never < 0).
     """
     lo = math.ceil(min_minutes / step) * step
-    hi = math.floor(max_minutes / step) * step
-    if hi < lo:  # degenerate config (min and max in the same step bucket)
-        hi = lo
+    hi = max(0, math.floor(max_minutes / step) * step)
+    if hi < lo:
+        # Degenerate config (no step multiple inside [min, max], e.g. min=max=40;
+        # the config flow now rejects these, but legacy entries may carry one):
+        # honour the cap, never the floor — the scheduler's number must not be
+        # asked for more than the user allowed, and never for a negative runtime.
+        return int(hi)
     val = round(minutes / step) * step
     return int(_clamp(val, lo, hi))
 
@@ -337,27 +343,60 @@ def update_gain(
     predicted_kwh: float,
     actual_kwh: float,
     *,
+    predicted_gain: float | None = None,
     beta: float = GAIN_BETA,
 ) -> ModelState:
     """EWMA-update the calibration gain from one day's actual/predicted ratio.
+
+    ``predicted_kwh`` already has the gain in force *at prediction time* baked
+    in, so ``actual / predicted`` is the ratio to the *pre-gain* model scaled by
+    ``1 / g_pred``. EWMA-ing that raw ratio has the fixed point ``g = true / g``
+    — i.e. ``√true`` — so the target is re-scaled by ``predicted_gain``
+    (``g_pred · ratio`` → converges to the true ratio). ``predicted_gain``
+    defaults to the current gain for legacy rows that didn't record it.
 
     No-op for a near-zero prediction (ratio undefined). The ratio and the gain
     are both clamped so a single wild day can't destabilise the model.
     """
     if predicted_kwh <= 0.5:
         return state
+    g_pred = state.gain if predicted_gain is None or predicted_gain <= 0 else predicted_gain
     ratio = _clamp(actual_kwh / predicted_kwh, RATIO_MIN, RATIO_MAX)
-    new_gain = _clamp((1.0 - beta) * state.gain + beta * ratio, GAIN_MIN, GAIN_MAX)
+    target = g_pred * ratio
+    new_gain = _clamp((1.0 - beta) * state.gain + beta * target, GAIN_MIN, GAIN_MAX)
     return replace(state, gain=new_gain)
 
 
-def apply_observation(state: ModelState, predicted_kwh: float, actual_kwh: float) -> ModelState:
+def apply_observation(
+    state: ModelState,
+    predicted_kwh: float,
+    actual_kwh: float,
+    *,
+    predicted_gain: float | None = None,
+) -> ModelState:
     """Fold one valid day's outcome into the model: update gain + bump count.
 
-    The caller must gate on :func:`is_valid_delivery` first.
+    The caller must gate on :func:`is_valid_delivery` first. ``predicted_gain``
+    is the gain the prediction was made with (see :func:`update_gain`).
     """
-    state = update_gain(state, predicted_kwh, actual_kwh)
+    state = update_gain(state, predicted_kwh, actual_kwh, predicted_gain=predicted_gain)
     return replace(state, sample_count=state.sample_count + 1)
+
+
+def energy_balance_demand(
+    delivered_kwh: float, deficit_end_kwh: float, deficit_prev_kwh: float
+) -> float:
+    """Demand drawn over a window from energy in and the tank's Δ state-of-charge.
+
+    Energy conservation over the capture→capture window: what the household
+    drew = what the element delivered + how much deeper the tank's deficit got
+    (a refill day delivers backlog *on top of* demand, so its Δdeficit is
+    negative; a skipped day under-delivers and the deficit grows). Unlike the
+    raw meter, this is a demand sample whatever the scheduler did, so it can
+    teach the gain on skip/refill days. Floored at 0 (model noise on an empty
+    house can't mean negative draw).
+    """
+    return max(0.0, delivered_kwh + deficit_end_kwh - deficit_prev_kwh)
 
 
 def blend_param(prior: float, empirical: float, n: int, n_prior: int = N_PRIOR) -> float:
@@ -366,22 +405,43 @@ def blend_param(prior: float, empirical: float, n: int, n_prior: int = N_PRIOR) 
 
 
 def refit_occupancy_params(
-    rows: Sequence[tuple[float, float]],
+    rows: Sequence[tuple[float, ...]],
+    *,
+    guest_bonus: float = SEED_GUEST_BONUS,
+    empty_house_factor: float = SEED_EMPTY_HOUSE_FACTOR,
 ) -> tuple[float, float] | None:
-    """2-parameter OLS of ``actual_kwh ~ people_home`` over logged rows.
+    """2-parameter OLS of the de-gained occupancy demand on ``people_home``.
 
-    ``rows`` is a sequence of ``(people_home, actual_kwh)``. Returns
-    ``(e_base, e_draw_per_person)`` (intercept, slope), each floored at 0 since
-    negatives are unphysical, or ``None`` when the slope isn't identifiable
-    (fewer than 2 rows, or no variation in ``people_home``).
+    ``rows`` holds ``(people_home, kwh)`` or ``(people_home, kwh, guests, gain)``
+    (guests default 0, gain 1). ``kwh`` is what :func:`predict_kwh` models —
+    ``gain × (factor × (E_base + E_draw × p) + guest_bonus × guests)`` — so each
+    row is first mapped back to the bracket this fit estimates: divide out the
+    row's gain (else the online gain double-applies on top of the refit), drop
+    the guest term, and for ``p == 0`` rows divide by ``empty_house_factor``
+    (an empty house is scaled, not a lower point on the same line). Then
+    ``y ~ p`` by OLS → ``(e_base, e_draw_per_person)``, each floored at 0 since
+    negatives are unphysical.
+
+    ``None`` when the structure isn't identifiable: the contract needs at least
+    one zero-person day (pins ``E_base``) *and* one multi-person day (``p ≥ 2``,
+    so the slope isn't just a 0-vs-1 contrast).
     """
-    pts = [(float(p), float(k)) for p, k in rows]
-    if len(pts) < 2:
+    pts: list[tuple[float, float]] = []
+    for row in rows:
+        people = max(0.0, float(row[0]))
+        kwh = float(row[1])
+        guests = max(0.0, float(row[2])) if len(row) > 2 and row[2] is not None else 0.0
+        gain = float(row[3]) if len(row) > 3 and row[3] else 1.0
+        y = kwh / gain - guest_bonus * guests
+        if people == 0:
+            if empty_house_factor <= 0:
+                continue  # an empty house carries no E_base information then
+            y /= empty_house_factor
+        pts.append((people, y))
+    if not any(p == 0 for p, _ in pts) or not any(p >= 2 for p, _ in pts):
         return None
     xs = [p for p, _ in pts]
-    ys = [k for _, k in pts]
-    if len(set(xs)) < 2:  # all observations at the same occupancy → slope undefined
-        return None
+    ys = [y for _, y in pts]
     n = len(pts)
     mean_x = sum(xs) / n
     mean_y = sum(ys) / n

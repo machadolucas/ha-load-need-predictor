@@ -32,10 +32,11 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 import aiohttp
+from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, State
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import TemperatureConverter
 
 from .const import WATTCAST_HOURS, WATTCAST_TIMEOUT_S, WATTCAST_URL
 from .spot_forecast import WattcastSeries, parse_wattcast
@@ -107,6 +108,8 @@ async def async_daily_temp_forecast(hass: HomeAssistant, weather_entity: str) ->
 
     Uses ``weather.get_forecasts`` (the supported replacement for the deprecated
     ``forecast`` attribute). Mean = (high + low)/2 when a low is present.
+    HA returns the forecast in the weather entity's *display* unit
+    (``temperature_unit``), so a °F entity is converted back to the model's °C.
     """
     try:
         response = await hass.services.async_call(
@@ -116,26 +119,54 @@ async def async_daily_temp_forecast(hass: HomeAssistant, weather_entity: str) ->
             blocking=True,
             return_response=True,
         )
-    except HomeAssistantError as err:
+    except Exception as err:  # noqa: BLE001 - a broken weather entity → no local forecast
         _LOGGER.warning("Could not read temperature forecast from %s: %s", weather_entity, err)
         return {}
+    state = hass.states.get(weather_entity)
+    unit = state.attributes.get("temperature_unit") if state is not None else None
+    convert = unit in TemperatureConverter.VALID_UNITS and unit != UnitOfTemperature.CELSIUS
     forecasts = (response or {}).get(weather_entity, {}).get("forecast", [])
     out: dict[date, float] = {}
     for entry in forecasts:
-        when = dt_util.parse_datetime(entry.get("datetime", ""))
-        temp = entry.get("temperature")
-        if when is None or temp is None:
+        try:
+            when = dt_util.parse_datetime(entry.get("datetime", ""))
+            temp = entry.get("temperature")
+            if when is None or temp is None:
+                continue
+            low = entry.get("templow")
+            mean = (float(temp) + float(low)) / 2 if low is not None else float(temp)
+        except (AttributeError, TypeError, ValueError):
             continue
-        low = entry.get("templow")
-        mean = (float(temp) + float(low)) / 2 if low is not None else float(temp)
+        if convert:
+            mean = TemperatureConverter.convert(mean, unit, UnitOfTemperature.CELSIUS)
         out[dt_util.as_local(when).date()] = mean
     return out
 
 
-async def _daily_means(
-    hass: HomeAssistant, entity_ids: list[str], start: datetime
-) -> dict[str, dict[int, float]]:
-    """Daily-mean statistics for several entities → {entity: {bucket_ms: mean}}."""
+def _row_start_s(row: Mapping) -> float:
+    """A statistics row's start as epoch **seconds** (the recorder returns a
+    float timestamp; tolerate a datetime from older/mocked recorders)."""
+    start = row["start"]
+    return start.timestamp() if isinstance(start, datetime) else float(start)
+
+
+# Temperature statistics are converted to °C by the recorder whatever the
+# sensor's unit; price (no unit class) and wind (MW, power) are unaffected.
+_STAT_UNITS = {"temperature": UnitOfTemperature.CELSIUS}
+
+
+async def _statistics(
+    hass: HomeAssistant,
+    entity_ids: set[str],
+    start: datetime,
+    end: datetime | None,
+    period: str,
+) -> dict[str, list]:
+    """``statistics_during_period`` means, or ``{}`` — never raises.
+
+    A recorder hiccup (DB locked, migration, …) must not abort the forecast
+    build: the callers degrade to the seed model / no shape / no score.
+    """
     try:
         from homeassistant.components.recorder import get_instance
         from homeassistant.components.recorder.statistics import statistics_during_period
@@ -144,26 +175,39 @@ async def _daily_means(
     try:
         instance = get_instance(hass)
     except KeyError:
-        _LOGGER.debug("Recorder not available; cannot fit price model")
+        _LOGGER.debug("Recorder not available; no price statistics")
+        return {}
+    try:
+        return await instance.async_add_executor_job(
+            statistics_during_period,
+            hass,
+            start,
+            end,
+            entity_ids,
+            period,
+            _STAT_UNITS,
+            {"mean"},
+        )
+    except Exception as err:  # noqa: BLE001 - any recorder hiccup → no statistics
+        _LOGGER.warning("Reading %s statistics for %s failed: %s", period, entity_ids, err)
         return {}
 
-    stats = await instance.async_add_executor_job(
-        statistics_during_period,
-        hass,
-        start,
-        None,
-        set(entity_ids),
-        "day",
-        None,
-        {"mean"},
-    )
+
+async def _daily_means(
+    hass: HomeAssistant, entity_ids: list[str], start: datetime, end: datetime | None = None
+) -> dict[str, dict[int, float]]:
+    """Daily-mean statistics → ``{entity: {bucket start epoch seconds: mean}}``."""
+    stats = await _statistics(hass, set(entity_ids), start, end, "day")
     result: dict[str, dict[int, float]] = {}
     for entity_id, series in stats.items():
         per_day: dict[int, float] = {}
         for row in series:
             mean = row.get("mean")
-            if mean is not None:
-                per_day[int(row["start"])] = float(mean)
+            try:
+                if mean is not None:
+                    per_day[int(_row_start_s(row))] = float(mean)
+            except (KeyError, TypeError, ValueError):
+                continue
         result[entity_id] = per_day
     return result
 
@@ -191,16 +235,15 @@ async def async_fit_rows(
 async def async_daily_price_mean(
     hass: HomeAssistant, price_entity: str, day_start: datetime
 ) -> float | None:
-    """Mean realised price (€/kWh) for the local day at ``day_start`` (for evaluation)."""
-    stats = await _daily_means(hass, [price_entity], day_start)
-    per_day = stats.get(price_entity, {})
-    if not per_day:
-        return None
-    target_ms = int(day_start.timestamp() * 1000)
-    # Prefer the exact bucket; fall back to the only/earliest bucket in range.
-    if target_ms in per_day:
-        return per_day[target_ms]
-    return per_day[min(per_day)]
+    """Mean realised price (€/kWh) for the local day at ``day_start`` (for evaluation).
+
+    Only that day's bucket counts: a missing day returns None rather than a
+    neighbouring day's mean (which would be stored as the actual for good).
+    """
+    # Wall-clock +1 day, so a 23/25-hour DST day is queried whole.
+    day_end = dt_util.as_local(day_start) + timedelta(days=1)
+    stats = await _daily_means(hass, [price_entity], day_start, day_end)
+    return stats.get(price_entity, {}).get(int(day_start.timestamp()))
 
 
 # ── Hourly statistics (intraday shape + hourly evaluation) ──────────────────
@@ -210,24 +253,17 @@ async def async_hourly_price_rows(
     hass: HomeAssistant, price_entity: str, start: datetime, end: datetime | None = None
 ) -> list[tuple[datetime, float]]:
     """Hourly-mean realised price rows ``(local hour start, €/kWh)`` from LTS."""
-    try:
-        from homeassistant.components.recorder import get_instance
-        from homeassistant.components.recorder.statistics import statistics_during_period
-    except ImportError:
-        return []
-    try:
-        instance = get_instance(hass)
-    except KeyError:
-        return []
-    stats = await instance.async_add_executor_job(
-        statistics_during_period, hass, start, end, {price_entity}, "hour", None, {"mean"}
-    )
+    stats = await _statistics(hass, {price_entity}, start, end, "hour")
     rows: list[tuple[datetime, float]] = []
     for row in stats.get(price_entity, []):
         mean = row.get("mean")
         if mean is None:
             continue
-        rows.append((dt_util.as_local(datetime.fromtimestamp(row["start"], tz=UTC)), float(mean)))
+        try:
+            when = datetime.fromtimestamp(_row_start_s(row), tz=UTC)
+            rows.append((dt_util.as_local(when), float(mean)))
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
     return rows
 
 

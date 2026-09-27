@@ -20,7 +20,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import PLATFORMS
 from .coordinator import LoadNeedPredictorCoordinator
-from .forecast_coordinator import PriceForecastCoordinator
+from .forecast_coordinator import PriceForecastCoordinator, async_delete_stale_wattcast_issues
 from .frontend import async_register_card
 from .jobs import PredictorJobs
 from .runtime import LoadNeedPredictorConfigEntry, RuntimeData
@@ -81,11 +81,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigE
 
 async def async_unload_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> bool:
     """Unload the hub config entry."""
-    # Flush the forecast Store (incl. the Wattcast cache) before a reload's new
-    # coordinator reads it — the debounced save may not have fired yet.
-    if (forecast := entry.runtime_data.forecast) is not None:
-        await forecast.async_flush()
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    runtime = entry.runtime_data
+    # Stop the tank tick first (idempotent — on_unload repeats it) so no tick can
+    # mutate/schedule a save after the flush below.
+    if runtime.tank is not None:
+        runtime.tank.async_shutdown_ticker()
+        # …and let an in-flight boost commit its cooldown before the flush.
+        await runtime.tank.async_drain()
+    if runtime.forecast is not None:
+        runtime.forecast.async_shutdown_ticker()
+    # Flush both Stores before a reload's new coordinators read them — the
+    # debounced saves may not have fired yet (every subentry add/edit reloads).
+    # The load Store holds the tank anchors/learning/boost state too. A failed
+    # flush is logged, never allowed to abort the unload.
+    try:
+        await runtime.load.async_flush()
+    except Exception:  # noqa: BLE001 - best effort; unloading matters more
+        _LOGGER.exception("Flushing the load state on unload failed")
+    if (forecast := runtime.forecast) is not None:
+        try:
+            await forecast.async_flush()
+        except Exception:  # noqa: BLE001 - best effort; unloading matters more
+            _LOGGER.exception("Flushing the price-forecast state on unload failed")
+    unloaded = False
+    try:
+        unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    finally:
+        if not unloaded:
+            # The entry stays loaded: resume writes and the tank tick (both
+            # idempotent), or tank tracking would silently stay dead.
+            runtime.load.async_reopen()
+            if runtime.tank is not None:
+                runtime.tank.async_start()
+            if runtime.forecast is not None:
+                runtime.forecast.async_reopen()
+                runtime.forecast.async_start()
+    return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> None:
+    """Drop this hub's Wattcast repair issues — nothing would clear them otherwise."""
+    async_delete_stale_wattcast_issues(hass, exclude_entry_id=entry.entry_id)
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> None:

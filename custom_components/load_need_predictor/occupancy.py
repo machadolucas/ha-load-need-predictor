@@ -75,18 +75,23 @@ def guests_active(hass: HomeAssistant, calendar_entity: str | None) -> bool:
 # ── pure duration math (unit-tested directly) ────────────────────────────────
 
 
-def home_seconds(states: list, start: datetime, end: datetime) -> float:
+def home_seconds(
+    states: list, start: datetime, end: datetime, *, unknown_is_home: bool = False
+) -> float:
     """Seconds spent in ``home`` across ``[start, end]`` given ordered states.
 
     Each state holds ``.state`` + ``.last_changed``; a state spans from its
     ``last_changed`` (clamped to ``start``) until the next state's, or ``end``.
+    ``unknown_is_home`` counts ``unknown``/``unavailable`` spans as present — a
+    tracker outage must not read as "nobody home" and trigger the empty-house cut.
     """
+    present = {STATE_HOME, STATE_UNKNOWN, STATE_UNAVAILABLE} if unknown_is_home else {STATE_HOME}
     ordered = sorted(states, key=lambda s: s.last_changed)
     total = 0.0
     for i, state in enumerate(ordered):
         seg_start = max(state.last_changed, start)
         seg_end = ordered[i + 1].last_changed if i + 1 < len(ordered) else end
-        if seg_end > seg_start and state.state == STATE_HOME:
+        if seg_end > seg_start and state.state in present:
             total += (seg_end - seg_start).total_seconds()
     return total
 
@@ -175,7 +180,7 @@ async def async_count_residents_home(
             if current is None or current.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, STATE_HOME):
                 count += 1
             continue
-        if home_seconds(states, start, end) >= min_seconds:
+        if home_seconds(states, start, end, unknown_is_home=True) >= min_seconds:
             count += 1
     return count
 

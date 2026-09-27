@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from homeassistant.config_entries import SOURCE_USER, ConfigSubentryData
 from homeassistant.core import HomeAssistant
@@ -36,12 +38,18 @@ async def test_hub_reconfigure(hass: HomeAssistant) -> None:
 
     result = await entry.start_reconfigure_flow(hass)
     assert result["type"] == FlowResultType.FORM
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"name": "Predictor", "predict_time": "15:30:00"}
-    )
+    reload = AsyncMock(wraps=hass.config_entries.async_reload)
+    with patch.object(hass.config_entries, "async_reload", new=reload):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"name": "Hot water", "predict_time": "15:30:00"}
+        )
+        await hass.async_block_till_done()
     assert result["type"] == FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
     assert entry.data["predict_time"] == "15:30:00"
+    # Once: the update listener reloads; the flow itself must not reload too.
+    assert reload.await_count == 1
+    assert entry.title == "Hot water"  # the hub's name field renames the entry
 
 
 async def test_add_load_subentry(hass: HomeAssistant) -> None:
@@ -61,6 +69,7 @@ async def test_add_load_subentry(hass: HomeAssistant) -> None:
             "name": "LVV",
             "delivered_energy_entity": "sensor.lvv_energy",
             "rated_power_kw": 3.0,
+            "controlled_switch_entity": "switch.lvv",
             "heating_active_entity": "binary_sensor.led",
             "tank_volume_l": 300,
             "tank_setpoint_c": 75,
@@ -78,6 +87,70 @@ async def test_add_load_subentry(hass: HomeAssistant) -> None:
     assert subentry.data["tank_setpoint_c"] == 75
     assert subentry.data["tank_cold_in_c"] == 12
     assert subentry.data["tank_boost_soc_pct"] == 20
+
+
+async def _start_load_flow(hass: HomeAssistant):
+    entry = MockConfigEntry(domain=DOMAIN, data={"name": "Predictor"})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_LOAD), context={"source": SOURCE_USER}
+    )
+    return entry, result
+
+
+@pytest.mark.parametrize(
+    ("band", "valid"),
+    [
+        ({"min_minutes": 40, "max_minutes": 40}, False),  # 45 > 40 → no step fits
+        ({"min_minutes": 200, "max_minutes": 100}, False),  # min > max
+        ({"min_minutes": 50, "max_minutes": 55}, False),  # same 15-min bucket
+        ({"min_minutes": 45, "max_minutes": 45}, True),  # exactly one step
+        ({"min_minutes": 40, "max_minutes": 240}, True),
+    ],
+)
+async def test_load_subentry_rejects_empty_runtime_band(hass: HomeAssistant, band, valid) -> None:
+    entry, result = await _start_load_flow(hass)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "LVV", "delivered_energy_entity": "sensor.e", **band}
+    )
+    if valid:
+        assert result["type"] == FlowResultType.CREATE_ENTRY
+        await hass.async_block_till_done()
+    else:
+        assert result["type"] == FlowResultType.FORM
+        assert result["errors"] == {"max_minutes": "invalid_runtime_band"}
+
+
+async def test_load_subentry_heating_detector_needs_switch(hass: HomeAssistant) -> None:
+    # Without the contactor the tank can never anchor → reject up front.
+    entry, result = await _start_load_flow(hass)
+    user_input = {
+        "name": "LVV",
+        "delivered_energy_entity": "sensor.e",
+        "heating_active_entity": "binary_sensor.led",
+    }
+    result = await hass.config_entries.subentries.async_configure(result["flow_id"], user_input)
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"heating_active_entity": "heating_needs_switch"}
+
+    # Fixing it on the re-shown form succeeds.
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {**user_input, "controlled_switch_entity": "switch.lvv"}
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+
+
+def test_load_error_strings_exist() -> None:
+    import json
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2] / "custom_components" / DOMAIN
+    for name in ("strings.json", "translations/en.json"):
+        errors = json.loads((root / name).read_text())["config_subentries"]["load"]["error"]
+        assert {"invalid_runtime_band", "heating_needs_switch"} <= set(errors)
 
 
 async def test_add_price_forecast_subentry(hass: HomeAssistant) -> None:

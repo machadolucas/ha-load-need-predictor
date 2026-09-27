@@ -12,6 +12,7 @@ Both capabilities share these two times; each coordinator does its own work.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_change
@@ -61,14 +62,24 @@ class PredictorJobs:
         """Predict + push each load, and (re)build the price forecast."""
         _LOGGER.debug("Predict job firing at %s", now)
         runtime = self.entry.runtime_data
-        await runtime.load.async_predict_and_push()
+        # Each capability is its own step: a failure in one must never skip the
+        # other (they only share the wall-clock time).
+        await _run_step("Load predict", runtime.load.async_predict_and_push())
         if runtime.forecast is not None:
-            await runtime.forecast.async_build_forecast()
+            await _run_step("Price forecast build", runtime.forecast.async_build_forecast())
 
     async def _handle_capture(self, now) -> None:
         """Capture + calibrate each load, and evaluate past forecasts."""
         _LOGGER.debug("Capture job firing at %s", now)
         runtime = self.entry.runtime_data
-        await runtime.load.async_capture_and_log()
+        await _run_step("Load capture", runtime.load.async_capture_and_log())
         if runtime.forecast is not None:
-            await runtime.forecast.async_evaluate()
+            await _run_step("Price forecast evaluation", runtime.forecast.async_evaluate())
+
+
+async def _run_step(label: str, step: Awaitable) -> None:
+    """Await one job step, logging (never raising) its failure."""
+    try:
+        await step
+    except Exception:  # noqa: BLE001 - isolate the capabilities from each other
+        _LOGGER.exception("%s job step failed", label)

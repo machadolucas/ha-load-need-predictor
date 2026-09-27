@@ -171,8 +171,22 @@ def test_clamp_minutes_respects_inward_bounds():
 
 
 def test_clamp_minutes_degenerate_config():
-    # min and max in the same 15-step bucket: still returns a valid value.
-    assert predictor.clamp_minutes(100, 50, 55) == 60
+    # No 15-step fits inside [min, max] (min and max in the same bucket): the
+    # floor-rounded cap wins — never above max_minutes (was 60 > 55 before).
+    assert predictor.clamp_minutes(100, 50, 55) == 45
+    assert predictor.clamp_minutes(10, 50, 55) == 45
+
+
+def test_clamp_minutes_min_equals_max_never_exceeds_max():
+    # A legacy min = max = 40 config: 45 would break the cap; 30 is the largest
+    # valid step ≤ 40.
+    assert predictor.clamp_minutes(200, 40, 40) == 30
+    assert predictor.clamp_minutes(0, 40, 40) == 30
+
+
+def test_clamp_minutes_degenerate_never_negative():
+    assert predictor.clamp_minutes(100, 40, 10) == 0  # max below one step
+    assert predictor.clamp_minutes(100, 40, -20) == 0  # nonsense negative max
 
 
 # ── predict_minutes (end-to-end) ─────────────────────────────────────────────
@@ -254,6 +268,60 @@ def test_update_gain_noop_for_tiny_prediction():
     assert predictor.update_gain(s, predicted_kwh=0.1, actual_kwh=9.0).gain == 1.3
 
 
+def test_update_gain_rescales_by_predicted_gain():
+    # The prediction was made with gain 1.2 and came in exact: the target is
+    # g_pred × 1.0 = 1.2, so a gain already at 1.2 stays put (the old raw-ratio
+    # EWMA would have pulled it toward 1.0).
+    s = predictor.ModelState(gain=1.2)
+    out = predictor.update_gain(s, predicted_kwh=7.0, actual_kwh=7.0, predicted_gain=1.2)
+    assert out.gain == pytest.approx(1.2)
+
+
+def test_update_gain_missing_predicted_gain_uses_current():
+    s = predictor.ModelState(gain=1.2)
+    legacy = predictor.update_gain(s, predicted_kwh=7.0, actual_kwh=7.0)
+    explicit = predictor.update_gain(s, predicted_kwh=7.0, actual_kwh=7.0, predicted_gain=1.2)
+    assert legacy.gain == pytest.approx(explicit.gain)
+
+
+@pytest.mark.parametrize(("start_gain", "true_ratio"), [(1.0, 1.3), (1.4, 0.75), (0.8, 1.3)])
+def test_gain_closed_loop_converges_to_true_ratio(start_gain, true_ratio):
+    """Predict with the current gain, observe the truth, learn — repeatedly.
+
+    Regression: with the raw ``actual / predicted`` ratio the loop's fixed
+    point was ``g = true / g`` → √true (≈ 1.14 for 1.3, ≈ 0.87 for 0.75).
+    """
+    s = predictor.ModelState(gain=start_gain)
+    fv = FeatureVector(people_home=2)
+    pre_gain = predictor.predict_kwh(replace_gain(s, 1.0), fv)  # 7.4 kWh
+    for _ in range(200):
+        predicted = predictor.predict_kwh(s, fv)  # includes the gain in force
+        actual = true_ratio * pre_gain
+        s = predictor.apply_observation(s, predicted, actual, predicted_gain=s.gain)
+    expected = min(max(true_ratio, predictor.GAIN_MIN), predictor.GAIN_MAX)
+    assert s.gain == pytest.approx(expected, abs=1e-3)
+    assert s.gain != pytest.approx(math.sqrt(true_ratio), abs=0.02)
+
+
+def test_gain_closed_loop_respects_clamps():
+    s = predictor.ModelState(gain=1.0)
+    fv = FeatureVector(people_home=2)
+    for _ in range(200):
+        predicted = predictor.predict_kwh(s, fv)
+        s = predictor.apply_observation(s, predicted, 1.9 * 7.4, predicted_gain=s.gain)
+    assert s.gain == pytest.approx(predictor.GAIN_MAX)
+
+
+def replace_gain(state, gain):
+    return predictor.ModelState(
+        e_base=state.e_base,
+        e_draw_per_person=state.e_draw_per_person,
+        guest_bonus=state.guest_bonus,
+        gain=gain,
+        empty_house_factor=state.empty_house_factor,
+    )
+
+
 def test_apply_observation_updates_gain_and_count():
     s = predictor.default_model_state()
     out = predictor.apply_observation(s, predicted_kwh=5.0, actual_kwh=10.0)
@@ -279,9 +347,32 @@ def test_blend_param_large_n_approaches_empirical():
 # ── refit_occupancy_params ───────────────────────────────────────────────────
 
 
-def test_refit_recovers_known_line():
-    # actual = 3.0 + 2.2 * people, exactly.
-    rows = [(p, 3.0 + 2.2 * p) for p in (0, 0, 1, 2, 2)]
+def _seed_rows(people_guests_gain):
+    """Rows generated *exactly* by predict_kwh with the seeds + each row's gain."""
+    rows = []
+    for people, guests, gain in people_guests_gain:
+        state = replace_gain(predictor.default_model_state(), gain)
+        kwh = predictor.predict_kwh(state, FeatureVector(people_home=people, guests=guests))
+        rows.append((people, kwh, guests, gain))
+    return rows
+
+
+def test_refit_recovers_seeds_from_predict_equation():
+    # Same equation predict_kwh uses: empty-house factor, guest bonus and the
+    # row's gain all baked into kWh — the fit must invert them.
+    rows = _seed_rows(
+        [(0, 0.0, 1.0), (0, 0.5, 1.2), (1, 0.0, 0.9), (1, 2.0, 1.1), (2, 0.0, 1.3), (2, 0.5, 1.0)]
+    )
+    e_base, e_draw = predictor.refit_occupancy_params(rows)
+    assert e_base == pytest.approx(predictor.SEED_E_BASE)
+    assert e_draw == pytest.approx(predictor.SEED_E_DRAW_PER_PERSON)
+
+
+def test_refit_legacy_two_tuples_mean_no_guests_unit_gain():
+    rows = [
+        (p, predictor.predict_kwh(predictor.default_model_state(), FeatureVector(p)))
+        for p in (0, 1, 2)
+    ]
     e_base, e_draw = predictor.refit_occupancy_params(rows)
     assert e_base == pytest.approx(3.0)
     assert e_draw == pytest.approx(2.2)
@@ -295,12 +386,35 @@ def test_refit_needs_two_rows():
     assert predictor.refit_occupancy_params([(2, 7.0)]) is None
 
 
+def test_refit_needs_zero_and_multi_person_days():
+    # Contract: ≥ 1 zero-person AND ≥ 1 multi-person (p ≥ 2) day.
+    assert predictor.refit_occupancy_params([(1, 5.2), (2, 7.4), (3, 9.6)]) is None  # no p=0
+    assert predictor.refit_occupancy_params([(0, 1.2), (1, 5.2), (1, 5.0)]) is None  # no p≥2
+
+
 def test_refit_floors_negative_at_zero():
     # A perverse downward fit must not yield negative parameters.
     rows = [(0, 10.0), (1, 5.0), (2, 0.0)]
     e_base, e_draw = predictor.refit_occupancy_params(rows)
     assert e_base >= 0.0
     assert e_draw == 0.0
+
+
+# ── energy_balance_demand ────────────────────────────────────────────────────
+
+
+def test_energy_balance_demand_refill_day_subtracts_backlog():
+    # Delivered 8.2 kWh, but the tank went from 3 kWh short to full → 5.2 drawn.
+    assert predictor.energy_balance_demand(8.2, 0.0, 3.0) == pytest.approx(5.2)
+
+
+def test_energy_balance_demand_skip_day_adds_deficit_growth():
+    # Scheduler skipped: 1 kWh in, tank got 6 kWh deeper → 7 kWh drawn.
+    assert predictor.energy_balance_demand(1.0, 7.0, 1.0) == pytest.approx(7.0)
+
+
+def test_energy_balance_demand_floored_at_zero():
+    assert predictor.energy_balance_demand(0.5, 0.0, 4.0) == 0.0
 
 
 # ── rolling_mae ──────────────────────────────────────────────────────────────

@@ -154,3 +154,15 @@ def test_learning_stays_inside_the_guardrails(week):
     assert abs(statistics.fmean(profile) - replay_tank.LIVE_HOT_FRACTION) < 0.05
     assert 60.0 <= state.standby_w <= 170.0
     assert 0.2 <= state.hysteresis_kwh <= 1.5
+
+
+def test_a_responsive_meter_keeps_its_one_tick_rate_caps(week):
+    """The slow-meter rate window must never loosen this (fast) meter's caps.
+
+    The fixture's meter steps ~2 L every ~30 s and never publishes a batch, so
+    its learned cadence must stay at one tick (≤ 1 min) on *every* tick of the
+    week — which keeps the hot-flow cap at 8 L/tick throughout. Stretching the
+    span to the meter's raw change intervals was measured to over-attribute
+    ~0.5 kWh/week of evening flow and worsen the trip residuals (rms 1.17 → 1.24).
+    """
+    assert week["max_water_cadence_min"] <= 1.0

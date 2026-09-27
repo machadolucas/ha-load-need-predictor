@@ -172,16 +172,33 @@ async def test_fit_rows_empty_without_recorder(hass: HomeAssistant) -> None:
     assert rows == []
 
 
-async def test_daily_price_mean_returns_bucket(hass: HomeAssistant) -> None:
+async def test_daily_price_mean_returns_exact_day_bucket(hass: HomeAssistant) -> None:
+    # The recorder's ``start`` is epoch *seconds* (a float) — not ms.
     day_start = dt_util.start_of_local_day()
-    bucket = int(day_start.timestamp() * 1000)
     instance = MagicMock()
     instance.async_add_executor_job = AsyncMock(
-        return_value={"sensor.price": [{"start": bucket, "mean": 0.12}]}
+        return_value={"sensor.price": [{"start": day_start.timestamp(), "mean": 0.12}]}
     )
     with patch(_GET_INSTANCE, return_value=instance):
         result = await fs.async_daily_price_mean(hass, "sensor.price", day_start)
     assert result == 0.12
+    # Only that local day is queried: [day_start, next local midnight).
+    args = instance.async_add_executor_job.await_args.args
+    assert args[2] == day_start
+    assert args[3] == day_start + timedelta(days=1)
+
+
+async def test_daily_price_mean_missing_day_is_none(hass: HomeAssistant) -> None:
+    # A later day's bucket must never stand in for a missing target day.
+    day_start = dt_util.start_of_local_day() - timedelta(days=3)
+    later = (day_start + timedelta(days=1)).timestamp()
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(
+        return_value={"sensor.price": [{"start": later, "mean": 0.2}]}
+    )
+    with patch(_GET_INSTANCE, return_value=instance):
+        result = await fs.async_daily_price_mean(hass, "sensor.price", day_start)
+    assert result is None
 
 
 async def test_daily_price_mean_none_when_empty(hass: HomeAssistant) -> None:
@@ -190,3 +207,64 @@ async def test_daily_price_mean_none_when_empty(hass: HomeAssistant) -> None:
     with patch(_GET_INSTANCE, return_value=instance):
         result = await fs.async_daily_price_mean(hass, "sensor.price", dt_util.start_of_local_day())
     assert result is None
+
+
+async def test_hourly_rows_read_epoch_seconds(hass: HomeAssistant) -> None:
+    when = datetime(2026, 9, 24, 10, tzinfo=UTC)
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(
+        return_value={
+            "sensor.price": [
+                {"start": when.timestamp(), "mean": 0.1},
+                {"start": when + timedelta(hours=1), "mean": 0.2},  # datetime tolerated
+                {"start": when.timestamp(), "mean": None},
+            ]
+        }
+    )
+    with patch(_GET_INSTANCE, return_value=instance):
+        rows = await fs.async_hourly_price_rows(hass, "sensor.price", when)
+    assert rows == [(when, 0.1), (when + timedelta(hours=1), 0.2)]
+
+
+async def test_recorder_errors_degrade_instead_of_raising(hass: HomeAssistant) -> None:
+    # A DB hiccup must not abort the forecast build: empty/None, logged.
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(side_effect=RuntimeError("database is locked"))
+    day = dt_util.start_of_local_day()
+    with patch(_GET_INSTANCE, return_value=instance):
+        assert await fs.async_fit_rows(hass, "sensor.price", "sensor.t", "sensor.w", 30) == []
+        assert await fs.async_hourly_price_rows(hass, "sensor.price", day) == []
+        assert await fs.async_daily_price_mean(hass, "sensor.price", day) is None
+
+
+async def test_statistics_request_celsius(hass: HomeAssistant) -> None:
+    # A °F temperature sensor's history is converted by the recorder.
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(return_value={})
+    with patch(_GET_INSTANCE, return_value=instance):
+        await fs.async_fit_rows(hass, "sensor.price", "sensor.t", "sensor.w", 30)
+    units = instance.async_add_executor_job.await_args.args[6]
+    assert units == {"temperature": "°C"}
+
+
+async def test_daily_temp_forecast_converts_fahrenheit(hass: HomeAssistant) -> None:
+    hass.states.async_set("weather.us", "sunny", {"temperature_unit": "°F"})
+
+    async def _forecast(call):
+        return {
+            "weather.us": {
+                "forecast": [
+                    {"datetime": "2026-06-18T12:00:00+00:00", "temperature": 41, "templow": 23},
+                    {"datetime": "2026-06-19T12:00:00+00:00", "temperature": 212},
+                ]
+            }
+        }
+
+    hass.services.async_register(
+        "weather", "get_forecasts", _forecast, supports_response=SupportsResponse.ONLY
+    )
+    out = await fs.async_daily_temp_forecast(hass, "weather.us")
+    d1 = dt_util.as_local(dt_util.parse_datetime("2026-06-18T12:00:00+00:00")).date()
+    d2 = dt_util.as_local(dt_util.parse_datetime("2026-06-19T12:00:00+00:00")).date()
+    assert out[d1] == 0.0  # mean 32 °F
+    assert out[d2] == 100.0

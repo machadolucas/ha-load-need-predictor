@@ -43,6 +43,9 @@ def test_manifest_dependencies():
     # and the statistics read guards for a missing recorder at job time.
     assert "recorder" in data["after_dependencies"]
     assert "load_scheduler" in data["after_dependencies"]
+    # frontend.py serves + registers the card through these; soft too (the card
+    # registration is best-effort and must never break setup).
+    assert {"frontend", "http"} <= set(data["after_dependencies"])
     assert data["dependencies"] == []
 
 

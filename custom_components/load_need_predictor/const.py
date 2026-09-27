@@ -119,6 +119,13 @@ FORECAST_TICK_MINUTES = 5  # cheap due-check cadence; network only when due
 RETAIL_PAIRS_DAYS = 14  # rolling buffer of (spot, buy) pairs for the mapping
 SHAPE_FIT_DAYS = 28  # hourly-LTS window for the local fallback's intraday shape
 HOURLY_LOG_ROWS = 60  # keep per-hour forecast vectors only for the recent rows
+# A forecast day is scored only once its local midnight has passed and at least
+# this many realised hours exist (mirrors the ≥ 20 forecast-hour snapshot rule),
+# so a DST/recorder-gap partial day never becomes a permanent score…
+EVAL_MIN_ACTUAL_HOURS = 20
+# …and a day still unscorable this long after it ended is marked ``unscorable``
+# instead of being re-queried every night forever.
+EVAL_GIVE_UP_DAYS = 7
 
 # Per-load UI defaults (tuned to the author's ~3 kW LVV; see CLAUDE.md data notes).
 DEFAULT_RATED_POWER_KW = 3.0

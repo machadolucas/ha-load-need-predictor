@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
@@ -40,6 +41,8 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
+    EVAL_GIVE_UP_DAYS,
+    EVAL_MIN_ACTUAL_HOURS,
     EVAL_WINDOW_DAYS,
     FORECAST_TICK_MINUTES,
     HOURLY_LOG_ROWS,
@@ -84,13 +87,20 @@ from .spot_forecast import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_DAY_MS = 86_400_000
 # A day's per-hour snapshot is only (re)written while at least this many of its
 # hours are still forecast — so a day that just became partially real (the CET
 # delivery day leaks 00:00–01:00 into the previous list) keeps its full
 # pre-publication snapshot instead of being overwritten by a sliver.
 _MIN_SNAPSHOT_HOURS = 20
 _BUTTON_MIN_REFETCH = timedelta(minutes=15)
+# A persisted ``next_fetch`` further out than this is not a real backoff (clock
+# jump, corrupt file) — ignore it rather than go silent. Generous on purpose: a
+# server-directed ``Retry-After`` of days must survive a reload.
+_MAX_RESTORED_BACKOFF = timedelta(days=7)
+_ISSUE_PREFIX = "wattcast_unreachable_"
+# Source tag of slots priced from Wattcast's *settled* spot (not a forecast):
+# never snapshotted/scored as a forecast source.
+_SRC_KNOWN = "wattcast_known"
 
 
 @dataclass
@@ -123,7 +133,8 @@ class ForecastResult:
 
 @dataclass
 class _FetchState:
-    """Per-subentry polling bookkeeping (``failing_since``/``last_error`` persist)."""
+    """Per-subentry polling bookkeeping (all of it persists, so a reload keeps a
+    failure backoff / ``Retry-After`` and the button still sees the failures)."""
 
     next_fetch: datetime | None = None
     failures: int = 0
@@ -152,6 +163,57 @@ def _parse_iso(value) -> datetime | None:
     return dt_util.as_utc(parsed) if parsed is not None else None
 
 
+def _extends(new: WattcastSeries, old: WattcastSeries) -> bool:
+    """True if ``new`` reaches strictly further (forecast or settled) than ``old``."""
+    floor = datetime.min.replace(tzinfo=UTC)
+    return (new.coverage_end or floor) > (old.coverage_end or floor) or (new.known_end or floor) > (
+        old.known_end or floor
+    )
+
+
+def _fingerprint(cfg: PriceForecastConfig) -> dict[str, str | None]:
+    """What makes the cached series / pairs / scores belong to *this* market.
+
+    The Wattcast cache is a zone's spot series; the mapping pairs join that
+    spot to a contract's buy price (``price_entity`` / ``price_series_entity``);
+    the scores compare a zone's forecast with that contract's realised price.
+    Keyed only by subentry id, a reconfigure (FI → EE) would otherwise restore
+    the old market's prices and learning.
+    """
+    return {
+        "zone": cfg.wattcast_zone,
+        "price_entity": cfg.price_entity,
+        "price_series_entity": cfg.price_series_entity,
+    }
+
+
+@callback
+def async_delete_stale_wattcast_issues(
+    hass: HomeAssistant, *, exclude_entry_id: str | None = None
+) -> None:
+    """Delete ``wattcast_unreachable_<sid>`` issues whose subentry is gone.
+
+    An issue is otherwise only cleared by a success or by turning Wattcast
+    off, so removing the subentry (or the whole hub) left it behind. Pass
+    ``exclude_entry_id`` from ``async_remove_entry`` to also drop that hub's.
+    """
+    keep = {
+        subentry_id
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.entry_id != exclude_entry_id
+        for subentry_id, subentry in entry.subentries.items()
+        if subentry.subentry_type == SUBENTRY_TYPE_PRICE_FORECAST
+    }
+    registry = ir.async_get(hass)
+    for domain, issue_id in list(registry.issues):
+        if (
+            domain == DOMAIN
+            and issue_id.startswith(_ISSUE_PREFIX)
+            and issue_id.removeprefix(_ISSUE_PREFIX) not in keep
+        ):
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+
 class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]]):
     """Fetches/caches Wattcast, fits the fallback, builds + scores the forecast."""
 
@@ -163,6 +225,7 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
         )
         self._store = PredictorStore(hass, entry.entry_id, ".forecast")
         self._lock = asyncio.Lock()
+        self._closing = False  # set by async_flush: no further saves
         self._unsub_tick = None
         # Local fallback model.
         self.models: dict[str, FittedModel | None] = {}
@@ -182,6 +245,8 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
         self.days: dict[str, list[dict]] = {}
         self.primary: dict[str, str] = {}
         self.known_until: dict[str, datetime | None] = {}
+        self._built_end: dict[str, datetime] = {}  # horizon end of the last rebuild
+        self._fingerprints: dict[str, dict] = {}  # config the loaded state belongs to
         self.log: dict[str, list[dict]] = {}
         self.eval_errors: dict[str, list[float]] = {}
 
@@ -189,6 +254,8 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
 
     async def async_load_runtime(self) -> None:
         data = await self._store.async_load()
+        configs = self.forecast_configs()
+        now = dt_util.utcnow()
         for subentry_id, payload in data.items():
             self.models[subentry_id] = FittedModel.from_dict(payload.get("model"))
             self.log[subentry_id] = list(payload.get("log", []))
@@ -203,14 +270,64 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
             self.wattcast[subentry_id] = WattcastSeries.from_dict(cache.get("series"))
             self.fetched_at[subentry_id] = _parse_iso(cache.get("fetched_at"))
             fetch = payload.get("fetch") or {}
+            next_fetch = _parse_iso(fetch.get("next_fetch"))
+            if next_fetch is not None and next_fetch - now > _MAX_RESTORED_BACKOFF:
+                next_fetch = None
+            try:
+                failures = max(0, int(fetch.get("failures") or 0))
+            except (TypeError, ValueError):
+                failures = 0
             self.fetch[subentry_id] = _FetchState(
+                # None (a pre-fix payload) → derived from fetched_at on the first tick.
+                next_fetch=next_fetch,
+                failures=failures,
                 failing_since=_parse_iso(fetch.get("failing_since")),
                 last_error=fetch.get("last_error"),
             )
+            stored = payload.get("fingerprint")
+            if subentry_id in configs and isinstance(stored, Mapping):
+                # A payload without a fingerprint predates it: adopt, don't wipe.
+                current = _fingerprint(configs[subentry_id])
+                self._invalidate(
+                    subentry_id, {key for key, value in current.items() if stored.get(key) != value}
+                )
+        # The config this state now belongs to. Captured here, not re-read at
+        # save time: a reconfigure updates the subentry *before* the unload
+        # flush, which would otherwise stamp the old state with the new config.
+        self._fingerprints = {sid: _fingerprint(cfg) for sid, cfg in configs.items()}
+        async_delete_stale_wattcast_issues(self.hass)
+
+    def _invalidate(self, subentry_id: str, changed: set[str]) -> None:
+        """Drop the state that belonged to the previous market/contract."""
+        if not changed:
+            return
+        _LOGGER.info(
+            "Price forecast %s: %s changed; discarding the state learned for the old value",
+            subentry_id,
+            ", ".join(sorted(changed)),
+        )
+        # Every key feeds the (spot, buy) pairs: a new zone's spot, a new
+        # contract's buy, or a new series's slots.
+        self.pairs[subentry_id] = []
+        self.mapping.pop(subentry_id, None)
+        if changed & {"zone", "price_entity"}:
+            # Snapshots/scores pit a zone's forecast against a contract's prices.
+            self.log[subentry_id] = []
+            self.eval_errors[subentry_id] = []
+        if "zone" in changed:
+            # The cache is another zone's series: fetch now, not at the next issue.
+            self.wattcast[subentry_id] = None
+            self.fetched_at[subentry_id] = None
+            self.fetch[subentry_id] = _FetchState()
+            ir.async_delete_issue(self.hass, DOMAIN, self._issue_id(subentry_id))
+        if "price_entity" in changed:
+            # Fit on the old contract's history; the next build refits from the new one.
+            self.models[subentry_id] = None
+            self.shape[subentry_id] = {}
 
     def _runtime_snapshot(self) -> dict:
         out: dict = {}
-        for subentry_id in self.forecast_configs():
+        for subentry_id, cfg in self.forecast_configs().items():
             model = self.models.get(subentry_id)
             series = self.wattcast.get(subentry_id)
             mapping = self.mapping.get(subentry_id)
@@ -229,19 +346,35 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
                     "fetched_at": _iso(self.fetched_at.get(subentry_id)),
                 },
                 "fetch": {
+                    "next_fetch": _iso(fetch.next_fetch),
+                    "failures": fetch.failures,
                     "failing_since": _iso(fetch.failing_since),
                     "last_error": fetch.last_error,
                 },
+                "fingerprint": self._fingerprints.get(subentry_id) or _fingerprint(cfg),
             }
         return out
 
     def async_persist(self) -> None:
+        if self._closing:
+            return
         self._store.async_schedule_save(self._runtime_snapshot)
 
     async def async_flush(self) -> None:
-        """Write now (on unload) so a reload can't read a stale cache."""
-        if self.has_loads:
-            await self._store.async_save_now(self._runtime_snapshot())
+        """Drain in-flight work, stop further writes, and save now (on unload).
+
+        A tick already awaiting the Wattcast HTTP call survives the timer's
+        unsubscribe; without the lock + closing flag it could finish after the
+        reload and overwrite the new coordinator's cache/backoff/fingerprint.
+        """
+        async with self._lock:
+            self._closing = True
+            if self.has_loads:
+                await self._store.async_save_now(self._runtime_snapshot())
+
+    def async_reopen(self) -> None:
+        """Undo :meth:`async_flush`'s closing flag (the unload failed)."""
+        self._closing = False
 
     def forecast_configs(self) -> dict[str, PriceForecastConfig]:
         out: dict[str, PriceForecastConfig] = {}
@@ -293,11 +426,17 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
                     if outcome is None:
                         outcome = await async_fetch_wattcast(self.hass, cfg.wattcast_zone)
                         memo[cfg.wattcast_zone] = outcome
-                    if outcome.series is not None:
-                        self._on_fetch_success(subentry_id, cfg, outcome.series, now)
-                        fetched = True
-                    else:
+                    if outcome.series is None:
                         self._on_fetch_failure(subentry_id, cfg, outcome, now)
+                    else:
+                        verdict, reason = self._judge(subentry_id, outcome.series, now)
+                        if verdict == "degraded":
+                            self._on_fetch_degraded(subentry_id, cfg, reason, now)
+                        elif verdict == "unchanged":
+                            self._on_fetch_unchanged(subentry_id, now)
+                        else:
+                            self._on_fetch_success(subentry_id, cfg, outcome.series, now)
+                            fetched = True
                     changed = True
                 real_end = self._real_end(subentry_id, cfg)
                 if fetched:
@@ -307,13 +446,60 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
                     fetched
                     or force_rebuild
                     or real_end != self.known_until.get(subentry_id)
-                    or subentry_id not in self.slots
+                    or self._expired(subentry_id, cfg, now)
                 ):
                     self._rebuild(subentry_id, cfg, now)
                     changed = True
             if changed:
                 self.async_persist()
                 await self.async_refresh()
+
+    def _expired(self, subentry_id: str, cfg: PriceForecastConfig, now: datetime) -> bool:
+        """Whether the published series has aged, independent of any fetch.
+
+        During an outage (fetches failing, real-price boundary unchanged)
+        nothing else triggers a rebuild, so without this, past slots — and in
+        the end a past-only series — would stay published as "ok". Cheap: at
+        most one rebuild per 15-min slot boundary plus one per local midnight.
+        """
+        slots = self.slots.get(subentry_id)
+        if slots is None:
+            return True
+        if slots and (end := _parse_iso(slots[0].get("end"))) is not None and end <= now:
+            return True  # the first published slot is over
+        return self._horizon_end(cfg) != self._built_end.get(subentry_id)  # new local day
+
+    def _horizon_end(self, cfg: PriceForecastConfig) -> datetime:
+        return dt_util.start_of_local_day() + timedelta(days=cfg.forecast_days + 1)
+
+    def _judge(
+        self, subentry_id: str, series: WattcastSeries, now: datetime
+    ) -> tuple[str, str | None]:
+        """Whether a parsed HTTP 200 may replace the cache.
+
+        ``("accept", None)`` — a newer issue (or nothing cached); ``("unchanged",
+        None)`` — the cached issue again, adding nothing (a button press or a
+        late re-issue): keep the cache and its bookkeeping, just wait for the
+        next issue; ``("degraded", why)`` — it would make things worse.
+
+        Issue order is enforced whatever the cache's coverage: an *older* issue
+        (a lagging edge cache) never replaces a newer one, even an expired one.
+        A newer issue without forecast still ahead never replaces a usable cache
+        (with no usable cache, even a known-only response is worth taking: its
+        settled spot feeds the mapping and the ``wattcast_known`` slots).
+        """
+        cached = self.wattcast.get(subentry_id)
+        if cached is None:
+            return "accept", None
+        if series.made_at and cached.made_at:
+            if series.made_at < cached.made_at:
+                return "degraded", "response older than the cached forecast"
+            if series.made_at == cached.made_at and not _extends(series, cached):
+                return "unchanged", None
+        usable = cached.coverage_end is not None and cached.coverage_end > now
+        if usable and (series.coverage_end is None or series.coverage_end <= now):
+            return "degraded", "response without forecast"
+        return "accept", None
 
     def _fetch_due(self, subentry_id: str, now: datetime) -> bool:
         state = self.fetch.setdefault(subentry_id, _FetchState())
@@ -357,7 +543,44 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
             outcome.error,
             delay,
         )
-        if now - state.failing_since >= timedelta(hours=WATTCAST_ISSUE_AFTER_H):
+        self._maybe_raise_issue(subentry_id, cfg, outcome.error, now)
+
+    def _on_fetch_unchanged(self, subentry_id: str, now: datetime) -> None:
+        """The cached issue confirmed: not a replacement, not a failure.
+
+        ``fetched_at`` moves (we did reach the server, and it rate-limits the
+        button); the series, mapping and failure bookkeeping stay as they are.
+        A server stuck on one issue still shows as stale via the issue age.
+        """
+        self.fetched_at[subentry_id] = now
+        self.fetch.setdefault(subentry_id, _FetchState()).next_fetch = _next_issue_fetch(now)
+
+    def _on_fetch_degraded(
+        self, subentry_id: str, cfg: PriceForecastConfig, reason: str, now: datetime
+    ) -> None:
+        """A 200 that would downgrade the cache: keep the cache, count it as failing.
+
+        Not a transport failure, so no retry ladder: the server re-issues
+        hourly, and a sooner retry would only get the same issue again — the
+        next request waits for the next issue, exactly like a success (no extra
+        requests). It still keeps the failure clock running, so a server that
+        stays degraded for hours raises the repair issue.
+        """
+        state = self.fetch.setdefault(subentry_id, _FetchState())
+        if state.last_error != reason:
+            _LOGGER.warning("Wattcast %s; keeping the cached forecast", reason)
+        state.failing_since = state.failing_since or now
+        state.last_error = reason
+        state.next_fetch = _next_issue_fetch(now)
+        self._maybe_raise_issue(subentry_id, cfg, reason, now)
+
+    def _maybe_raise_issue(
+        self, subentry_id: str, cfg: PriceForecastConfig, error: str | None, now: datetime
+    ) -> None:
+        state = self.fetch.setdefault(subentry_id, _FetchState())
+        if state.failing_since and now - state.failing_since >= timedelta(
+            hours=WATTCAST_ISSUE_AFTER_H
+        ):
             last = self.fetched_at.get(subentry_id)
             ir.async_create_issue(
                 self.hass,
@@ -372,12 +595,12 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
                     "last_success": dt_util.as_local(last).strftime("%Y-%m-%d %H:%M")
                     if last
                     else "never",
-                    "error": outcome.error or "unknown",
+                    "error": error or "unknown",
                 },
             )
 
     def _issue_id(self, subentry_id: str) -> str:
-        return f"wattcast_unreachable_{subentry_id}"
+        return f"{_ISSUE_PREFIX}{subentry_id}"
 
     def _update_mapping(
         self, subentry_id: str, cfg: PriceForecastConfig, series: WattcastSeries, now: datetime
@@ -427,7 +650,11 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
         for subentry_id, cfg in self.forecast_configs().items():
             if only is not None and subentry_id != only:
                 continue
-            await self._refit_local(subentry_id, cfg)
+            try:
+                await self._refit_local(subentry_id, cfg)
+            except Exception:
+                # Never let a bad fit skip the rebuild below (or other subentries).
+                _LOGGER.exception("Refitting the local price model failed; keeping the old fit")
             await self._refresh_local(subentry_id, cfg)
             series = self.wattcast.get(subentry_id) if cfg.use_wattcast else None
             if series is not None:
@@ -442,7 +669,9 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
                 fetched_at = self.fetched_at.get(subentry_id)
                 now = dt_util.utcnow()
                 fresh = fetched_at is not None and now - fetched_at < _BUTTON_MIN_REFETCH
-                if not state.failures and not fresh:
+                # ``last_error`` also covers a degraded 200, whose deadline is the
+                # next issue — pressing again would only re-fetch the same one.
+                if not state.failures and state.last_error is None and not fresh:
                     state.next_fetch = now
         await self.async_tick(force_rebuild=True)
 
@@ -472,16 +701,21 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
 
     async def _refresh_local(self, subentry_id: str, cfg: PriceForecastConfig) -> None:
         """Daily local-fallback prices for every day of the horizon."""
-        wind_daily = (
-            daily_wind_means_gw(await async_wind_series_gw(self.hass, cfg.wind_entity))
-            if cfg.wind_entity
-            else {}
-        )
-        temp_daily = (
-            await async_daily_temp_forecast(self.hass, cfg.weather_entity)
-            if cfg.weather_entity
-            else {}
-        )
+        try:
+            wind_daily = (
+                daily_wind_means_gw(await async_wind_series_gw(self.hass, cfg.wind_entity))
+                if cfg.wind_entity
+                else {}
+            )
+            temp_daily = (
+                await async_daily_temp_forecast(self.hass, cfg.weather_entity)
+                if cfg.weather_entity
+                else {}
+            )
+        except Exception:
+            # Keep the previous local forecast; the tick/rebuild must still run.
+            _LOGGER.exception("Reading the local price-forecast inputs failed")
+            return
         model = self.models.get(subentry_id)
         clim = self.wind_clim.get(subentry_id)
         if clim is None and model is not None:
@@ -512,10 +746,16 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
         start = _floor_slot(now)
         if real_end is not None and real_end > start:
             start = real_end
-        end = dt_util.start_of_local_day() + timedelta(days=cfg.forecast_days + 1)
+        end = self._horizon_end(cfg)
+        self._built_end[subentry_id] = end
         series = self.wattcast.get(subentry_id) if cfg.use_wattcast else None
-        if series is not None and (series.coverage_end is None or series.coverage_end <= start):
-            series = None  # nothing left in the cache that's still ahead of us
+        if series is not None and not any(
+            edge is not None and edge > start for edge in (series.coverage_end, series.known_end)
+        ):
+            # Nothing left in the cache that's still ahead of us — neither
+            # forecast nor settled spot (a known-only series still prices the
+            # hours a lagging real-price entity hasn't published).
+            series = None
         mapping = self.mapping.get(subentry_id) or seed_mapping(cfg.vat)
         local_daily = self.local_daily.get(subentry_id, {})
         shape = self.shape.get(subentry_id) or None
@@ -542,20 +782,29 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
             candidates["wattcast_raw"] = _build("wattcast_raw")
         if local_daily:
             candidates["local"] = _build("local")
+        # Settled-spot slots are near-truth, not forecast: never snapshot/score them.
+        candidates = {
+            src: [s for s in slots if s.get("src") != _SRC_KNOWN]
+            for src, slots in candidates.items()
+        }
         available = [src for src, slots in candidates.items() if slots]
         primary = select_primary(self._scores(subentry_id), available=available)
         self.primary[subentry_id] = primary
 
-        # Published: the primary everywhere it reaches, the local fallback beyond.
+        # Published, per slot: Wattcast's settled spot where it runs ahead of the
+        # real-price entity, then the primary where it reaches, the other
+        # forecast source where it doesn't (a local primary with weather for
+        # only a few days must not drop the Wattcast days beyond).
         slots = build_slots(
             start=start,
             end=end,
             tz=tz,
-            wattcast=series if primary != "local" else None,
+            wattcast=series,
             variant=primary if primary != "local" else "wattcast",
             mapping=mapping,
             local_daily=local_daily,
             shape=shape,
+            prefer_local=primary == "local",
         )
         self.slots[subentry_id] = slots
         self.days[subentry_id] = self._day_summaries(subentry_id, slots, tz)
@@ -637,34 +886,50 @@ class PriceForecastCoordinator(DataUpdateCoordinator[dict[str, ForecastResult]])
 
     async def async_evaluate(self) -> None:
         """Score each past forecast (per source) against the realised prices."""
-        now_ms = dt_util.utcnow().timestamp() * 1000
+        now = dt_util.utcnow()
         tz = dt_util.get_default_time_zone()
         async with self._lock:
             for subentry_id, cfg in self.forecast_configs().items():
                 if not cfg.price_entity:
                     continue
                 for entry in self.log.get(subentry_id, []):
-                    if entry.get("actual") is not None or entry.get("predicted") is None:
+                    if (
+                        entry.get("actual") is not None
+                        or entry.get("predicted") is None
+                        or entry.get("unscorable")
+                    ):
                         continue
                     bucket_ms = entry.get("bucket_ms")
-                    if bucket_ms is None or bucket_ms + _DAY_MS > now_ms:
-                        continue  # day not fully realised yet
+                    if bucket_ms is None:
+                        continue
                     day_start = datetime.fromtimestamp(bucket_ms / 1000, tz=UTC)
                     # Local midnight to local midnight (wall-clock +1 day), so a
-                    # 25-hour DST day isn't cut short by an hour.
-                    day_end = dt_util.as_local(day_start) + timedelta(days=1)
+                    # 25-hour DST day is neither cut short nor — at the 23:55
+                    # capture on the fall-back day — finalised an hour early.
+                    day_end = dt_util.as_utc(dt_util.as_local(day_start) + timedelta(days=1))
+                    if day_end > now:
+                        continue  # day not fully realised yet
                     rows = await async_hourly_price_rows(
                         self.hass, cfg.price_entity, day_start, day_end
                     )
                     actual_vec = hourly_vectors(
                         [{"start": when.isoformat(), "buy": value} for when, value in rows], tz
                     ).get(entry["date"])
-                    actual = daily_mean(actual_vec) if actual_vec else None
-                    if actual is None:
+                    hours = sum(v is not None for v in actual_vec or ())
+                    actual = None
+                    if hours >= EVAL_MIN_ACTUAL_HOURS:
+                        actual = daily_mean(actual_vec)
+                    elif not hours:
+                        # No hourly LTS at all → the daily mean (exact day only).
                         actual = await async_daily_price_mean(
                             self.hass, cfg.price_entity, day_start
                         )
+                    else:
+                        actual_vec = None  # a partial day: retry, never score it
                     if actual is None:
+                        # Retry nightly (a recorder may backfill), but not forever.
+                        if now - day_end >= timedelta(days=EVAL_GIVE_UP_DAYS):
+                            entry["unscorable"] = True
                         continue
                     entry["actual"] = round(actual, 5)
                     error = abs(entry["predicted"] - actual)

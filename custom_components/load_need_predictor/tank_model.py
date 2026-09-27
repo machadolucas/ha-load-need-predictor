@@ -133,6 +133,25 @@ MAX_PLAUSIBLE_FLOW_LPM = 30.0
 # A missing reading below this age is a blip: wait (draw 0), the cumulative meter
 # catches up. Beyond it, fall back to the occupancy estimate.
 WATER_STALE_AFTER_S = 900.0
+# Slow meters: a meter that publishes a 50 L step every 10 min re-reports the same
+# value on every tick in between, so "time since the previous read" (one tick)
+# would present the whole step as one minute of flow — a misread for the 30 L/min
+# guard, and clipped to 8 L by the hot-flow cap. The rate span may therefore
+# stretch back over the meter's own change-to-change interval (its
+# ``last_changed`` stamps), but only as far as the meter's learned publish
+# cadence (``water_cadence_min``) and never past this window. The cadence starts
+# at one tick and is raised only on *evidence of batching*: a step physically
+# impossible over the current span (> MAX_PLAUSIBLE_FLOW_LPM — no plumbing does
+# that, so it's an OCR misread or a batched publish) yet plausible over the
+# meter's own change interval. The hot-flow cap is deliberately not the trigger:
+# a > 8 L/min tick is a real hose/appliance fill and says nothing about batching.
+# Why gate at all instead of always stretching: the replayed week (a responsive
+# meter stepping ~2 L every ~30 s) showed stretching its 9–17 L evening steps
+# attributes ~0.5 kWh/week more hot draw and worsens the trip residuals (rms
+# 1.17 → 1.24 kWh) — for a fast meter the one-tick cap is right, and isolated
+# small draws minutes apart must not loosen it. Time the meter was *not*
+# observed at all (a dropout, a restart) always counts in full.
+WATER_RATE_WINDOW_MIN = 15.0
 
 # ── Energy-counter guards ─────────────────────────────────────────────────────
 # A cumulative counter that steps *down* by less than this is a restore-after-
@@ -144,6 +163,10 @@ COUNTER_ROLLBACK_TOL_KWH = 1.0
 # between steps the element's on-time × rated power fills in (capped so a stalled
 # counter can't run it away).
 LED_SMOOTHING_CAP_KWH = 1.0
+# There is deliberately no "implausibly fast" energy-delta guard: after a restart
+# a stale intermediate reading followed by the real one looks exactly like a jump,
+# and silently discarding delivered energy is the failure the replay exists to
+# catch. Entity swaps are handled by ``rebind_sources``, units by the tracker.
 
 # ── Anchor thresholds ─────────────────────────────────────────────────────────
 # Sustained-state requirements for the *transition*: the element must have been
@@ -162,6 +185,9 @@ FIRST_INSTALL_DEFICIT_FRACTION = 0.5
 # Hysteresis: after a boost, SoC must climb this many points above the threshold
 # before another can arm — stops thrash around the trigger line.
 BOOST_REARM_MARGIN_PCT = 15.0
+# …but never above 100 %: a high threshold (e.g. 90 + 15) could otherwise never
+# re-arm. The control ledger reads exactly 100 at an anchor, so a trip re-arms.
+BOOST_REARM_MAX_PCT = 100.0
 BOOST_MIN_INTERVAL_H = 6.0  # rate limit: at most one boost re-plan per 6 h
 
 # ── Human-readable helpers ────────────────────────────────────────────────────
@@ -238,7 +264,10 @@ class TankState:
     can close the balance; ``pending_fallback_kwh`` is fallback draw charged since
     the last valid meter read, reconciled out of the next metered delta so an OCR
     dropout doesn't double-count. ``boost_armed`` / ``last_boost_iso`` back the
-    low-charge boost hysteresis + rate limit. ``hot_fraction`` is kept as the mean
+    low-charge boost hysteresis + rate limit. ``water_changed_iso`` /
+    ``water_cadence_min`` time the water meter's own steps (the slow-meter rate
+    window) and ``*_source`` names the entity each baseline came from, so a
+    reconfigured counter re-baselines. ``hot_fraction`` is kept as the mean
     of ``hot_fraction_profile`` (an empty profile means "all buckets = hot_fraction",
     which is how pre-v2 stored state migrates).
     """
@@ -269,6 +298,17 @@ class TankState:
     cycle_relax_kwh: float = 0.0  # post-trip relaxation accrued and not yet paid by energy in
     cycle_hot_liters_by_bucket: tuple[float, ...] = _ZERO_PROFILE
     led_kwh_since_counter: float = 0.0
+    # When the water reading last *changed* ("" ⇒ unknown: the span falls back to
+    # "since the last read") — the slow-meter rate window, see WATER_RATE_WINDOW_MIN.
+    water_changed_iso: str = ""
+    # The water meter's learned publish cadence (minutes; 0 ⇒ unknown ⇒ one-tick
+    # spans): how far a delta's rate span may stretch. Raised only on evidence of
+    # batched publishing, see :func:`_resolve_draw`.
+    water_cadence_min: float = 0.0
+    # Which entity each baseline came from ("" ⇒ unknown, adopted as-is): a
+    # reconfigured counter must re-baseline, not dump its whole difference.
+    energy_source: str = ""
+    water_source: str = ""
     version: str = TANK_VERSION
 
 
@@ -303,6 +343,9 @@ class TickInputs:
     empty_house_factor: float
     rated_power_kw: float | None = None
     local_hour: int | None = None
+    # When the water reading last changed on the meter's side (the entity's
+    # ``last_changed``); ``None`` ⇒ unknown, the tick time stands in.
+    water_changed_iso: str | None = None
 
 
 @dataclass(frozen=True)
@@ -424,11 +467,11 @@ def water_delta(
     reading (keep the baseline and wait) or no baseline yet (adopt the reading),
     or the implied flow is impossible — negative, or faster than ``max_flow_lpm``
     over ``span_min`` — in which case it is treated as a misread and we
-    re-baseline. The span is the time since the previous valid read (the baseline
-    stamp advances on every valid read, changed or not), so it is one tick in
-    steady state and the whole gap after a restart: a legitimate multi-litre delta
-    that accumulated while HA was down still passes, while the same delta over a
-    single tick is correctly rejected.
+    re-baseline. The caller's span (:func:`_water_span_minutes`) covers the
+    whole unobserved gap plus, for a meter with a demonstrated slow publish
+    cadence, its own change-to-change interval — so a delta that accumulated
+    while HA was down, or behind a slow meter's cadence, still passes, while the
+    same delta from a fast meter over a single tick is correctly rejected.
     """
     if reading_l is None:
         return None, baseline
@@ -446,10 +489,11 @@ def hot_attributable_liters(
     """Litres of the metered draw plausibly heated (taps/showers only).
 
     Water above the hot-flow rate cap over ``span_min`` is cold-only usage (garden
-    hose, appliance fill) and is *not* charged to the tank. The span is the time
-    since the previous valid meter read — normally one tick, so this is in effect
-    an 8 L/tick cap, but the whole gap after a restart, so a delta that accumulated
-    while HA was down is not clipped.
+    hose, appliance fill) and is *not* charged to the tank. The span is the same
+    one the misread guard uses — one tick for a fast meter (an 8 L/tick cap), a
+    slow meter's own step interval (≤ ``WATER_RATE_WINDOW_MIN``), and the whole
+    gap after a restart, so a delta that accumulated while HA was down is not
+    clipped.
     """
     return min(max(0.0, delta_liters), max_hot_flow_lpm * max(span_min, 1.0))
 
@@ -651,19 +695,92 @@ def learn_from_cycle(
     )
 
 
+def _water_span_minutes(state: TankState, inputs: TickInputs, elapsed_min: float) -> float:
+    """Minutes the current water delta is spread over, for the rate guards.
+
+    Time since the last *read* always counts (nothing was observed then — a
+    dropout or restart gap) and is the floor, so this is never stricter than the
+    one-tick span. On top of that, the meter's own change-to-change interval
+    (previous reading's change stamp → this reading's) counts up to its learned
+    cadence floor (≤ ``WATER_RATE_WINDOW_MIN``), because a slow meter re-reports
+    the same value until its next step. With no change stamp or no cadence yet
+    it is the old "since the last read".
+    """
+    since_read = _span_minutes(state.water_baseline_iso, inputs.now_iso, elapsed_min)
+    if not state.water_changed_iso or state.water_cadence_min <= 0:
+        return since_read
+    changed_now = inputs.water_changed_iso or inputs.now_iso
+    between_changes = _span_minutes(state.water_changed_iso, changed_now, since_read)
+    stretch = min(state.water_cadence_min, WATER_RATE_WINDOW_MIN)
+    return max(since_read, min(between_changes, stretch))
+
+
+def rebind_sources(state: TankState, energy_source: str, water_source: str) -> TankState:
+    """Re-baseline any counter whose source entity changed since its baseline.
+
+    Baselines are raw readings of *one* entity: a reconfigured counter (e.g. a
+    powercalc ``_2`` re-add) reading higher would otherwise land its whole
+    difference in a single tick — the tank reads full and the cycle closes on a
+    bogus residual. A changed source therefore drops that baseline (the next
+    reading is adopted with no delta) and dirties the cycle, whose balance now
+    spans two meters. An empty stored source is state from before this was
+    recorded: adopt the current one as-is, so an upgrade loses nothing.
+    """
+    updates: dict = {}
+    if state.energy_source != energy_source:
+        updates["energy_source"] = energy_source
+        if state.energy_source:
+            updates.update(energy_baseline_kwh=None, cycle_clean=False)
+    if state.water_source != water_source:
+        updates["water_source"] = water_source
+        if state.water_source:
+            updates.update(
+                water_baseline_l=None,
+                water_baseline_iso="",
+                water_changed_iso="",
+                pending_fallback_kwh=0.0,
+                cycle_clean=False,
+            )
+    return replace(state, **updates) if updates else state
+
+
+@dataclass(frozen=True)
+class _WaterTick:
+    """One tick's draw decision + the water meter's new bookkeeping.
+
+    ``hot_liters`` (0 unless the meter was valid) is what accumulates into the
+    cycle, so learning uses the same capped attribution as the deficit.
+    """
+
+    draw_kwh: float
+    source: str
+    clean: bool
+    hot_liters: float
+    baseline_l: float | None
+    baseline_iso: str
+    changed_iso: str
+    cadence_min: float
+    pending_kwh: float
+
+
 def _resolve_draw(
     state: TankState,
     params: TankParams,
     inputs: TickInputs,
     elapsed_min: float,
     hot_fraction: float,
-) -> tuple[float, str, bool, float, float | None, str, float]:
-    """Decide this tick's draw + water bookkeeping.
+) -> _WaterTick:
+    """Decide this tick's draw + water bookkeeping (meter / fallback / none).
 
-    Returns ``(draw_kwh, draw_source, tick_clean, metered_hot_liters,
-    new_water_baseline_l, new_water_baseline_iso, new_pending_fallback_kwh)``.
-    ``metered_hot_liters`` (0 unless the meter was valid) is what accumulates into
-    the cycle so learning uses the same capped attribution as the deficit.
+    Also trains the meter's publish cadence, from *validated* evidence only: a
+    valid step arriving faster than the learned cadence lowers it (the meter just
+    proved it publishes that quickly); a step impossible over the current span
+    but plausible over the meter's own change interval is evidence of batched
+    publishing and raises it. That evidencing step is itself still rejected — it
+    can't yet be told from an OCR spike — and the meter's next step settles it.
+    Adoptions, rollbacks/resets (negative deltas), steps implausible even over
+    their own interval, and ordinary valid steps slower than the cadence (e.g.
+    isolated small draws minutes apart) never raise it.
     """
     fallback = fallback_draw_kwh(
         inputs.e_base,
@@ -674,19 +791,56 @@ def _resolve_draw(
         elapsed_min,
     )
     reading = inputs.water_counter_l
+    now_iso = inputs.now_iso
+    cadence = state.water_cadence_min
+    # The reading's own change time (meter-side), for the next delta's span.
+    reading_changed_iso = inputs.water_changed_iso or now_iso
+    if reading is not None and state.water_baseline_l is None:
+        # First reading (fresh install, or a baseline dropped at an anchor /
+        # source change): nothing to measure against yet, so adopt it with zero
+        # draw. That is not a data-quality problem — the cycle stays clean (an
+        # anchor that dropped the baseline already dirtied its own cycle). Any
+        # pending fallback has no baseline to reconcile against → dropped.
+        return _WaterTick(
+            0.0, "none", True, 0.0, reading, now_iso, reading_changed_iso, cadence, 0.0
+        )
     if reading is not None:
-        span_min = _span_minutes(state.water_baseline_iso, inputs.now_iso, elapsed_min)
+        span_min = _water_span_minutes(state, inputs, elapsed_min)
         delta, _ = water_delta(state.water_baseline_l, reading, span_min)
+        # The meter's own interval for this step (None without a change stamp).
+        between = (
+            _span_minutes(state.water_changed_iso, reading_changed_iso, 0.0)
+            if state.water_changed_iso
+            else None
+        )
         if delta is not None:
             # Valid metered draw: charge the hot portion, netting off any fallback
             # already charged since the baseline (floored so it can't go negative).
             hot = hot_attributable_liters(delta, span_min)
             raw = draw_kwh_from_liters(hot, hot_fraction, params.setpoint_c, params.cold_in_c)
             draw = max(0.0, raw - state.pending_fallback_kwh)
-            return draw, "meter", True, hot, reading, inputs.now_iso, 0.0
+            if delta > 0 and between is not None and 0.0 < between < cadence:
+                cadence = between  # a valid step this fast: the meter isn't that slow
+            # Only a *change* moves the change stamp: an unchanged re-report must
+            # not shrink a slow meter's next step into one tick of flow.
+            changed_iso = (
+                reading_changed_iso
+                if delta > 0
+                else (state.water_changed_iso or reading_changed_iso)
+            )
+            return _WaterTick(draw, "meter", True, hot, reading, now_iso, changed_iso, cadence, 0.0)
+        raw_delta = reading - state.water_baseline_l
+        if raw_delta > 0 and between is not None:
+            own_span = min(between, WATER_RATE_WINDOW_MIN)
+            if own_span > span_min and raw_delta <= MAX_PLAUSIBLE_FLOW_LPM * own_span:
+                # Impossible over the current span, plausible over the meter's own
+                # interval → it publishes in batches: learn that cadence.
+                cadence = max(cadence, own_span)
         # Misread (negative or impossibly fast): fall back this tick, re-baseline,
         # mark the cycle dirty, and drop the unreconcilable pending.
-        return fallback, "fallback", False, 0.0, reading, inputs.now_iso, 0.0
+        return _WaterTick(
+            fallback, "fallback", False, 0.0, reading, now_iso, reading_changed_iso, cadence, 0.0
+        )
     # No reading. A short gap is a blip — draw nothing and let the cumulative meter
     # catch up; only fall back (and accumulate pending) once the meter is stale.
     base_dt = _parse_iso(state.water_baseline_iso)
@@ -698,22 +852,26 @@ def _resolve_draw(
         and (now_dt - base_dt).total_seconds() < WATER_STALE_AFTER_S
     )
     if fresh:
-        return (
+        return _WaterTick(
             0.0,
             "none",
             True,
             0.0,
             state.water_baseline_l,
             state.water_baseline_iso,
+            state.water_changed_iso,
+            cadence,
             state.pending_fallback_kwh,
         )
-    return (
+    return _WaterTick(
         fallback,
         "fallback",
         False,
         0.0,
         state.water_baseline_l,
         state.water_baseline_iso,
+        state.water_changed_iso,
+        cadence,
         state.pending_fallback_kwh + fallback,
     )
 
@@ -741,15 +899,9 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
     )
 
     # Draw + water bookkeeping (meter / fallback / none).
-    (
-        draw_kwh,
-        draw_source,
-        tick_clean,
-        metered_hot_liters,
-        new_water_baseline_l,
-        new_water_baseline_iso,
-        new_pending,
-    ) = _resolve_draw(state, params, inputs, elapsed_min, hot_fraction)
+    water = _resolve_draw(state, params, inputs, elapsed_min, hot_fraction)
+    draw_kwh, draw_source, tick_clean = water.draw_kwh, water.source, water.clean
+    metered_hot_liters = water.hot_liters
 
     standby = standby_kwh(state.standby_w, elapsed_min)
 
@@ -817,9 +969,11 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
     base = replace(
         state,
         energy_baseline_kwh=new_energy_baseline,
-        water_baseline_l=new_water_baseline_l,
-        water_baseline_iso=new_water_baseline_iso,
-        pending_fallback_kwh=new_pending,
+        water_baseline_l=water.baseline_l,
+        water_baseline_iso=water.baseline_iso,
+        water_changed_iso=water.changed_iso,
+        water_cadence_min=water.cadence_min,
+        pending_fallback_kwh=water.pending_kwh,
         last_tick_iso=inputs.now_iso,
         led_kwh_since_counter=led_since,
     )
@@ -835,16 +989,41 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
     if transition:
         # Anchor transition: close + learn the cycle (a no-op on the first anchor,
         # still uncalibrated), then pin the tank full and open a fresh cycle.
+        # A counter that is unavailable *at* the anchor has an unknown delta since
+        # its last read, and that delta straddles the anchor: part of it belongs to
+        # the cycle being closed (so this residual is incomplete → no learning)
+        # and, were its baseline kept, all of it would be credited again to the
+        # new cycle when the counter returns (a bogus residual next time). So drop
+        # that baseline — the returning reading is adopted with no delta — and
+        # open the new cycle dirty, since whatever flows before the return is
+        # lost to its balance. The pending fallback is the closed cycle's (its
+        # ledger was just re-zeroed), so it can never be netted against the new one.
+        # This holds *whether or not a baseline exists*: an outage spanning
+        # several anchors has none by the second one, and a cycle opened then
+        # would otherwise look clean while recording zero delivered energy. So
+        # cycles stay dirty until an anchor sees the counter back (a cycle opened
+        # with the counter present has a valid baseline from its first tick).
+        # With no counter configured the reading is always None and nothing
+        # learns — correct, as that balance is missing a whole side.
+        energy_gap = inputs.energy_counter_kwh is None
+        water_gap = inputs.water_counter_l is None
+        counter_gap = energy_gap or water_gap
         cycle_hours = _hours_between(state.cycle_start_iso, inputs.now_iso)
         accumulated = replace(
             base,
             cycle_energy_in_kwh=acc_energy,
             cycle_liters=acc_liters,
-            cycle_clean=acc_clean,
+            cycle_clean=acc_clean and not counter_gap,
             cycle_gross_kwh=acc_gross,
             cycle_hot_liters_by_bucket=acc_buckets,
         )
         learned = learn_from_cycle(accumulated, params, cycle_hours, new_unclamped)
+        if energy_gap:
+            learned = replace(learned, energy_baseline_kwh=None)
+        if water_gap:
+            learned = replace(
+                learned, water_baseline_l=None, water_baseline_iso="", water_changed_iso=""
+            )
         new_state = replace(
             learned,
             deficit_kwh=0.0,
@@ -855,11 +1034,12 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
             cycle_start_iso=inputs.now_iso,
             cycle_energy_in_kwh=0.0,
             cycle_liters=0.0,
-            cycle_clean=True,
+            cycle_clean=not counter_gap,
             cycle_gross_kwh=0.0,
             cycle_relax_kwh=0.0,
             cycle_hot_liters_by_bucket=_ZERO_PROFILE,
             led_kwh_since_counter=0.0,
+            pending_fallback_kwh=0.0,
         )
         shown = 0.0
         sigma = SIGMA_MIN_KWH
@@ -915,14 +1095,17 @@ def should_boost(
     Returns ``(fire, new_state)``. Firing re-runs the predict/push path so the
     scheduler books more heating before the tank empties. Guards, in order: never
     on an uncalibrated tank (the SoC is still the seeded guess); hysteresis re-arm
-    once SoC recovers ``rearm_margin_pct`` above the threshold; fire only when
+    once SoC recovers ``rearm_margin_pct`` above the threshold (capped at
+    ``BOOST_REARM_MAX_PCT``, so a high threshold still re-arms at a full tank);
+    fire only when
     below the threshold, armed, and at least ``min_interval_h`` since the last
     boost. The re-arm is applied even while uncalibrated so a tank that calibrates
     above the threshold is already armed for its first dip.
     """
     soc_pct = soc_value * 100.0
     new_state = state
-    if soc_pct >= threshold_pct + rearm_margin_pct and not state.boost_armed:
+    rearm_pct = min(threshold_pct + rearm_margin_pct, BOOST_REARM_MAX_PCT)
+    if soc_pct >= rearm_pct and not state.boost_armed:
         new_state = replace(state, boost_armed=True)
     if not new_state.calibrated:
         return False, new_state

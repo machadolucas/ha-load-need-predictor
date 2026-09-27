@@ -10,6 +10,7 @@ the first case; the rest call ``async_tick()`` directly.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
@@ -40,6 +41,7 @@ _SWITCH = "switch.lvv"
 _LED = "binary_sensor.led"
 _WATER = "sensor.water"
 _TARGET = "number.lvv_target"
+_KWH = {"unit_of_measurement": "kWh"}
 
 _TANK_LOAD = {
     "name": "LVV",
@@ -134,7 +136,7 @@ async def test_energy_in_raises_soc(hass: HomeAssistant, freezer) -> None:
     tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
     sid = _tank_sid(entry)
 
-    hass.states.async_set(_ENERGY, "100.0")
+    hass.states.async_set(_ENERGY, "100.0", _KWH)
     hass.states.async_set(_WATER, "500.0", {"unit_of_measurement": "m³"})
     coord.tanks[sid] = replace(
         initial_state(_CAPACITY),
@@ -145,7 +147,7 @@ async def test_energy_in_raises_soc(hass: HomeAssistant, freezer) -> None:
     await tracker.async_tick()  # settle baselines (no delta yet)
     soc0 = tracker.data[sid].soc_pct
 
-    hass.states.async_set(_ENERGY, "101.5")  # +1.5 kWh delivered
+    hass.states.async_set(_ENERGY, "101.5", _KWH)  # +1.5 kWh delivered
     freezer.tick(timedelta(seconds=60))
     await tracker.async_tick()
     r = tracker.data[sid]
@@ -244,7 +246,7 @@ async def test_m3_meter_normalised_to_liters(hass: HomeAssistant, freezer) -> No
     tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
     sid = _tank_sid(entry)
 
-    hass.states.async_set(_ENERGY, "100.0")
+    hass.states.async_set(_ENERGY, "100.0", _KWH)
     hass.states.async_set(_WATER, "412.35", {"unit_of_measurement": "m³"})
     coord.tanks[sid] = replace(
         initial_state(_CAPACITY),
@@ -314,6 +316,7 @@ async def test_low_charge_boost_pushes_once(hass: HomeAssistant) -> None:
     )
 
     await tracker.async_tick()
+    await hass.async_block_till_done()  # the boost push runs as its own task
     assert len(calls) == 1  # one predict/push fired by the boost
     # The push folds in the measured tank deficit → far above the ~105 min need.
     assert calls[-1].data["value"] > 105
@@ -321,6 +324,7 @@ async def test_low_charge_boost_pushes_once(hass: HomeAssistant) -> None:
 
     # A second tick right away: still low, but disarmed + rate-limited → no re-push.
     await tracker.async_tick()
+    await hass.async_block_till_done()
     assert len(calls) == 1
 
 
@@ -392,3 +396,275 @@ async def test_gain_not_learned_on_tank_refill_day(hass: HomeAssistant) -> None:
     assert row["clean_cycle"] is False
     assert coord.models[sid].sample_count == 0
     assert coord.models[sid].gain == before
+
+
+# 10 ─ counter units are converted, never guessed ─────────────────────────────
+
+
+async def test_wh_energy_counter_normalised_to_kwh(hass: HomeAssistant, freezer) -> None:
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+
+    hass.states.async_set(_ENERGY, "100000", {"unit_of_measurement": "Wh"})
+    coord.tanks[sid] = replace(initial_state(_CAPACITY), last_tick_iso=dt_util.utcnow().isoformat())
+    await tracker.async_tick()
+    assert coord.tanks[sid].energy_baseline_kwh == pytest.approx(100.0)
+
+    # +500 Wh is 0.5 kWh — not 500 kWh.
+    hass.states.async_set(_ENERGY, "100500", {"unit_of_measurement": "Wh"})
+    before = coord.tanks[sid].deficit_kwh
+    freezer.tick(timedelta(seconds=60))
+    await tracker.async_tick()
+    assert coord.tanks[sid].energy_baseline_kwh == pytest.approx(100.5)
+    assert before - coord.tanks[sid].deficit_kwh == pytest.approx(0.5, abs=0.05)
+
+
+async def test_water_units_converted_liters_and_gallons(hass: HomeAssistant) -> None:
+    entry = await _setup(hass)
+    tracker = entry.runtime_data.tank
+    hass.states.async_set(_WATER, "412.35", {"unit_of_measurement": "m³"})
+    assert tracker._water_liters(_WATER) == pytest.approx(412_350.0)
+    hass.states.async_set(_WATER, "1234", {"unit_of_measurement": "L"})
+    assert tracker._water_liters(_WATER) == pytest.approx(1234.0)
+    hass.states.async_set(_WATER, "1234", {"unit_of_measurement": "liters"})  # legacy alias
+    assert tracker._water_liters(_WATER) == pytest.approx(1234.0)
+    hass.states.async_set(_WATER, "10", {"unit_of_measurement": "gal"})
+    assert tracker._water_liters(_WATER) == pytest.approx(37.854, abs=0.01)
+
+
+async def test_unknown_unit_reads_unavailable_and_logs_once(
+    hass: HomeAssistant, freezer, caplog
+) -> None:
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+
+    hass.states.async_set(_ENERGY, "100.0", {"unit_of_measurement": "bananas"})
+    hass.states.async_set(_WATER, "500.0")  # no unit at all → not guessed as m³
+    coord.tanks[sid] = replace(initial_state(_CAPACITY), last_tick_iso=dt_util.utcnow().isoformat())
+    caplog.clear()
+    await tracker.async_tick()
+    freezer.tick(timedelta(seconds=60))
+    await tracker.async_tick()
+
+    assert coord.tanks[sid].energy_baseline_kwh is None
+    assert coord.tanks[sid].water_baseline_l is None
+    warnings = [r for r in caplog.records if "can't be converted" in r.getMessage()]
+    assert len(warnings) == 2  # once per entity, not once per tick
+
+
+# 11 ─ a reconfigured counter re-baselines instead of dumping its difference ───
+
+
+async def test_changed_energy_entity_rebaselines(hass: HomeAssistant, freezer) -> None:
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+
+    # The stored baseline came from an older counter at 100 kWh; the configured
+    # one (_ENERGY) reads 8115 kWh.
+    hass.states.async_set(_ENERGY, "8115.0", _KWH)
+    coord.tanks[sid] = replace(
+        initial_state(_CAPACITY),
+        last_tick_iso=dt_util.utcnow().isoformat(),
+        energy_baseline_kwh=100.0,
+        energy_source="sensor.old_lvv_energy",
+    )
+    before = coord.tanks[sid].deficit_kwh
+    await tracker.async_tick()
+    after = coord.tanks[sid]
+    assert after.energy_source == _ENERGY
+    assert after.energy_baseline_kwh == pytest.approx(8115.0)
+    assert after.deficit_kwh == pytest.approx(before, abs=0.1)  # not pinned full
+    assert after.cycle_clean is False
+
+
+async def test_legacy_state_adopts_configured_source_without_loss(
+    hass: HomeAssistant, freezer
+) -> None:
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+
+    hass.states.async_set(_ENERGY, "101.0", _KWH)
+    coord.tanks[sid] = replace(
+        initial_state(_CAPACITY),
+        last_tick_iso=dt_util.utcnow().isoformat(),
+        energy_baseline_kwh=100.0,  # saved before sources were recorded
+    )
+    before = coord.tanks[sid].deficit_kwh
+    await tracker.async_tick()
+    after = coord.tanks[sid]
+    assert after.energy_source == _ENERGY
+    assert before - after.deficit_kwh == pytest.approx(1.0, abs=0.05)  # delta credited
+
+
+# 12 ─ a failed boost push keeps the trigger, with bounded retries ─────────────
+
+
+def _low_calibrated(hass: HomeAssistant, coord, sid: str) -> None:
+    hass.states.async_set(_SWITCH, "off")
+    hass.states.async_set(_LED, "off")
+    coord.tanks[sid] = replace(
+        initial_state(_CAPACITY), deficit_kwh=0.9 * _CAPACITY, calibrated=True
+    )
+
+
+async def test_failed_boost_push_stays_armed_and_backs_off(hass: HomeAssistant, freezer) -> None:
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+    _low_calibrated(hass, coord, sid)
+
+    push = AsyncMock(return_value=False)  # scheduler target unavailable
+    with patch.object(coord, "async_predict_and_push", new=push):
+        await tracker.async_tick()
+        assert push.await_count == 1
+        assert coord.tanks[sid].boost_armed is True  # trigger not consumed
+        assert coord.tanks[sid].last_boost_iso == ""
+
+        # Still low a minute later: no re-plan storm while backing off.
+        freezer.tick(timedelta(seconds=60))
+        await tracker.async_tick()
+        assert push.await_count == 1
+        assert coord.tanks[sid].boost_armed is True
+
+        # After the retry interval the push is attempted again — and succeeds.
+        push.return_value = True
+        freezer.tick(timedelta(minutes=15))
+        await tracker.async_tick()
+        assert push.await_count == 2
+        assert coord.tanks[sid].boost_armed is False
+        assert coord.tanks[sid].last_boost_iso != ""
+
+
+async def test_boost_push_raising_counts_as_failure(hass: HomeAssistant, freezer) -> None:
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+    _low_calibrated(hass, coord, sid)
+
+    push = AsyncMock(side_effect=RuntimeError("boom"))
+    with patch.object(coord, "async_predict_and_push", new=push):
+        await tracker.async_tick()
+    assert push.await_count == 1
+    assert coord.tanks[sid].boost_armed is True
+    assert tracker.data[sid] is not None  # the tick still published
+
+
+async def test_boost_push_returning_none_counts_as_success(hass: HomeAssistant) -> None:
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+    _low_calibrated(hass, coord, sid)
+
+    push = AsyncMock(return_value=None)  # an older signature that returns nothing
+    with patch.object(coord, "async_predict_and_push", new=push):
+        await tracker.async_tick()
+        await tracker.async_tick()
+    assert push.await_count == 1
+    assert coord.tanks[sid].boost_armed is False
+
+
+def _gated_push(result):
+    """An ``async_predict_and_push`` stand-in that blocks until released."""
+    gate = asyncio.Event()
+
+    async def _push(only=None):
+        await gate.wait()
+        return result
+
+    return gate, AsyncMock(side_effect=_push)
+
+
+async def test_in_flight_boost_is_not_refired_and_commits_onto_latest_state(
+    hass: HomeAssistant, freezer
+) -> None:
+    """A push slower than a tick: no duplicate predict, and no stale overwrite.
+
+    The second tick must neither queue another predict nor lose its own updates
+    when the first push finally succeeds — only the boost fields are applied, on
+    top of whatever the tank state is by then.
+    """
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+    _low_calibrated(hass, coord, sid)
+    hass.states.async_set(_ENERGY, "100.0", _KWH)
+    coord.tanks[sid] = replace(coord.tanks[sid], energy_baseline_kwh=100.0)
+    fired_at = dt_util.utcnow().isoformat()
+
+    gate, push = _gated_push(True)
+    with patch.object(coord, "async_predict_and_push", new=push):
+        await tracker.async_tick()  # fires; the push is now blocked in flight
+        assert push.await_count == 1
+        assert coord.tanks[sid].boost_armed is True  # nothing committed yet
+
+        hass.states.async_set(_ENERGY, "101.0", _KWH)  # the tank keeps integrating
+        freezer.tick(timedelta(seconds=90))
+        await tracker.async_tick()
+        assert push.await_count == 1  # in flight → not re-evaluated
+        assert coord.tanks[sid].energy_baseline_kwh == pytest.approx(101.0)
+
+        gate.set()
+        await hass.async_block_till_done()
+
+    state = coord.tanks[sid]
+    assert state.boost_armed is False
+    assert state.last_boost_iso == fired_at
+    assert state.energy_baseline_kwh == pytest.approx(101.0)  # tick 2 survived
+    assert sid not in tracker._boost_in_flight
+
+
+async def test_failed_boost_backoff_runs_from_completion(hass: HomeAssistant, freezer) -> None:
+    """A push that hangs 20 min then fails must not retry the moment it gives up."""
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+    _low_calibrated(hass, coord, sid)
+
+    gate, push = _gated_push(False)
+    with patch.object(coord, "async_predict_and_push", new=push):
+        await tracker.async_tick()  # T0: fires, blocked
+        freezer.tick(timedelta(minutes=20))
+        gate.set()  # T0+20: fails
+        await hass.async_block_till_done()
+        assert coord.tanks[sid].boost_armed is True
+
+        freezer.tick(timedelta(minutes=5))  # T0+25: past fire+15, not completion+15
+        await tracker.async_tick()
+        await hass.async_block_till_done()
+        assert push.await_count == 1
+
+        freezer.tick(timedelta(minutes=11))  # T0+36: completion+16 → retried
+        await tracker.async_tick()
+        await hass.async_block_till_done()
+        assert push.await_count == 2
+
+
+async def test_unload_drains_an_in_flight_boost_before_flushing(
+    hass: HomeAssistant, freezer, hass_storage
+) -> None:
+    """A boost finishing mid-unload must still commit its cooldown to disk.
+
+    Otherwise the reload restores the armed trigger and re-boosts at once,
+    bypassing the rate limit.
+    """
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+    _low_calibrated(hass, coord, sid)
+
+    gate, push = _gated_push(True)
+    with patch.object(coord, "async_predict_and_push", new=push):
+        await tracker.async_tick()  # fires; blocked in flight
+        assert sid in tracker._boost_in_flight
+        unload = hass.async_create_task(hass.config_entries.async_unload(entry.entry_id))
+        await asyncio.sleep(0)
+        assert not unload.done()  # waiting on the boost, not flushing yet
+        gate.set()
+        assert await unload
+
+    saved = hass_storage[f"{DOMAIN}.{entry.entry_id}"]["data"]
+    assert saved[sid]["tank"]["boost_armed"] is False  # the flush saw the cooldown

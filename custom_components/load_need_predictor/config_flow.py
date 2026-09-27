@@ -7,6 +7,7 @@ one ``init`` step between add and reconfigure (mirrors ha-load-scheduler).
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import voluptuous as vol
@@ -70,6 +71,7 @@ from .const import (
     MAX_FORECAST_DAYS,
     SUBENTRY_TYPE_LOAD,
     SUBENTRY_TYPE_PRICE_FORECAST,
+    TARGET_STEP_MINUTES,
     WATTCAST_ZONES,
 )
 
@@ -282,6 +284,28 @@ def _clean(user_input: dict) -> dict:
     return {k: v for k, v in user_input.items() if v not in (None, "")}
 
 
+def _validate_load(data: dict) -> dict[str, str]:
+    """Field errors for a load config that can't work as entered.
+
+    - The scheduler's target only takes whole 15-min steps, and the predictor
+      rounds its bounds inward (``clamp_minutes``), so ``[min, max]`` must
+      contain at least one step multiple (catches ``min > max`` and e.g.
+      ``min = max = 40``).
+    - A heating-active detector without the controlled switch can never anchor
+      the tank (the anchor is "contactor on + element idle"), so the charge
+      would stay uncalibrated forever.
+    """
+    errors: dict[str, str] = {}
+    lo = float(data.get(CONF_MIN_MINUTES, DEFAULT_MIN_MINUTES))
+    hi = float(data.get(CONF_MAX_MINUTES, DEFAULT_MAX_MINUTES))
+    step = TARGET_STEP_MINUTES
+    if math.ceil(lo / step) * step > math.floor(hi / step) * step:
+        errors[CONF_MAX_MINUTES] = "invalid_runtime_band"
+    if data.get(CONF_HEATING_ACTIVE_ENTITY) and not data.get(CONF_CONTROLLED_SWITCH_ENTITY):
+        errors[CONF_HEATING_ACTIVE_ENTITY] = "heating_needs_switch"
+    return errors
+
+
 class LoadNeedPredictorConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the hub config flow."""
 
@@ -302,7 +326,13 @@ class LoadNeedPredictorConfigFlow(ConfigFlow, domain=DOMAIN):
         """Edit the hub's predict/capture schedule."""
         entry = self._get_reconfigure_entry()
         if user_input is not None:
-            return self.async_update_reload_and_abort(entry, data_updates=user_input)
+            # Not ``async_update_reload_and_abort``: the entry's update listener
+            # already reloads on a data change, so that would reload twice.
+            return self.async_update_and_abort(
+                entry,
+                title=user_input.get(CONF_NAME) or entry.title,
+                data_updates=user_input,
+            )
         defaults = {**entry.data, **(user_input or {})}
         return self.async_show_form(step_id="reconfigure", data_schema=_hub_schema(defaults))
 
@@ -338,17 +368,24 @@ class LoadSubentryFlowHandler(ConfigSubentryFlow):
         return await self.async_step_init(user_input)
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
             data = _clean(user_input)
-            if self._is_new:
-                return self.async_create_entry(title=data[CONF_NAME], data=data)
-            return self.async_update_and_abort(
-                self._get_entry(),
-                self._get_reconfigure_subentry(),
-                title=data[CONF_NAME],
-                data=data,
-            )
-        return self.async_show_form(step_id="init", data_schema=_load_schema(self._defaults))
+            errors = _validate_load(data)
+            if not errors:
+                if self._is_new:
+                    return self.async_create_entry(title=data[CONF_NAME], data=data)
+                return self.async_update_and_abort(
+                    self._get_entry(),
+                    self._get_reconfigure_subentry(),
+                    title=data[CONF_NAME],
+                    data=data,
+                )
+            # Re-show what was entered, not the stored defaults.
+            self._defaults = {**self._defaults, **user_input}
+        return self.async_show_form(
+            step_id="init", data_schema=_load_schema(self._defaults), errors=errors
+        )
 
 
 class PriceForecastSubentryFlowHandler(ConfigSubentryFlow):

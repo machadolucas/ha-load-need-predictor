@@ -92,6 +92,29 @@ async def test_async_count_residents_home_uses_duration(hass: HomeAssistant) -> 
     assert count == 1
 
 
+async def test_async_count_residents_home_unavailable_history_is_present(
+    hass: HomeAssistant,
+) -> None:
+    # A tracker outage (history only `unavailable`) must not read as "away" —
+    # that would trigger the empty-house cut and under-serve the tank.
+    now = dt_util.utcnow()
+    wstart = now - timedelta(hours=24)
+    history = {
+        "person.a": [State("person.a", "unavailable", last_changed=wstart - timedelta(hours=1))],
+        "person.b": [
+            State("person.b", "unavailable", last_changed=wstart - timedelta(hours=1)),
+            State("person.b", "not_home", last_changed=wstart + timedelta(hours=2)),
+        ],
+    }
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(return_value=history)
+    with patch(_GET_INSTANCE, return_value=instance):
+        count = await occ.async_count_residents_home(hass, ["person.a", "person.b"])
+    assert count == 1  # a: unknown all day → present; b: known away for 22 h
+    states = history["person.a"]
+    assert occ.home_seconds(states, wstart, now) == 0.0  # default stays strict
+
+
 async def test_async_count_residents_home_fallback_without_recorder(hass: HomeAssistant) -> None:
     # No recorder in this test → falls back to the instantaneous count.
     hass.states.async_set("person.a", "home")
