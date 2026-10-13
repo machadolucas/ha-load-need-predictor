@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+from datetime import UTC
 
 from homeassistant.config_entries import ConfigSubentryData
 from homeassistant.core import HomeAssistant
@@ -113,3 +114,34 @@ async def test_diagnostics_forecast_wattcast_section(
     # The published series is trimmed to a preview.
     assert len(fc["result"]["slots"]) <= 8
     assert fc["result"]["source"] == "wattcast"
+
+
+def test_observation_diagnostics_do_not_export_shower_events():
+    from datetime import datetime
+
+    from custom_components.load_need_predictor.diagnostics import _observation_diagnostics
+
+    stamp = datetime.now(UTC).isoformat()
+    saved = {
+        "version": 1,
+        "mode": "shadow",
+        "source_signature": "sources",
+        "cycles": [],
+        "events": [
+            {
+                "id": "private-event",
+                "start": stamp,
+                "end": stamp,
+                "last_flow_iso": stamp,
+                "water_l": 40,
+                "motion_seen": True,
+                "confidence": "ambiguous",
+                "feedback": "not_warm_enough",
+            }
+        ],
+    }
+    exported = _observation_diagnostics(saved)
+    assert "private-event" not in json.dumps(exported)
+    assert "events" not in exported and "recent_showers" not in exported
+    assert exported["comfort_report_count"] == 1
+    assert exported["source_signature"] == "sources"

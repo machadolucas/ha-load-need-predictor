@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import voluptuous as vol
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -20,6 +21,8 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import SUBENTRY_TYPE_LOAD, SUBENTRY_TYPE_PRICE_FORECAST
@@ -29,6 +32,18 @@ from .models import load_config_from_data
 from .runtime import LoadNeedPredictorConfigEntry
 
 _EUR_PER_KWH = "€/kWh"
+
+
+async def _report_shower_comfort(entity, call) -> None:
+    """HA's entity-service dispatcher handles target permissions and lifecycle."""
+    if not isinstance(entity, TankSocSensor):
+        raise ServiceValidationError("Select an estimated stored heat sensor")
+    try:
+        await entity.coordinator.async_report_shower_comfort(
+            entity._subentry_id, call.data["event_id"], call.data["comfort"]
+        )
+    except ValueError as err:
+        raise ServiceValidationError(str(err)) from err
 
 
 # ── Load sensors ─────────────────────────────────────────────────────────────
@@ -170,6 +185,16 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up sensors for each subentry (loads and the price forecast)."""
+    entity_platform.async_get_current_platform().async_register_entity_service(
+        "report_shower_comfort",
+        {
+            vol.Required("event_id"): vol.All(str, vol.Length(min=1, max=128)),
+            vol.Required("comfort"): vol.In(
+                ["comfortable", "cooler_than_usual", "not_warm_enough"]
+            ),
+        },
+        _report_shower_comfort,
+    )
     runtime = entry.runtime_data
     for subentry_id, subentry in entry.subentries.items():
         if subentry.subentry_type == SUBENTRY_TYPE_LOAD:
@@ -249,8 +274,12 @@ class TankSocSensor(TankEntity, SensorEntity):
             "uncertainty_kwh",
             "latched",
             "draw_source",
-            "liters_40c",
-            "showers_left",
+            "equivalent_liters_40c",
+            "anchor_age_hours",
+            "quality_warnings",
+            "recent_showers",
+            "shadow_evaluation",
+            "comfort_risk",
         }
     )
 
@@ -280,8 +309,21 @@ class TankSocSensor(TankEntity, SensorEntity):
             "latched": result.latched,
             "last_full": result.last_full,
             "draw_source": result.draw_source,
-            "liters_40c": round(result.liters_40c, 0),
-            "showers_left": round(result.showers_left, 1),
+            "equivalent_liters_40c": round(result.liters_40c, 0),
+            "equivalent_liters_assumption": (
+                "Energy equivalent only: assumes heat can be delivered at 40°C; "
+                "outlet temperature and usable volume are not measured"
+            ),
+            "hot_water_availability": "unknown",
+            "anchor_age_hours": (
+                round(result.anchor_age_hours, 1) if result.anchor_age_hours is not None else None
+            ),
+            "quality_warnings": result.quality_warnings,
+            "observation_enabled": result.observation_enabled,
+            "comfort_feedback_supported": True,
+            "recent_showers": result.observation.get("recent_showers", []),
+            "comfort_risk": result.observation.get("comfort_risk", "unknown"),
+            "shadow_evaluation": result.observation.get("evaluation", {}),
         }
 
 

@@ -3,7 +3,7 @@
  *
  * A compact, responsive Lovelace card that explains, in plain language, *how*
  * each configured load's runtime and each price forecast was calculated. It is
- * read-only diagnostics plus the two "run now" buttons; all the rationale comes
+ * diagnostics, the two "run now" buttons and optional shower-comfort feedback; all the rationale comes
  * from entity attributes the integration publishes:
  *   - load    → the `*_predicted_runtime` sensor's `breakdown` + `metrics` attrs
  *   - forecast → the `*_price_forecast` sensor's `days`, `source`, `retail_mapping`,
@@ -16,7 +16,7 @@
  */
 
 const DOMAIN = "load_need_predictor";
-const CARD_VERSION = "0.11.0";
+const CARD_VERSION = "0.12.0";
 const DOC_URL = "https://github.com/machadolucas/ha-load-need-predictor";
 
 // translation_key values the integration assigns to its entities.
@@ -29,7 +29,7 @@ const TK = {
 };
 
 // ── small formatting helpers ────────────────────────────────────────────────
-const isNum = (x) => typeof x === "number" && !Number.isNaN(x);
+const isNum = (x) => typeof x === "number" && Number.isFinite(x);
 const kwh = (x) => (isNum(x) ? x.toFixed(1) : "—");
 const eur = (x) => (isNum(x) ? x.toFixed(3) : "—");
 const gain = (x) => (isNum(x) ? "×" + x.toFixed(2) : "—");
@@ -53,11 +53,13 @@ class LoadNeedPredictorCard extends HTMLElement {
     this._config = {};
     this._hass = null;
     this._toggled = new Map(); // deviceId → explicit open/closed (overrides default)
+    this._feedback = new Map(); // tank entity → selected event and request status
     this._fingerprint = null;
     this._discovery = null; // memoised _devices() result + the inputs it was built from
     this._watched = null; // state objects the last render read (identity fast path)
     // One delegated listener survives innerHTML re-renders (it's on the root).
     this.shadowRoot.addEventListener("click", (ev) => this._onClick(ev));
+    this.shadowRoot.addEventListener("change", (ev) => this._onChange(ev));
   }
 
   setConfig(config) {
@@ -168,10 +170,11 @@ class LoadNeedPredictorCard extends HTMLElement {
     const fp = JSON.stringify({
       cfg: this._config,
       exp: [...this._toggled.entries()].sort(),
+      feedback: [...this._feedback.entries()],
       dev: this._discovery ? this._discovery.sig : "",
       st: eids.map((eid, i) => {
         const s = watched[i];
-        return [eid, s ? s.state + "@" + s.last_updated : "none"];
+        return [eid, s ? [s.state, s.last_updated, s.attributes] : "none"];
       }),
     });
     this._fpDiscovery = this._discovery;
@@ -231,6 +234,7 @@ class LoadNeedPredictorCard extends HTMLElement {
         </div>
         <div class="big">${headline}</div>
         ${tankRow(hass.states[d.keys[TK.tankSoc]])}
+        ${showerFeedback(hass.states[d.keys[TK.tankSoc]], d.keys[TK.tankSoc], this._feedback.get(d.keys[TK.tankSoc]))}
         ${loadExplanation(bd)}
         <div class="toggle" data-action="toggle" data-device="${d.deviceId}">
           ${open ? "Hide detail ▴" : "Show detail ▾"}
@@ -286,9 +290,56 @@ class LoadNeedPredictorCard extends HTMLElement {
       this._toggled.set(id, !this._isOpen(id));
       this._fingerprint = null; // defeat the identity fast path: the view changed
       this._render();
+    } else if (el.dataset.action === "comfort") {
+      this._reportComfort(el.dataset.entity, el.dataset.comfort);
     } else if (el.dataset.action === "service" && this._hass) {
       const [domain, service] = el.dataset.service.split(".");
       this._hass.callService(domain, service, {}, { entity_id: el.dataset.entity });
+    }
+  }
+
+  _onChange(ev) {
+    const el = ev.target;
+    if (el.dataset.action !== "shower-select") return;
+    const previous = this._feedback.get(el.dataset.entity);
+    if (previous && previous.pending) return;
+    this._feedback.set(el.dataset.entity, { eventId: el.value });
+    this._fingerprint = null;
+    this._render();
+  }
+
+  async _reportComfort(entityId, comfort) {
+    const a = this._hass?.states[entityId]?.attributes || {};
+    const previous = this._feedback.get(entityId) || {};
+    const events = recentShowers(a);
+    if (previous.eventId && !events.some((event) => event.id === previous.eventId) && !previous.pending) {
+      this._feedback.set(entityId, {
+        eventId: events[0]?.id,
+        error: true,
+        message: "That shower event is no longer available. Choose a recent event before reporting comfort.",
+      });
+      this._fingerprint = null;
+      this._render();
+      return;
+    }
+    const eventId = selectedShower(events, previous)?.id;
+    if (a.comfort_feedback_supported !== true || previous.pending || !eventId || !Object.hasOwn(COMFORT_LABELS, comfort)) return;
+    const status = { eventId, pending: true, message: "Saving feedback…" };
+    this._feedback.set(entityId, status);
+    this._fingerprint = null;
+    this._render();
+    try {
+      await this._hass.callService(DOMAIN, "report_shower_comfort", {
+        entity_id: entityId, event_id: eventId, comfort,
+      });
+      status.message = `Saved: ${COMFORT_LABELS[comfort]}.`;
+    } catch (err) {
+      status.error = true;
+      status.message = `Could not save feedback: ${err?.message || "Please try again."}`;
+    } finally {
+      status.pending = false;
+      this._fingerprint = null;
+      this._render();
     }
   }
 }
@@ -297,21 +348,71 @@ class LoadNeedPredictorCard extends HTMLElement {
 // Rendered only when the load has a tank_soc sensor (the tank feature is opt-in);
 // absent or non-numeric states (e.g. "unknown" before the first tick) hide the row.
 function tankRow(st) {
-  if (!st || Number.isNaN(Number(st.state))) return "";
-  const pct = Math.max(0, Math.min(100, Math.round(Number(st.state))));
+  if (!st) return "";
+  const valid = st.state !== "" && Number.isFinite(Number(st.state));
+  const pct = valid ? Math.max(0, Math.min(100, Math.round(Number(st.state)))) : null;
   const a = st.attributes || {};
-  const note =
-    a.calibrated === false
-      ? "calibrating…"
-      : isNum(a.showers_left)
-        ? `~${Math.round(a.showers_left)} showers`
-        : "";
-  const low = pct < 25 ? " low" : "";
-  return `<div class="tank" title="Estimated hot-water charge">
-    <span class="tl">Tank</span>
-    <div class="bar"><div class="fill${low}" style="width:${pct}%"></div></div>
-    <span class="tv">${pct}%</span>
-    ${note ? `<span class="muted tn">${esc(note)}</span>` : ""}
+  const low = pct !== null && pct < 25 ? " low" : "";
+  const quality = Array.isArray(a.quality_warnings) ? a.quality_warnings.filter((x) => typeof x === "string") : [];
+  const age = isNum(a.anchor_age_hours) ? `${a.anchor_age_hours.toFixed(1)} h ago` : "unknown";
+  const assumption = typeof a.equivalent_liters_assumption === "string" && a.equivalent_liters_assumption.trim();
+  const equivalent = isNum(a.equivalent_liters_40c) && assumption
+    ? `<div class="muted tank-note">Energy equivalent: ~${Math.round(a.equivalent_liters_40c)} L at 40 °C. ${esc(assumption)} This is not a measured volume of usable hot water.</div>`
+    : "";
+  return `<div class="tank" title="Estimated stored heat, based on an energy balance">
+    <span class="tl">Estimated stored heat</span>
+    <div class="bar" role="meter" aria-label="Estimated stored heat" aria-valuemin="0" aria-valuemax="100" ${pct === null ? 'aria-valuetext="unknown"' : `aria-valuenow="${pct}"`}><div class="fill${low}" style="width:${pct ?? 0}%"></div></div>
+    <span class="tv">${pct === null ? "unknown" : `${pct}%`}</span>
+  </div>
+  <div class="tank-note">Hot-water availability unknown.</div>
+  <div class="muted tank-note">Last thermostat anchor: ${esc(age)}${a.calibrated === false ? " · awaiting first anchor" : ""}</div>
+  ${quality.map((warning) => `<div class="warn">${esc(warning)}</div>`).join("")}
+  ${equivalent}`;
+}
+
+const COMFORT_LABELS = {
+  comfortable: "Comfortable",
+  cooler_than_usual: "Cooler than usual",
+  not_warm_enough: "Not warm enough",
+};
+function recentShowers(a) {
+  return Array.isArray(a.recent_showers)
+    ? a.recent_showers.filter((ev) => ev && typeof ev.id === "string" && ev.id.length).slice(0, 10)
+    : [];
+}
+function selectedShower(events, status) {
+  return events.find((ev) => ev.id === status?.eventId) || events[0];
+}
+function showerFeedback(st, entityId, status = {}) {
+  const a = st?.attributes || {};
+  if (a.comfort_feedback_supported !== true) return "";
+  const events = recentShowers(a);
+  if (!events.length) {
+    return a.observation_enabled
+      ? '<div class="muted tank-note">Shower observations active · no recent shower events to rate.</div>'
+      : '<div class="muted tank-note">Configure optional shower observation sources to record events.</div>';
+  }
+  const selected = selectedShower(events, status);
+  if (status.eventId && selected.id !== status.eventId && !status.pending) status = {};
+  const disabled = status.pending ? "disabled" : "";
+  const options = events.map((ev) => {
+    const date = new Date(ev.start);
+    const when = Number.isNaN(date.getTime()) ? "Time unknown" : date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const water = isNum(ev.water_l) ? ` · ${Math.round(ev.water_l)} L metered` : "";
+    const confidence = ev.confidence != null ? ` · confidence ${ev.confidence}` : "";
+    const feedback = Object.hasOwn(COMFORT_LABELS, ev.feedback) ? ` · ${COMFORT_LABELS[ev.feedback]}` : "";
+    return `<option value="${esc(ev.id)}" ${ev.id === selected.id ? "selected" : ""}>${esc(when + water + confidence + feedback)}</option>`;
+  }).join("");
+  const buttons = Object.entries(COMFORT_LABELS).map(([value, label]) =>
+    `<button class="comfort-button" data-action="comfort" data-entity="${esc(entityId)}" data-comfort="${value}" ${disabled}>${label}</button>`
+  ).join("");
+  return `<div class="shower-feedback">
+    <label>Recent shower observation
+      <select aria-label="Recent shower observation" data-action="shower-select" data-entity="${esc(entityId)}" ${disabled}>${options}</select>
+    </label>
+    <div class="muted tank-note">How warm did this shower feel? Feedback is recorded for observation only.</div>
+    <div class="comfort-buttons" role="group" aria-label="Shower comfort">${buttons}</div>
+    <div class="tank-note${status.error ? " warn" : ""}" role="status" aria-live="polite">${esc(status.message || "")}</div>
   </div>`;
 }
 
@@ -535,14 +636,25 @@ const STYLES = `
   .warn { color: var(--warning-color, #ffa600); font-size: 0.8rem; }
   .explain { font-size: 0.92rem; line-height: 1.45; color: var(--primary-text-color); }
   .explain b { font-weight: 600; }
-  .tank { display: flex; align-items: center; gap: 8px; margin: 2px 0 4px; font-size: 0.85rem; }
+  .tank { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 2px 0 4px; font-size: 0.85rem; }
   .tank .tl { color: var(--secondary-text-color); }
   .tank .bar { flex: 1; max-width: 220px; height: 8px; border-radius: 4px;
                background: var(--secondary-background-color); overflow: hidden; }
   .tank .fill { height: 100%; border-radius: 4px; background: var(--primary-color); }
   .tank .fill.low { background: var(--error-color, #db4437); }
   .tank .tv { font-weight: 600; }
-  .tank .tn { font-size: 0.8rem; }
+  .tank-note { font-size: 0.82rem; line-height: 1.4; margin: 3px 0; }
+  .shower-feedback { margin: 10px 0; }
+  .shower-feedback label { display: block; font-size: 0.85rem; }
+  .shower-feedback select { box-sizing: border-box; width: 100%; min-height: 44px; margin: 4px 0;
+    border: 1px solid var(--divider-color); border-radius: 6px; padding: 8px;
+    color: var(--primary-text-color); background: var(--card-background-color, #fff); font: inherit; }
+  .comfort-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .comfort-button { min-height: 44px; flex: 1 1 120px; border: 1px solid var(--divider-color);
+    border-radius: 8px; padding: 8px; cursor: pointer; font: inherit; font-size: 0.85rem;
+    background: var(--secondary-background-color); color: var(--primary-color); }
+  .comfort-button:disabled, .shower-feedback select:disabled { opacity: 0.6; cursor: wait; }
+  .comfort-button:focus-visible, .shower-feedback select:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
   .toggle { margin-top: 6px; font-size: 0.82rem; color: var(--primary-color); cursor: pointer; user-select: none; width: fit-content; }
   .detail { margin-top: 6px; }
   .sub { font-size: 0.74rem; text-transform: uppercase; letter-spacing: .04em; color: var(--secondary-text-color); margin: 8px 0 4px; }

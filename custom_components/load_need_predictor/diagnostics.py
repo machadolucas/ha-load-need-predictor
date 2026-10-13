@@ -12,9 +12,11 @@ from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .persistence import model_to_dict, tank_to_dict
 from .runtime import LoadNeedPredictorConfigEntry
+from .tank_observation import prune_observation, summarize_observation
 
 _REDACT = {
     "target_number_entity",
@@ -27,6 +29,10 @@ _REDACT = {
     "supply_temp_entity",
     "outdoor_temp_entity",
     "water_total_entity",
+    "shower_motion_entity",
+    "shower_humidity_entity",
+    "shower_ventilation_entity",
+    "cold_appliance_entities",
     "price_entity",
     "wind_entity",
     "weather_entity",
@@ -38,6 +44,21 @@ _RECENT_ROWS = 14  # last two weeks of rows is plenty to diagnose
 
 def _to_dict(obj) -> dict | None:
     return obj.to_dict() if obj is not None else None
+
+
+def _observation_diagnostics(saved: dict | None) -> dict | None:
+    """Share evaluation evidence without exporting exact shower/feedback events."""
+    if not saved:
+        return None
+    saved = prune_observation(saved, dt_util.utcnow().isoformat())
+    summary = summarize_observation(saved)
+    summary.pop("recent_showers", None)
+    # Cycle boundaries are thermostat anchors, not individual shower times.
+    return {
+        **summary,
+        "source_signature": saved.get("source_signature"),
+        "cycles": saved.get("cycles", []),
+    }
 
 
 def _wattcast_diag(forecast, subentry_id: str) -> dict:
@@ -67,7 +88,12 @@ async def async_get_config_entry_diagnostics(
             "model": model_to_dict(load.model_for(subentry_id)),
             "result": vars(result) if result else None,
             "tank": tank_to_dict(load.tanks[subentry_id]) if subentry_id in load.tanks else None,
-            "tank_result": vars(tr) if tr else None,
+            "tank_result": (
+                {key: value for key, value in vars(tr).items() if key != "observation"}
+                if tr
+                else None
+            ),
+            "tank_observations": _observation_diagnostics(load.tank_observations.get(subentry_id)),
             "training_rows": len(load.training.get(subentry_id, [])),
             "recent_training": load.training.get(subentry_id, [])[-_RECENT_ROWS:],
             "eval_errors": load.eval_errors.get(subentry_id, [])[-_RECENT_ROWS:],

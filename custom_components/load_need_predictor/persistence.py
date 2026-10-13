@@ -41,6 +41,8 @@ class PredictorStore:
         # The load coordinator uses suffix="" (one file per hub); the price
         # forecaster uses a distinct suffix so the two don't clobber each other.
         self._store: Store[dict] = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}{suffix}")
+        self._hass = hass
+        self._key = f"{DOMAIN}.{entry_id}{suffix}"
 
     async def async_load(self) -> dict:
         """Return the saved ``{subentry_id: {...}}`` mapping (empty if none)."""
@@ -54,6 +56,18 @@ class PredictorStore:
     async def async_save_now(self, data: dict) -> None:
         """Write immediately, bypassing the debounce (shutdown / explicit flush)."""
         await self._store.async_save(data)
+
+    async def async_save_feedback(
+        self, data: dict, subentry_id: str, event_id: str, report: str
+    ) -> None:
+        """Read back a feedback write: HA's Store can log and swallow IO errors."""
+        await self.async_save_now(data)
+        # A fresh Store has no pending in-memory write to return from async_load.
+        reader: Store[dict] = Store(self._hass, STORAGE_VERSION, self._key)
+        persisted = await reader.async_load() or {}
+        events = persisted.get(subentry_id, {}).get("tank_observations", {}).get("events", [])
+        if not any(row.get("id") == event_id and row.get("feedback") == report for row in events):
+            raise ValueError("Feedback could not be verified in storage; please try again")
 
 
 def model_to_dict(state: ModelState) -> dict:

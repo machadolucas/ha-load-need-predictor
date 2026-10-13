@@ -182,6 +182,9 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
         # Tank state-of-charge, mutated by the tank tracker but owned here so the
         # debounced snapshot doesn't drop it (see tank_tracker for the rationale).
         self.tanks: dict[str, TankState] = {}
+        # Observation-only history must survive every snapshot without entering
+        # either the demand model or the tank ledger used for heating control.
+        self.tank_observations: dict[str, dict] = {}
         # What each load last pushed (see PublishedTarget); in-memory only.
         self._published: dict[str, PublishedTarget] = {}
         # Serialises predict/capture (see the module docstring).
@@ -201,6 +204,9 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             self.eval_errors[subentry_id] = list(payload.get("eval", []))
             if (tank := payload.get("tank")) and (restored := tank_from_dict(tank)) is not None:
                 self.tanks[subentry_id] = restored
+            if isinstance(observations := payload.get("tank_observations"), dict):
+                self.tank_observations[subentry_id] = observations
+        self._prune_tank_observations()
         # The last *successfully pushed* target survives a restart/reload, so
         # the sensor keeps showing what the scheduler holds rather than an
         # unpushed recomputation — unless the load now targets another entity.
@@ -217,6 +223,7 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
 
     def _runtime_snapshot(self) -> dict:
         """Serialise everything persistable (called by the debounced save)."""
+        self._prune_tank_observations()
         return {
             subentry_id: {
                 "model": model_to_dict(self.models.get(subentry_id, default_model_state())),
@@ -228,6 +235,11 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
                     if subentry_id in self.tanks
                     else {}
                 ),
+                **(
+                    {"tank_observations": self.tank_observations[subentry_id]}
+                    if subentry_id in self.tank_observations
+                    else {}
+                ),
                 # Additive (defaults-tolerant): the last successful push.
                 **(
                     {"published": self._published[subentry_id].to_dict()}
@@ -237,6 +249,14 @@ class LoadNeedPredictorCoordinator(DataUpdateCoordinator[dict[str, LoadResult]])
             }
             for subentry_id in self.load_configs()
         }
+
+    def _prune_tank_observations(self) -> None:
+        """Expire disabled loads' observation history on normal persistence too."""
+        from .tank_observation import prune_observation
+
+        now_iso = dt_util.utcnow().isoformat()
+        for sid, saved in self.tank_observations.items():
+            self.tank_observations[sid] = prune_observation(saved, now_iso)
 
     def async_persist(self) -> None:
         """Schedule a debounced save of the model + training state.

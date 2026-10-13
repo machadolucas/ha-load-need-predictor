@@ -668,3 +668,121 @@ async def test_unload_drains_an_in_flight_boost_before_flushing(
 
     saved = hass_storage[f"{DOMAIN}.{entry.entry_id}"]["data"]
     assert saved[sid]["tank"]["boost_armed"] is False  # the flush saw the cooldown
+
+
+async def test_shadow_observations_never_change_control_and_feedback_survives_reload(
+    hass: HomeAssistant, freezer
+) -> None:
+    """Real tracker/service path: a candidate correction cannot change control."""
+    from homeassistant.exceptions import ServiceValidationError
+
+    hass.states.async_set(_ENERGY, "100", _KWH)
+    hass.states.async_set(_WATER, "1000", {"unit_of_measurement": "L"})
+    hass.states.async_set(_SWITCH, "off")
+    hass.states.async_set(_LED, "off")
+    hass.states.async_set("binary_sensor.shower", "off")
+    hass.states.async_set("sensor.humidity", "35", {"unit_of_measurement": "%"})
+    base = {**_TANK_LOAD, "tank_boost_soc_pct": None}
+    observed = {
+        **base,
+        "name": "Observed",
+        "shower_motion_entity": "binary_sensor.shower",
+        "shower_humidity_entity": "sensor.humidity",
+    }
+    entry = await _setup(hass, [base, observed])
+    coord, tracker = entry.runtime_data.load, entry.runtime_data.tank
+    plain_sid, observed_sid = list(entry.subentries)
+    tracker.async_shutdown_ticker()  # This test explicitly drives each tick.
+    for minute in range(1, 11):
+        freezer.tick(timedelta(minutes=1))
+        if 4 <= minute <= 6:
+            hass.states.async_set(
+                _WATER, str(1000 + (minute - 3) * 10), {"unit_of_measurement": "L"}
+            )
+            hass.states.async_set("binary_sensor.shower", "on")
+            hass.states.async_set(
+                "sensor.humidity", str(35 + (minute - 3) * 2), {"unit_of_measurement": "%"}
+            )
+        elif minute > 6:
+            hass.states.async_set("binary_sensor.shower", "off")
+        await hass.async_block_till_done()
+        await tracker.async_tick()
+        assert coord.tanks[plain_sid] == coord.tanks[observed_sid]
+    events = coord.tank_observations[observed_sid]["events"]
+    assert any(e["confidence"] == "confident" for e in events), [
+        e["quality_reasons"] for e in events
+    ]
+    event = next(e for e in events if e["confidence"] == "confident")
+    assert event["water_l"] == 30
+    assert event["correction_kwh"] > 0
+    control_before = coord.tanks[observed_sid]
+    eid = _sensor_id(hass, observed_sid, "tank_soc")
+    service_data = {"entity_id": eid, "event_id": event["id"], "comfort": "not_warm_enough"}
+    with patch.object(coord, "async_predict_and_push", new=AsyncMock()) as push:
+        await hass.services.async_call(DOMAIN, "report_shower_comfort", service_data, blocking=True)
+        push.assert_not_called()
+    assert coord.tanks[observed_sid] == control_before
+    assert hass.states.get(eid).attributes["recent_showers"][0]["feedback"] == "not_warm_enough"
+    assert hass.states.get(eid).attributes["hot_water_availability"] == "unknown"
+    assert "showers_left" not in hass.states.get(eid).attributes
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            "report_shower_comfort",
+            {**service_data, "event_id": "wrong-load-or-expired"},
+            blocking=True,
+        )
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    restored = entry.runtime_data.load.tank_observations[observed_sid]
+    assert (
+        next(e for e in restored["events"] if e["id"] == event["id"])["feedback"]
+        == "not_warm_enough"
+    )
+
+
+async def test_short_motion_pulse_between_ticks_is_observed(hass: HomeAssistant, freezer) -> None:
+    load = {**_TANK_LOAD, "shower_motion_entity": "binary_sensor.shower"}
+    hass.states.async_set("binary_sensor.shower", "off")
+    entry = await _setup(hass, [load])
+    tracker = entry.runtime_data.tank
+    hass.states.async_set("binary_sensor.shower", "on")
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=10))
+    hass.states.async_set("binary_sensor.shower", "off")
+    await hass.async_block_till_done()
+    assert "binary_sensor.shower" in tracker._motion_seen
+    await tracker.async_tick()
+    assert not tracker._motion_seen
+    tracker.async_shutdown_ticker()
+    assert tracker._unsub_motion is None
+
+
+async def test_observation_failure_does_not_break_tank(hass: HomeAssistant) -> None:
+    entry = await _setup(hass)
+    tracker = entry.runtime_data.tank
+    with patch(
+        "custom_components.load_need_predictor.tank_tracker.advance_observation",
+        side_effect=ValueError("bad diagnostic state"),
+    ):
+        await tracker.async_tick()
+    result = tracker.data[_tank_sid(entry)]
+    assert result.soc_pct is not None
+    assert "Shower observations unavailable" in result.quality_warnings
+
+
+def test_appliance_unknown_is_not_idle() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from custom_components.load_need_predictor.tank_tracker import TankTracker
+
+    tracker = object.__new__(TankTracker)
+    tracker.hass = SimpleNamespace(states=Mock())
+    tracker.hass.states.get.return_value = SimpleNamespace(state="mystery")
+    assert tracker._appliance_activity(("sensor.washer",)) is None
+    tracker.hass.states.get.return_value = SimpleNamespace(state="running")
+    assert tracker._appliance_activity(("sensor.washer",)) is True
+    tracker.hass.states.get.return_value = SimpleNamespace(state="idle")
+    assert tracker._appliance_activity(("sensor.washer",)) is False
+    assert tracker._appliance_activity(()) is False

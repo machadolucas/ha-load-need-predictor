@@ -240,3 +240,23 @@ async def test_load_runtime_without_tank_key(hass: HomeAssistant) -> None:
 
     assert sid not in coordinator.tanks
     assert coordinator.models[sid].gain == 1.1
+
+
+async def test_feedback_save_verifies_disk_even_if_store_swallows_failure(hass, hass_storage):
+    import pytest
+    from homeassistant.helpers.storage import Store
+    from homeassistant.util import json as json_util
+
+    from custom_components.load_need_predictor.persistence import PredictorStore
+
+    store = PredictorStore(hass, "feedback-test")
+    payload = {
+        "load": {"tank_observations": {"events": [{"id": "shower", "feedback": "comfortable"}]}}
+    }
+    await store.async_save_feedback(payload, "load", "shower", "comfortable")
+    payload["load"]["tank_observations"]["events"][0]["feedback"] = "not_warm_enough"
+    with patch.object(
+        Store, "_async_write_data", side_effect=json_util.SerializationError("disk failed")
+    ):
+        with pytest.raises(ValueError, match="verified in storage"):
+            await store.async_save_feedback(payload, "load", "shower", "not_warm_enough")

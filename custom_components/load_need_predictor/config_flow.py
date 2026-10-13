@@ -24,6 +24,7 @@ from homeassistant.helpers import selector
 
 from .const import (
     CONF_CAPTURE_TIME,
+    CONF_COLD_APPLIANCE_ENTITIES,
     CONF_CONTROLLED_SWITCH_ENTITY,
     CONF_DEFICIT_CAP_MINUTES,
     CONF_DELIVERED_ENERGY_ENTITY,
@@ -41,6 +42,10 @@ from .const import (
     CONF_PRICE_ENTITY,
     CONF_PRICE_SERIES_ENTITY,
     CONF_RATED_POWER_KW,
+    CONF_SHOWER_HUMIDITY_ENTITY,
+    CONF_SHOWER_MOTION_ENTITY,
+    CONF_SHOWER_TARGET_TEMP_C,
+    CONF_SHOWER_VENTILATION_ENTITY,
     CONF_SUPPLY_TEMP_ENTITY,
     CONF_TANK_BOOST_SOC_PCT,
     CONF_TANK_COLD_IN_C,
@@ -62,6 +67,7 @@ from .const import (
     DEFAULT_NAME,
     DEFAULT_PREDICT_TIME,
     DEFAULT_RATED_POWER_KW,
+    DEFAULT_SHOWER_TARGET_TEMP_C,
     DEFAULT_TANK_COLD_IN_C,
     DEFAULT_TANK_SETPOINT_C,
     DEFAULT_TANK_VOLUME_L,
@@ -204,6 +210,39 @@ def _load_schema(defaults: dict) -> vol.Schema:
                 )
             ),
             vol.Optional(
+                CONF_SHOWER_MOTION_ENTITY, description=suggest(CONF_SHOWER_MOTION_ENTITY)
+            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="binary_sensor")),
+            vol.Optional(
+                CONF_SHOWER_HUMIDITY_ENTITY, description=suggest(CONF_SHOWER_HUMIDITY_ENTITY)
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", device_class="humidity")
+            ),
+            vol.Optional(
+                CONF_SHOWER_VENTILATION_ENTITY,
+                description=suggest(CONF_SHOWER_VENTILATION_ENTITY),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["binary_sensor", "input_boolean"])
+            ),
+            vol.Optional(
+                CONF_COLD_APPLIANCE_ENTITIES, description=suggest(CONF_COLD_APPLIANCE_ENTITIES)
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["binary_sensor", "sensor", "input_boolean"], multiple=True
+                )
+            ),
+            vol.Optional(
+                CONF_SHOWER_TARGET_TEMP_C,
+                default=defaults.get(CONF_SHOWER_TARGET_TEMP_C, DEFAULT_SHOWER_TARGET_TEMP_C),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=30,
+                    max=45,
+                    step=1,
+                    unit_of_measurement="°C",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
                 CONF_MIN_MINUTES, default=defaults.get(CONF_MIN_MINUTES, DEFAULT_MIN_MINUTES)
             ): _minutes_selector(),
             vol.Optional(
@@ -303,6 +342,9 @@ def _validate_load(data: dict) -> dict[str, str]:
         errors[CONF_MAX_MINUTES] = "invalid_runtime_band"
     if data.get(CONF_HEATING_ACTIVE_ENTITY) and not data.get(CONF_CONTROLLED_SWITCH_ENTITY):
         errors[CONF_HEATING_ACTIVE_ENTITY] = "heating_needs_switch"
+    target = float(data.get(CONF_SHOWER_TARGET_TEMP_C, DEFAULT_SHOWER_TARGET_TEMP_C))
+    if not 30 <= target <= 45:
+        errors[CONF_SHOWER_TARGET_TEMP_C] = "invalid_shower_temperature"
     return errors
 
 

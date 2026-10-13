@@ -153,6 +153,55 @@ def test_load_error_strings_exist() -> None:
         assert {"invalid_runtime_band", "heating_needs_switch"} <= set(errors)
 
 
+async def test_load_observation_defaults_do_not_select_household_sources(hass):
+    entry, result = await _start_load_flow(hass)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "LVV", "delivered_energy_entity": "sensor.e"}
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"]["shower_target_temp_c"] == 40
+    for key in (
+        "shower_motion_entity",
+        "shower_humidity_entity",
+        "shower_ventilation_entity",
+        "cold_appliance_entities",
+    ):
+        assert key not in result["data"]
+    await hass.async_block_till_done()
+
+
+async def test_load_observation_source_fields(hass):
+    entry, result = await _start_load_flow(hass)
+    sources = {
+        "shower_motion_entity": "binary_sensor.shower_motion",
+        "shower_humidity_entity": "sensor.bathroom_humidity",
+        "shower_ventilation_entity": "input_boolean.shower_boost",
+        "cold_appliance_entities": ["binary_sensor.dishwasher", "sensor.washer_run_state"],
+        "shower_target_temp_c": 38,
+    }
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "LVV", "delivered_energy_entity": "sensor.e", **sources}
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    for key, value in sources.items():
+        assert result["data"][key] == value
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("target", [29, 46])
+async def test_load_shower_temperature_rejected(hass, target):
+    entry, result = await _start_load_flow(hass)
+    with pytest.raises(InvalidData):
+        await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            {
+                "name": "LVV",
+                "delivered_energy_entity": "sensor.e",
+                "shower_target_temp_c": target,
+            },
+        )
+
+
 async def test_add_price_forecast_subentry(hass: HomeAssistant) -> None:
     entry = MockConfigEntry(domain=DOMAIN, data={"name": "Predictor"})
     entry.add_to_hass(hass)

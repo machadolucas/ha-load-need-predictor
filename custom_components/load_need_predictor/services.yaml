@@ -1,0 +1,28 @@
+report_shower_comfort:
+  name: Report shower comfort
+  description: >-
+    Attach an optional comfort observation to a retained shower event. This does
+    not change tank charge, heating, or the scheduler target.
+  target:
+    entity:
+      integration: load_need_predictor
+      domain: sensor
+  fields:
+    event_id:
+      name: Shower event
+      description: Event ID from the estimated stored heat sensor's recent_showers attribute.
+      required: true
+      selector:
+        text:
+    comfort:
+      name: Comfort
+      required: true
+      selector:
+        select:
+          options:
+            - label: Comfortable
+              value: comfortable
+            - label: Cooler than usual
+              value: cooler_than_usual
+            - label: Not warm enough
+              value: not_warm_enough

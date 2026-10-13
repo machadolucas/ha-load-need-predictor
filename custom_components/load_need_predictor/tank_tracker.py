@@ -24,7 +24,7 @@ and asks the load coordinator to persist.
 
 **Two deficits, two audiences.** The model keeps a clamped *control* ledger and
 a saturation-curve *display* deficit (see :mod:`tank_model`). What we publish as
-``deficit_kwh`` (and therefore the SoC %, litres and showers) is the shown one:
+``deficit_kwh`` (and therefore the stored-heat %) is the shown one:
 it reaches exactly 100 % only on a real anchor *transition* and then drifts back
 down as the tank relaxes past the thermostat trip — a latched tank is **not**
 held at 100 %. The raw control ledger rides along as ``deficit_raw_kwh``, which
@@ -47,16 +47,24 @@ consume the trigger), and a failed push is retried at most every
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
-from dataclasses import dataclass, replace
+import math
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from homeassistant.const import UnitOfEnergy, UnitOfVolume
+from homeassistant.const import UnitOfEnergy, UnitOfTemperature, UnitOfVolume
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
-from homeassistant.util.unit_conversion import BaseUnitConverter, EnergyConverter, VolumeConverter
+from homeassistant.util.unit_conversion import (
+    BaseUnitConverter,
+    EnergyConverter,
+    TemperatureConverter,
+    VolumeConverter,
+)
 
 from . import occupancy
 from .const import DOMAIN, TANK_TICK_SECONDS
@@ -73,9 +81,14 @@ from .tank_model import (
     profile_of,
     rebind_sources,
     should_boost,
-    showers_left,
 )
 from .tank_model import soc as model_soc
+from .tank_observation import (
+    ObservationInputs,
+    advance_observation,
+    record_feedback,
+    summarize_observation,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,7 +133,10 @@ class TankResult:
     last_full: str | None
     draw_source: str
     liters_40c: float
-    showers_left: float
+    anchor_age_hours: float | None = None
+    quality_warnings: list[str] = field(default_factory=list)
+    observation: dict = field(default_factory=dict)
+    observation_enabled: bool = False
 
 
 class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
@@ -140,6 +156,8 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         )
         self._load = load
         self._unsub: callable | None = None
+        self._unsub_motion: callable | None = None
+        self._motion_seen: set[str] = set()
         self._ticks = 0
         # Per-load "don't retry the boost push before" after a failed push
         # (in memory: a restart may retry at once, which is harmless).
@@ -174,6 +192,22 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         if self._unsub is not None or not self.has_tanks:
             return
         self._unsub = async_track_time_interval(self.hass, self._handle_tick, TICK_INTERVAL)
+        motion_entities = {
+            cfg.shower_motion_entity
+            for cfg in self.tank_configs().values()
+            if cfg.shower_motion_entity
+        }
+        if motion_entities:
+            self._unsub_motion = async_track_state_change_event(
+                self.hass, motion_entities, self._record_motion
+            )
+
+    @callback
+    def _record_motion(self, event) -> None:
+        """Remember short motion pulses between the one-minute ticks."""
+        new = event.data.get("new_state")
+        if new is not None and new.state == "on":
+            self._motion_seen.add(event.data["entity_id"])
 
     @callback
     def async_shutdown_ticker(self) -> None:
@@ -181,6 +215,10 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
+        if self._unsub_motion is not None:
+            self._unsub_motion()
+            self._unsub_motion = None
+        self._motion_seen.clear()
 
     async def _handle_tick(self, now: datetime) -> None:
         """Timer callback → run one tick."""
@@ -292,6 +330,7 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         if persist_needed:
             self._load.async_persist()
         self.async_set_updated_data(results)
+        self._motion_seen.clear()
 
     async def _tick_one(
         self, sid: str, cfg: LoadConfig, now: datetime, now_iso: str
@@ -391,8 +430,8 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
                 self._boost_tasks.add(task)
                 task.add_done_callback(self._boost_tasks.discard)
 
-        # Litres/showers are a *display* figure, so they follow the shown deficit
-        # (the same number the SoC % is derived from) — not the control ledger.
+        # Energy-equivalent litres follow the display ledger. They cannot establish
+        # usable volume without an outlet temperature and a stratification model.
         available_kwh = tick.capacity_kwh - tick.deficit_shown_kwh
         liters_40c = liters_at_temp(available_kwh, cfg.tank_cold_in_c)
         result = TankResult(
@@ -412,9 +451,161 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             last_full=tick.state.last_anchor_iso or None,
             draw_source=tick.draw_source,
             liters_40c=liters_40c,
-            showers_left=showers_left(liters_40c),
         )
-        return result, tick.anchored
+        # Observation failures must never prevent the existing tank/boost paths
+        # from publishing. No observation value is fed back into either path.
+        observation_changed = False
+        try:
+            observation_changed = self._observe(sid, cfg, state, tick, inputs, result, now)
+        except Exception:  # noqa: BLE001 - diagnostic path cannot break control
+            _LOGGER.exception("Tank observation failed for load %s", sid)
+            result.quality_warnings.append("Shower observations unavailable")
+        return result, tick.anchored or observation_changed
+
+    def _number(self, entity_id: str | None, *, temperature: bool = False) -> float | None:
+        """Read diagnostic context without guessing temperature units."""
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if state is None:
+            return None
+        try:
+            value = float(state.state)
+            if temperature:
+                value = TemperatureConverter.convert(
+                    value, state.attributes.get("unit_of_measurement"), UnitOfTemperature.CELSIUS
+                )
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _appliance_activity(self, entity_ids: tuple[str, ...]) -> bool | None:
+        """Known idle states are evidence; an unfamiliar enum is uncertainty."""
+        active = {"on", "running", "run", "washing", "rinsing", "spinning", "drying"}
+        idle = {"off", "idle", "standby", "stop", "stopped", "finished", "complete", "completed"}
+        unknown = False
+        for entity_id in entity_ids:
+            state = self.hass.states.get(entity_id)
+            value = state.state.lower() if state else "unknown"
+            if value in active:
+                return True
+            if value not in idle:
+                unknown = True
+        return None if unknown else False
+
+    def _observe(self, sid, cfg, previous, tick, inputs, result, now) -> bool:
+        """Store an independent shadow comparison, never a heating input."""
+        anchor = dt_util.parse_datetime(result.last_full) if result.last_full else None
+        result.anchor_age_hours = (
+            max(0.0, (now - anchor).total_seconds() / 3600) if anchor else None
+        )
+        warnings = result.quality_warnings
+        if not result.calibrated:
+            warnings.append("No full-tank anchor observed yet")
+        elif result.anchor_age_hours is not None and result.anchor_age_hours > 48:
+            warnings.append("Last full-tank anchor is more than 48 hours old")
+        if not tick.state.cycle_clean:
+            warnings.append("Current tank cycle contains missing or unreliable readings")
+        if tick.draw_source == "fallback":
+            warnings.append("Water consumption uses an occupancy fallback")
+        if inputs.energy_counter_kwh is None:
+            warnings.append("Heating energy counter unavailable")
+        if inputs.water_counter_l is None:
+            warnings.append("Water counter unavailable")
+        if tick.uncertainty_kwh > tick.capacity_kwh * 0.10:
+            warnings.append(
+                "Model uncertainty scale exceeds 10% of capacity; not a confidence interval"
+            )
+        motion, _ = self._bool_and_duration(cfg.shower_motion_entity, now)
+        if motion is not None and cfg.shower_motion_entity in self._motion_seen:
+            motion = True
+        ventilation, _ = self._bool_and_duration(cfg.shower_ventilation_entity, now)
+        result.observation_enabled = bool(cfg.shower_motion_entity and cfg.water_total_entity)
+        if result.observation_enabled and motion is None:
+            warnings.append("Shower motion unavailable; event attribution uncertain")
+        signature = hashlib.sha256(
+            json.dumps(
+                [
+                    cfg.water_total_entity,
+                    cfg.delivered_energy_entity,
+                    cfg.shower_motion_entity,
+                    cfg.shower_humidity_entity,
+                    cfg.shower_ventilation_entity,
+                    cfg.cold_appliance_entities,
+                    cfg.supply_temp_entity,
+                    cfg.shower_target_temp_c,
+                    cfg.tank_cold_in_c,
+                    cfg.tank_setpoint_c,
+                    cfg.tank_volume_l,
+                ]
+            ).encode()
+        ).hexdigest()
+        saved = self._load.tank_observations.get(sid)
+        updated = advance_observation(
+            saved,
+            ObservationInputs(
+                now_iso=inputs.now_iso,
+                source_signature=signature,
+                water_l=inputs.water_counter_l,
+                motion=motion,
+                humidity=self._number(cfg.shower_humidity_entity),
+                ventilation=ventilation,
+                appliance_active=self._appliance_activity(cfg.cold_appliance_entities),
+                supply_temp_c=self._number(cfg.supply_temp_entity, temperature=True),
+                target_temp_c=cfg.shower_target_temp_c,
+                cold_in_c=cfg.tank_cold_in_c,
+                baseline_draw_kwh=tick.draw_kwh,
+                energy_in_kwh=tick.energy_in_kwh,
+                standby_kwh=tick.standby_kwh,
+                previous_cycle_unclamped_kwh=(
+                    previous.cycle_unclamped_kwh
+                    if previous.cycle_unclamped_kwh is not None
+                    else previous.deficit_kwh
+                ),
+                previous_cycle_clean=(
+                    previous.cycle_clean
+                    and tick.draw_source != "fallback"
+                    and inputs.energy_counter_kwh is not None
+                    and inputs.water_counter_l is not None
+                ),
+                anchored=tick.anchored,
+                tank_capacity_kwh=tick.capacity_kwh,
+                tank_deficit_kwh=tick.state.deficit_kwh,
+                shown_deficit_kwh=tick.deficit_shown_kwh,
+                uncertainty_kwh=tick.uncertainty_kwh,
+                draw_source=tick.draw_source,
+                water_source_quality=(
+                    "valid"
+                    if inputs.water_counter_l is not None and tick.draw_source != "fallback"
+                    else "unavailable"
+                ),
+                energy_available=inputs.energy_counter_kwh is not None,
+            ),
+        )
+        self._load.tank_observations[sid] = updated
+        result.observation = summarize_observation(updated)
+        # Event/anchor transitions are promptly saved; active accumulators also
+        # ride the existing periodic save and final unload flush.
+        return len(updated.get("events", [])) != len((saved or {}).get("events", []))
+
+    async def async_report_shower_comfort(self, sid: str, event_id: str, comfort: str) -> None:
+        """Attach feedback to one retained event without ticking or actuating."""
+        if self._load._closing or sid not in self.tank_configs():
+            raise ValueError("Tank observation is not active")
+        saved = self._load.tank_observations.get(sid)
+        updated = record_feedback(
+            saved, event_id=event_id, report=comfort, now_iso=dt_util.utcnow().isoformat()
+        )
+        self._load.tank_observations[sid] = updated
+        self._load.async_persist()
+        # Confirm success only after durable storage; do not use async_flush,
+        # which closes the coordinator for unloading.
+        await self._load._store.async_save_feedback(
+            self._load._runtime_snapshot(), sid, event_id, comfort
+        )
+        if sid in (self.data or {}):
+            result = replace(
+                self.data[sid], observation=summarize_observation(self._load.tank_observations[sid])
+            )
+            self.async_set_updated_data({**self.data, sid: result})
 
     async def async_drain(self, timeout: float = 30.0) -> None:
         """Wait (bounded) for in-flight boost pushes — call after stopping the tick."""

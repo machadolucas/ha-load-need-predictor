@@ -165,12 +165,17 @@ exactly as the plain daily model above. When enabled,
 `breakdown` attribute (and the dashboard card) splits out the need, the backlog,
 and the final target.
 
-### Tank charge % — how much hot water is left
+### Estimated stored heat — an energy balance
 
-An opt-in, continuously updated **state-of-charge estimate** for the hot-water
+An opt-in, continuously updated **stored-heat estimate** for the hot-water
 tank: `sensor.<load>_tank_charge` (0–100 %). It tracks the tank's **energy
 deficit below "full at setpoint"** with a minute-by-minute balance, then turns
-that into a percentage:
+that into a percentage. This is an energy estimate, not a measurement of outlet
+water temperature or guaranteed shower availability. **Hot-water availability is
+unknown**: stratification, mixing, flow and the temperature of the upper layer
+can make a shower cool even when the energy balance reports heat remaining.
+
+The estimate uses:
 
 - **Energy in** from the delivered-energy counter's deltas (cumulative, so
   restarts and HA downtime lose nothing). Any energy unit HA knows (Wh, kWh,
@@ -189,8 +194,9 @@ that into a percentage:
 
 **What "100 %" actually means.** When the contactor is commanded *on* but the
 heating-active detector shows the element *idle* for a sustained spell, the
-tank's own thermostat has just tripped — the tank is genuinely full, and that
-is the *only* moment the sensor reads 100 %:
+tank's own thermostat has just tripped — the model anchors its energy balance
+to the configured setpoint. This does not prove that every layer has that
+temperature. That transition is the *only* moment the sensor reads 100 %:
 
 - **While the element is heating**, the % climbs smoothly toward full and only
   actually touches 100 at the trip itself — never before it.
@@ -234,11 +240,17 @@ Attributes carry the full rationale:
 | `latched` | Whether the tank is currently sitting right at a trip (contactor on, element idle). |
 | `last_full` | Timestamp of the most recent trip. |
 | `draw_source` | Where this tick's draw came from: the water meter, the occupancy fallback, or none (a brief meter gap). |
-| `liters_40c` | The hot water still available, as an equivalent volume of comfortable 40 °C water. |
-| `showers_left` | The same, expressed as roughly how many showers remain. |
+| `equivalent_liters_40c` | Optional energy-equivalent litres at 40 °C under the accompanying assumption; not measured usable water. |
+| `equivalent_liters_assumption` | Explicit mixing/temperature assumption needed to interpret equivalent litres. |
+| `comfort_risk` | `unknown` with sparse reports; after five reports, a descriptive report-history label, never a temperature or comfort guarantee. |
+| `anchor_age_hours` | Time since the most recent thermostat anchor, or unknown before an anchor. |
+| `quality_warnings` | Current gaps, fallback inputs or other limitations of the estimate. |
+| `observation_enabled` | Whether optional shower observation sources have been configured. |
+| `recent_showers` | Up to 10 recent possible shower events, newest first, with event ID, times, metered litres, confidence and any comfort feedback. |
+| `comfort_feedback_supported` | Whether this backend supports the card's comfort-feedback service. |
 
 The minute-by-minute attributes (`deficit_kwh`, `deficit_raw_kwh`,
-`uncertainty_kwh`, `latched`, `draw_source`, `liters_40c`, `showers_left`) are
+`uncertainty_kwh`, `latched`, `draw_source` and recent observations) are
 live-only — they aren't written to the recorder, so they don't bloat the
 database; the charge % itself and the learned parameters keep their history.
 
@@ -275,7 +287,7 @@ features above.
 | `sensor.<load>_prediction_error` | Yesterday's \|predicted − actual\| in minutes. |
 | `sensor.<load>_rolling_mae` | Rolling mean absolute error (minutes) over the evaluation window. |
 | `sensor.<load>_sample_count` | How many self-logged days the model has learned from. |
-| `sensor.<load>_tank_charge` | Opt-in: estimated hot-water charge (%) — 100 % only right at a thermostat trip, drifting down until the next one. Attributes carry the energy deficit/uncertainty, learned per-daypart parameters, calibration/latch state and a "showers left" estimate. |
+| `sensor.<load>_tank_charge` | Opt-in: estimated stored heat (%) — 100 % only right at a thermostat anchor, drifting down until the next one. Attributes carry the energy deficit/uncertainty, learned parameters, anchor age, quality warnings and optional shower observations. Hot-water availability remains unknown. |
 | `button.<load>_predict_now` | Recompute the prediction and push it to the scheduler **now** (no need to wait for the daily predict time). |
 
 ### When does it run? Publish time & DST
@@ -405,14 +417,71 @@ MAE.
 
 The large attributes are excluded from the recorder.
 
+## Shower observations and comfort feedback (shadow mode)
+
+Optional shower-area motion, bathroom humidity, shower ventilation boost and
+cold-water appliance activity provide context for possible shower events. Water
+flow is household flow: a toilet, washing machine or dishwasher can overlap a
+shower. Evidence and confidence are recorded; an unavailable input stays unknown.
+These observations and comfort reports **do not change heating targets, boosts,
+energy accounting or learned tank parameters**. They are retained for 90 days to
+compare events with real comfort before making any control-model changes.
+
+Configure these fields by reconfiguring the load under *Settings → Devices &
+services → Load Need Predictor*. Every source is optional and starts empty. Shower event recording needs both
+the shower-area motion source and the existing household water meter; humidity
+and ventilation add supporting evidence.
+Examples from the author's existing household (select your own entities):
+
+| Field | Existing source example |
+|---|---|
+| Shower-area motion | `binary_sensor.shower_motion_sensor_occupancy` |
+| Bathroom humidity | `sensor.core_humidity` |
+| Shower ventilation boost | `input_boolean.ventilation_boost_reason_shower` |
+| Cold-water appliance activity | `binary_sensor.dishwasher_running`, `sensor.front_load_washer` |
+| Household water total (existing field) | `sensor.water_meter_mac_ocr_water_total` (m³; converted to litres) |
+
+Prefer actual binary running signals for appliances. For status sensors, select
+an actual run-state sensor rather than the appliance's general availability.
+The **preferred shower temperature** is 40 °C by default and accepts 30–45 °C;
+it records an observation assumption and does not alter the tank thermostat.
+`sensor.supply_water_temperature` remains log-only: municipal supply temperature
+is not a measurement of the tank inlet or outlet temperature.
+
+In the dashboard card, choose the recent event matching the shower, then select
+**Comfortable**, **Cooler than usual** or **Not warm enough**. The card waits for
+the service result and shows success or failure; it offers no feedback controls
+when connected to an older backend without that capability. Events and source
+confidence are visible even when you have not reported comfort.
+
+The same report can be made through *Developer tools → Actions*:
+
+```yaml
+action: load_need_predictor.report_shower_comfort
+data:
+  entity_id: sensor.your_existing_tank_sensor
+  event_id: "copy-the-id-from-recent_showers"
+  comfort: not_warm_enough
+```
+
+Use the load's actual tank sensor ID (it may retain its previous name) and the
+ID of a specific logged event. Allowed comfort values are `comfortable`,
+`cooler_than_usual` and `not_warm_enough`. Feedback is attached to that event;
+it is not a command to turn on heating.
+
 ## Dashboard card
 
 A bundled Lovelace card explains, in plain language, **how** each number was
 calculated — the occupancy/baseline/gain breakdown behind every load's runtime
 (plus any carried-over backlog), and the wind/temperature regression behind the
 price forecast — with a "Predict now" / "Update forecast now" button on each.
-Loads with tank tracking enabled also get a live **tank-charge bar** (red below
-25 %, with a "showers left" hint).
+Loads with tank tracking enabled also get a live **estimated stored heat bar**
+(red below 25 %), anchor age and quality warnings. The card explicitly shows
+**Hot-water availability unknown**. It never converts the percentage into a
+"showers left" claim. If energy-equivalent litres are provided together with an
+explicit assumption, they appear as a conditional diagnostic with that caveat.
+A backend exposing recent shower observations and feedback support also gets an
+event selector and three comfort feedback buttons.
 
 The integration **auto-registers** the card on startup — it adds itself to the
 Lovelace **resource registry** (the same mechanism HACS uses), so no manual
@@ -493,3 +562,8 @@ data findings behind the design.
 ## License
 
 MIT © Lucas Machado
+
+Shower event details stay in the local Home Assistant Store (and its backups).
+Downloaded diagnostics expose aggregate feedback and anchor-cycle evaluation, not
+individual shower timestamps or ratings. The 90-day retention is enforced during
+tracking and normal load/save operations even if tank tracking is disabled.

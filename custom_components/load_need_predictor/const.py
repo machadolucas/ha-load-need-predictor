@@ -72,6 +72,12 @@ CONF_TANK_COLD_IN_C = "tank_cold_in_c"
 # Optional low-charge boost threshold; below this calibrated SoC the tracker
 # re-runs predict+push so the scheduler plans more heating. Empty disables.
 CONF_TANK_BOOST_SOC_PCT = "tank_boost_soc_pct"
+# Optional observation sources: recorded in shadow mode, never control heating.
+CONF_SHOWER_MOTION_ENTITY = "shower_motion_entity"
+CONF_SHOWER_HUMIDITY_ENTITY = "shower_humidity_entity"
+CONF_SHOWER_VENTILATION_ENTITY = "shower_ventilation_entity"
+CONF_COLD_APPLIANCE_ENTITIES = "cold_appliance_entities"
+CONF_SHOWER_TARGET_TEMP_C = "shower_target_temp_c"
 
 # Output clamp (minutes/day).
 CONF_MIN_MINUTES = "min_minutes"
@@ -135,6 +141,7 @@ DEFAULT_TANK_VOLUME_L = 300.0
 DEFAULT_TANK_SETPOINT_C = 75.0
 DEFAULT_TANK_COLD_IN_C = 12.0
 DEFAULT_TANK_BOOST_SOC_PCT = 20.0
+DEFAULT_SHOWER_TARGET_TEMP_C = 40.0
 TANK_TICK_SECONDS = 60  # tank tracker tick cadence
 
 # ── Deficit carryover ────────────────────────────────────────────────────────

@@ -147,8 +147,16 @@ _TANK_ATTRS = {
     "latched",
     "last_full",
     "draw_source",
-    "liters_40c",
-    "showers_left",
+    "equivalent_liters_40c",
+    "anchor_age_hours",
+    "quality_warnings",
+    "recent_showers",
+    "shadow_evaluation",
+    "comfort_risk",
+    "equivalent_liters_assumption",
+    "hot_water_availability",
+    "observation_enabled",
+    "comfort_feedback_supported",
 }
 _HA_MANAGED = {"state_class", "unit_of_measurement", "icon", "friendly_name", "device_class"}
 
@@ -195,8 +203,12 @@ def test_tank_soc_volatile_attributes_are_unrecorded() -> None:
         "uncertainty_kwh",
         "latched",
         "draw_source",
-        "liters_40c",
-        "showers_left",
+        "equivalent_liters_40c",
+        "anchor_age_hours",
+        "quality_warnings",
+        "recent_showers",
+        "shadow_evaluation",
+        "comfort_risk",
     }
     unrecorded = TankSocSensor._unrecorded_attributes
     assert volatile <= unrecorded

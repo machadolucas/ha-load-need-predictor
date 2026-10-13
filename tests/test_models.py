@@ -105,6 +105,49 @@ def test_tank_boost_empty_string_disables():
     assert cfg.tank_boost_soc_pct is None
 
 
+def test_observation_sources_default_to_absent():
+    cfg = load_config_from_data({CONF_NAME: "LVV"})
+    assert cfg.shower_motion_entity is None
+    assert cfg.shower_humidity_entity is None
+    assert cfg.shower_ventilation_entity is None
+    assert cfg.cold_appliance_entities == ()
+    assert cfg.shower_target_temp_c == 40.0
+
+
+def test_observation_sources_round_trip():
+    cfg = load_config_from_data(
+        {
+            CONF_NAME: "LVV",
+            "shower_motion_entity": "binary_sensor.shower_motion",
+            "shower_humidity_entity": "sensor.bathroom_humidity",
+            "shower_ventilation_entity": "input_boolean.shower_boost",
+            "cold_appliance_entities": ["binary_sensor.dishwasher", "sensor.washer_run_state"],
+            "shower_target_temp_c": 38,
+        }
+    )
+    assert cfg.shower_motion_entity == "binary_sensor.shower_motion"
+    assert cfg.shower_humidity_entity == "sensor.bathroom_humidity"
+    assert cfg.shower_ventilation_entity == "input_boolean.shower_boost"
+    assert cfg.cold_appliance_entities == ("binary_sensor.dishwasher", "sensor.washer_run_state")
+    assert cfg.shower_target_temp_c == 38.0
+
+
+def test_single_cold_appliance_normalised_to_tuple():
+    cfg = load_config_from_data({"cold_appliance_entities": "binary_sensor.dishwasher"})
+    assert cfg.cold_appliance_entities == ("binary_sensor.dishwasher",)
+
+
+@pytest.mark.parametrize("target", [29, 46, float("nan"), float("inf")])
+def test_observation_target_rejects_invalid_temperature(target):
+    with pytest.raises(ValueError, match="shower_target_temp_c"):
+        load_config_from_data({"shower_target_temp_c": target})
+
+
+@pytest.mark.parametrize("target", [30, 45])
+def test_observation_target_allows_boundary_temperature(target):
+    assert load_config_from_data({"shower_target_temp_c": target}).shower_target_temp_c == target
+
+
 # ── price-forecast subentry mapping ──────────────────────────────────────────
 
 

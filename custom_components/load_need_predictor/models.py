@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .const import (
+    CONF_COLD_APPLIANCE_ENTITIES,
     CONF_CONTROLLED_SWITCH_ENTITY,
     CONF_DEFICIT_CAP_MINUTES,
     CONF_DELIVERED_ENERGY_ENTITY,
@@ -27,6 +28,10 @@ from .const import (
     CONF_PRICE_ENTITY,
     CONF_PRICE_SERIES_ENTITY,
     CONF_RATED_POWER_KW,
+    CONF_SHOWER_HUMIDITY_ENTITY,
+    CONF_SHOWER_MOTION_ENTITY,
+    CONF_SHOWER_TARGET_TEMP_C,
+    CONF_SHOWER_VENTILATION_ENTITY,
     CONF_SUPPLY_TEMP_ENTITY,
     CONF_TANK_BOOST_SOC_PCT,
     CONF_TANK_COLD_IN_C,
@@ -46,6 +51,7 @@ from .const import (
     DEFAULT_MAX_MINUTES,
     DEFAULT_MIN_MINUTES,
     DEFAULT_RATED_POWER_KW,
+    DEFAULT_SHOWER_TARGET_TEMP_C,
     DEFAULT_TANK_COLD_IN_C,
     DEFAULT_TANK_SETPOINT_C,
     DEFAULT_TANK_VOLUME_L,
@@ -85,6 +91,12 @@ class LoadConfig:
     # actually delivered (None → carryover disabled), and the backlog cap.
     controlled_switch_entity: str | None
     deficit_cap_minutes: float
+    # Shadow observations do not change the existing energy/control ledgers.
+    shower_motion_entity: str | None = None
+    shower_humidity_entity: str | None = None
+    shower_ventilation_entity: str | None = None
+    cold_appliance_entities: tuple[str, ...] = ()
+    shower_target_temp_c: float = DEFAULT_SHOWER_TARGET_TEMP_C
 
     @property
     def tank_tracking_enabled(self) -> bool:
@@ -116,6 +128,9 @@ def load_config_from_data(data: Mapping) -> LoadConfig:
     )
     boost = data.get(CONF_TANK_BOOST_SOC_PCT)
     tank_boost_soc_pct = float(boost) if boost not in (None, "") else None
+    shower_target = float(data.get(CONF_SHOWER_TARGET_TEMP_C, DEFAULT_SHOWER_TARGET_TEMP_C))
+    if not 30 <= shower_target <= 45:
+        raise ValueError("shower_target_temp_c must be between 30 and 45 °C")
     return LoadConfig(
         name=str(data.get(CONF_NAME, "")),
         target_number_entity=data.get(CONF_TARGET_NUMBER_ENTITY),
@@ -136,6 +151,11 @@ def load_config_from_data(data: Mapping) -> LoadConfig:
         max_minutes=max_minutes,
         controlled_switch_entity=data.get(CONF_CONTROLLED_SWITCH_ENTITY),
         deficit_cap_minutes=deficit_cap_minutes,
+        shower_motion_entity=data.get(CONF_SHOWER_MOTION_ENTITY) or None,
+        shower_humidity_entity=data.get(CONF_SHOWER_HUMIDITY_ENTITY) or None,
+        shower_ventilation_entity=data.get(CONF_SHOWER_VENTILATION_ENTITY) or None,
+        cold_appliance_entities=_as_tuple(data.get(CONF_COLD_APPLIANCE_ENTITIES)),
+        shower_target_temp_c=shower_target,
     )
 
 

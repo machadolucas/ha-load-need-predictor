@@ -38,7 +38,7 @@
       "step": {
         "init": {
           "title": "Load",
-          "description": "Pick the scheduler target to drive, the delivered-energy sensor (training signal), the occupancy entities, and the runtime clamp. Temperature/water sensors are logged for a future model, not used in the prediction.",
+          "description": "Pick the scheduler target, delivery and occupancy sources, and runtime clamp. Temperature sources are log-only. Optional tank tracking estimates stored heat; shower sources record observations without changing heating control.",
           "data": {
             "name": "Name",
             "target_number_entity": "Scheduler target (number)",
@@ -50,7 +50,7 @@
             "guests_calendar_entity": "Guests calendar",
             "supply_temp_entity": "Incoming-water temperature (log-only)",
             "outdoor_temp_entity": "Outdoor temperature (log-only)",
-            "water_total_entity": "Household water total (log-only)",
+            "water_total_entity": "Household water total",
             "heating_active_entity": "Heating-active detector",
             "tank_volume_l": "Tank volume",
             "tank_setpoint_c": "Tank set temperature",
@@ -58,7 +58,12 @@
             "tank_boost_soc_pct": "Low-charge boost threshold",
             "min_minutes": "Minimum minutes/day (safety floor)",
             "max_minutes": "Maximum minutes/day (cap)",
-            "deficit_cap_minutes": "Backlog cap (minutes, optional)"
+            "deficit_cap_minutes": "Backlog cap (minutes, optional)",
+            "shower_motion_entity": "Shower-area motion (optional, observations only)",
+            "shower_humidity_entity": "Bathroom humidity (optional, observations only)",
+            "shower_ventilation_entity": "Shower ventilation boost (optional, observations only)",
+            "cold_appliance_entities": "Cold-water appliance activity (optional, observations only)",
+            "shower_target_temp_c": "Preferred shower temperature"
           },
           "data_description": {
             "target_number_entity": "The Load Scheduler target number this predictor drives (e.g. number.water_heater_lvv_target_runtime). The prediction is written here.",
@@ -70,21 +75,27 @@
             "guests_calendar_entity": "Calendar marking guest visits. Demand is weighted by visit length — a short visit (< 6 h) counts as ~half a person, a long one (≥ 6 h, likely sauna + showers) as two.",
             "supply_temp_entity": "Incoming mains-water temperature. Logged for a future model; not used in the current prediction.",
             "outdoor_temp_entity": "Outdoor temperature. Logged for a future model; not used in the current prediction.",
-            "water_total_entity": "Household water-meter total. Logged for a future model; not used in the current prediction.",
-            "heating_active_entity": "Binary sensor that is on only while the element actually draws power (contactor AND internal thermostat, e.g. an LED or current detector). Together with the controlled switch it detects 'thermostat tripped while commanded on' — the tank-is-full anchor that calibrates the charge estimate. Leave empty to disable the tank charge sensor.",
+            "water_total_entity": "Cumulative household water meter. Logged as day-ahead context; tank tracking also uses its deltas for the energy balance and optional shadow observations.",
+            "heating_active_entity": "Binary sensor that is on only while the element actually draws power (contactor AND internal thermostat, e.g. an LED or current detector). Together with the controlled switch it detects a thermostat trip while commanded on and anchors the stored-heat estimate. This does not measure outlet temperature or guarantee shower comfort. Leave empty to disable tank tracking.",
             "tank_volume_l": "Hot-water tank volume in litres.",
             "tank_setpoint_c": "The tank thermostat's set temperature.",
             "tank_cold_in_c": "Cold-water inlet temperature at the house (annual average). Used to compute the tank's energy capacity.",
             "tank_boost_soc_pct": "When the calibrated tank charge falls below this percentage, re-run predict + push immediately so the scheduler plans more heating. Leave empty to disable.",
             "min_minutes": "Lower clamp on the pushed target — a safety floor so the load never starves.",
             "max_minutes": "Upper clamp on the pushed target — a cap so a bad prediction can't over-run the load.",
-            "deficit_cap_minutes": "Largest backlog the catch-up can accumulate (minutes). Defaults to twice the daily cap — enough to recover a couple of skipped days without runaway after a long outage. Only used when a controlled switch is set."
+            "deficit_cap_minutes": "Largest backlog the catch-up can accumulate (minutes). Defaults to twice the daily cap — enough to recover a couple of skipped days without runaway after a long outage. Only used when a controlled switch is set.",
+            "shower_motion_entity": "Binary occupancy/motion sensor near the shower. Used with water and humidity to identify possible shower events; motion alone is not proof of a shower.",
+            "shower_humidity_entity": "Bathroom relative-humidity sensor. Humidity rise adds evidence to a shower event; missing readings remain unknown.",
+            "shower_ventilation_entity": "Binary sensor or input boolean indicating a shower-triggered ventilation boost. Supplemental evidence only; automatic ventilation alone does not confirm a shower.",
+            "cold_appliance_entities": "Running/status entities for cold-fed appliances such as a dishwasher or washing machine. Use actual running signals, not overall appliance availability. Unknown/unavailable states remain unknown. Used only in the shadow observation log.",
+            "shower_target_temp_c": "Preferred shower temperature (30–45 °C, default 40 °C) for observation context. This does not change the tank thermostat or heating target."
           }
         }
       },
       "error": {
         "invalid_runtime_band": "No whole 15-minute step fits between the minimum and maximum minutes/day (e.g. min 40 / max 40). Widen the range so it contains at least one multiple of 15 (e.g. 45).",
-        "heating_needs_switch": "The heating-active detector needs the controlled switch too: the tank charge is calibrated at 'contactor on + element idle', which can't be seen without the switch."
+        "heating_needs_switch": "The heating-active detector needs the controlled switch too: the tank charge is calibrated at 'contactor on + element idle', which can't be seen without the switch.",
+        "invalid_shower_temperature": "Preferred shower temperature must be between 30 and 45 °C."
       }
     },
     "price_forecast": {
@@ -128,28 +139,72 @@
   },
   "entity": {
     "sensor": {
-      "predicted_runtime": { "name": "Predicted runtime" },
-      "tank_soc": { "name": "Tank charge" },
-      "predicted_energy": { "name": "Predicted energy" },
-      "last_delivered": { "name": "Last delivered" },
-      "prediction_error": { "name": "Prediction error" },
-      "rolling_mae": { "name": "Rolling MAE" },
-      "sample_count": { "name": "Sample count" },
-      "price_forecast": { "name": "Price forecast" },
-      "forecast_error": { "name": "Forecast error" },
-      "forecast_mae": { "name": "Forecast MAE" },
-      "forecast_samples": { "name": "Forecast samples" },
-      "forecast_hourly_mae": { "name": "Forecast hourly MAE" }
+      "predicted_runtime": {
+        "name": "Predicted runtime"
+      },
+      "tank_soc": {
+        "name": "Estimated stored heat"
+      },
+      "predicted_energy": {
+        "name": "Predicted energy"
+      },
+      "last_delivered": {
+        "name": "Last delivered"
+      },
+      "prediction_error": {
+        "name": "Prediction error"
+      },
+      "rolling_mae": {
+        "name": "Rolling MAE"
+      },
+      "sample_count": {
+        "name": "Sample count"
+      },
+      "price_forecast": {
+        "name": "Price forecast"
+      },
+      "forecast_error": {
+        "name": "Forecast error"
+      },
+      "forecast_mae": {
+        "name": "Forecast MAE"
+      },
+      "forecast_samples": {
+        "name": "Forecast samples"
+      },
+      "forecast_hourly_mae": {
+        "name": "Forecast hourly MAE"
+      }
     },
     "button": {
-      "predict_now": { "name": "Predict now" },
-      "forecast_now": { "name": "Update forecast now" }
+      "predict_now": {
+        "name": "Predict now"
+      },
+      "forecast_now": {
+        "name": "Update forecast now"
+      }
     }
   },
   "issues": {
     "wattcast_unreachable": {
       "title": "Wattcast price forecast unreachable",
       "description": "The Wattcast price forecast for zone {zone} could not be fetched for more than {hours} hours (last success: {last_success}; last error: {error}). The last cached forecast is still being used while it lasts, and the local model fills the rest. This clears automatically once a fetch succeeds."
+    }
+  },
+  "services": {
+    "report_shower_comfort": {
+      "name": "Report shower comfort",
+      "description": "Attach a comfort observation to a retained shower event. This does not change stored heat, heating or scheduler targets.",
+      "fields": {
+        "event_id": {
+          "name": "Shower event",
+          "description": "Event ID from the estimated stored heat sensor's recent_showers attribute."
+        },
+        "comfort": {
+          "name": "Comfort",
+          "description": "How warm the selected shower felt."
+        }
+      }
     }
   }
 }
