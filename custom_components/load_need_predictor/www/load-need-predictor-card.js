@@ -367,7 +367,8 @@ function tankRow(st) {
   <div class="tank-note">Hot-water availability unknown.</div>
   <div class="muted tank-note">Last thermostat anchor: ${esc(age)}${a.calibrated === false ? " · awaiting first anchor" : ""}</div>
   ${quality.map((warning) => `<div class="warn">${esc(warning)}</div>`).join("")}
-  ${equivalent}`;
+  ${equivalent}
+  ${a.appliance_profiles?.status === "observational_only" ? `<div class="muted tank-note">Cold-appliance observations active · ${Number(a.appliance_profiles.active_run_count) || 0} runs in progress. Appliance water attribution is unvalidated; stored heat is unchanged by this analysis.</div>` : ""}`;
 }
 
 const COMFORT_LABELS = {

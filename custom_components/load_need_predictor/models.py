@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .const import (
+    CONF_APPLIANCE_HOUSEHOLD_ACTIVITY_ENTITIES,
     CONF_COLD_APPLIANCE_ENTITIES,
     CONF_CONTROLLED_SWITCH_ENTITY,
     CONF_DEFICIT_CAP_MINUTES,
@@ -96,6 +97,7 @@ class LoadConfig:
     shower_humidity_entity: str | None = None
     shower_ventilation_entity: str | None = None
     cold_appliance_entities: tuple[str, ...] = ()
+    appliance_household_activity_entities: tuple[str, ...] = ()
     shower_target_temp_c: float = DEFAULT_SHOWER_TARGET_TEMP_C
 
     @property
@@ -155,6 +157,9 @@ def load_config_from_data(data: Mapping) -> LoadConfig:
         shower_humidity_entity=data.get(CONF_SHOWER_HUMIDITY_ENTITY) or None,
         shower_ventilation_entity=data.get(CONF_SHOWER_VENTILATION_ENTITY) or None,
         cold_appliance_entities=_as_tuple(data.get(CONF_COLD_APPLIANCE_ENTITIES)),
+        appliance_household_activity_entities=_as_tuple(
+            data.get(CONF_APPLIANCE_HOUSEHOLD_ACTIVITY_ENTITIES)
+        ),
         shower_target_temp_c=shower_target,
     )
 

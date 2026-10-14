@@ -63,7 +63,8 @@
             "shower_humidity_entity": "Bathroom humidity (optional, observations only)",
             "shower_ventilation_entity": "Shower ventilation boost (optional, observations only)",
             "cold_appliance_entities": "Cold-water appliance activity (optional, observations only)",
-            "shower_target_temp_c": "Preferred shower temperature"
+            "shower_target_temp_c": "Preferred shower temperature",
+            "appliance_household_activity_entities": "Household activity near water uses (optional, appliance observations)"
           },
           "data_description": {
             "target_number_entity": "The Load Scheduler target number this predictor drives (e.g. number.water_heater_lvv_target_runtime). The prediction is written here.",
@@ -88,7 +89,8 @@
             "shower_humidity_entity": "Bathroom relative-humidity sensor. Humidity rise adds evidence to a shower event; missing readings remain unknown.",
             "shower_ventilation_entity": "Binary sensor or input boolean indicating a shower-triggered ventilation boost. Supplemental evidence only; automatic ventilation alone does not confirm a shower.",
             "cold_appliance_entities": "Running/status entities for cold-fed appliances such as a dishwasher or washing machine. Use actual running signals, not overall appliance availability. Unknown/unavailable states remain unknown. Used only in the shadow observation log.",
-            "shower_target_temp_c": "Preferred shower temperature (30–45 °C, default 40 °C) for observation context. This does not change the tank thermostat or heating target."
+            "shower_target_temp_c": "Preferred shower temperature (30–45 °C, default 40 °C) for observation context. This does not change the tank thermostat or heating target.",
+            "appliance_household_activity_entities": "Motion or occupancy sources near other water uses (bathroom, toilet, shower). Activity flags possible household overlap; no activity does not prove all water belongs to an appliance. Empty or unavailable sources remain unknown. Shadow analysis only."
           }
         }
       },
@@ -186,6 +188,10 @@
     }
   },
   "issues": {
+    "configured_source_unhealthy": {
+      "title": "Configured source unavailable for {load}",
+      "description": "The configured source {source} for {load} has a persistent problem: {problem}. Reconfigure this load in Settings → Devices & services → Load Need Predictor to select the correct source, or restore the source integration. Unknown readings remain uncertain; a replacement sensor is not selected automatically. This issue clears when the source recovers or its configuration is changed."
+    },
     "wattcast_unreachable": {
       "title": "Wattcast price forecast unreachable",
       "description": "The Wattcast price forecast for zone {zone} could not be fetched for more than {hours} hours (last success: {last_success}; last error: {error}). The last cached forecast is still being used while it lasts, and the local model fills the rest. This clears automatically once a fetch succeeds."

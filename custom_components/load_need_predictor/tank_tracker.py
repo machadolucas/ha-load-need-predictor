@@ -71,6 +71,7 @@ from .const import DOMAIN, TANK_TICK_SECONDS
 from .coordinator import LoadNeedPredictorCoordinator
 from .models import LoadConfig
 from .runtime import LoadNeedPredictorConfigEntry
+from .source_health import appliance_state, source_health_warnings
 from .tank_model import (
     TankParams,
     TickInputs,
@@ -158,6 +159,9 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         self._unsub: callable | None = None
         self._unsub_motion: callable | None = None
         self._motion_seen: set[str] = set()
+        self._appliance_changed: set[str] = set()
+        self._appliance_change_counts: dict[str, int] = {}
+        self._observation_started: set[str] = set()
         self._ticks = 0
         # Per-load "don't retry the boost push before" after a failed push
         # (in memory: a restart may retry at once, which is harmless).
@@ -193,9 +197,14 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             return
         self._unsub = async_track_time_interval(self.hass, self._handle_tick, TICK_INTERVAL)
         motion_entities = {
-            cfg.shower_motion_entity
+            entity_id
             for cfg in self.tank_configs().values()
-            if cfg.shower_motion_entity
+            for entity_id in (
+                cfg.shower_motion_entity,
+                *cfg.appliance_household_activity_entities,
+                *cfg.cold_appliance_entities,
+            )
+            if entity_id
         }
         if motion_entities:
             self._unsub_motion = async_track_state_change_event(
@@ -206,8 +215,15 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
     def _record_motion(self, event) -> None:
         """Remember short motion pulses between the one-minute ticks."""
         new = event.data.get("new_state")
+        old = event.data.get("old_state")
+        entity_id = event.data["entity_id"]
         if new is not None and new.state == "on":
-            self._motion_seen.add(event.data["entity_id"])
+            self._motion_seen.add(entity_id)
+        if old is None or new is None or old.state != new.state:
+            self._appliance_changed.add(entity_id)
+            self._appliance_change_counts[entity_id] = (
+                self._appliance_change_counts.get(entity_id, 0) + 1
+            )
 
     @callback
     def async_shutdown_ticker(self) -> None:
@@ -219,6 +235,8 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             self._unsub_motion()
             self._unsub_motion = None
         self._motion_seen.clear()
+        self._appliance_changed.clear()
+        self._appliance_change_counts.clear()
 
     async def _handle_tick(self, now: datetime) -> None:
         """Timer callback → run one tick."""
@@ -331,6 +349,8 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             self._load.async_persist()
         self.async_set_updated_data(results)
         self._motion_seen.clear()
+        self._appliance_changed.clear()
+        self._appliance_change_counts.clear()
 
     async def _tick_one(
         self, sid: str, cfg: LoadConfig, now: datetime, now_iso: str
@@ -456,20 +476,32 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         # from publishing. No observation value is fed back into either path.
         observation_changed = False
         try:
+            result.quality_warnings.extend(source_health_warnings(self.hass, cfg))
             observation_changed = self._observe(sid, cfg, state, tick, inputs, result, now)
         except Exception:  # noqa: BLE001 - diagnostic path cannot break control
             _LOGGER.exception("Tank observation failed for load %s", sid)
             result.quality_warnings.append("Shower observations unavailable")
         return result, tick.anchored or observation_changed
 
-    def _number(self, entity_id: str | None, *, temperature: bool = False) -> float | None:
+    def _number(
+        self, entity_id: str | None, *, temperature: bool = False, humidity: bool = False
+    ) -> float | None:
         """Read diagnostic context without guessing temperature units."""
         state = self.hass.states.get(entity_id) if entity_id else None
         if state is None:
             return None
         try:
             value = float(state.state)
+            if humidity and (
+                state.attributes.get("unit_of_measurement") != "%" or not 0 <= value <= 100
+            ):
+                return None
             if temperature:
+                if (
+                    state.attributes.get("unit_of_measurement")
+                    not in TemperatureConverter.VALID_UNITS
+                ):
+                    return None
                 value = TemperatureConverter.convert(
                     value, state.attributes.get("unit_of_measurement"), UnitOfTemperature.CELSIUS
                 )
@@ -479,17 +511,25 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
 
     def _appliance_activity(self, entity_ids: tuple[str, ...]) -> bool | None:
         """Known idle states are evidence; an unfamiliar enum is uncertainty."""
-        active = {"on", "running", "run", "washing", "rinsing", "spinning", "drying"}
-        idle = {"off", "idle", "standby", "stop", "stopped", "finished", "complete", "completed"}
-        unknown = False
-        for entity_id in entity_ids:
-            state = self.hass.states.get(entity_id)
-            value = state.state.lower() if state else "unknown"
-            if value in active:
-                return True
-            if value not in idle:
-                unknown = True
-        return None if unknown else False
+        values = [
+            appliance_state(state.state) if (state := self.hass.states.get(entity_id)) else None
+            for entity_id in entity_ids
+        ]
+        if True in values:
+            return True
+        return None if None in values else False
+
+    def _household_activity(self, cfg: LoadConfig, now: datetime) -> bool | None:
+        """No detected motion is a coverage-limited observation, not proof of sleep."""
+        if not cfg.appliance_household_activity_entities:
+            return None
+        values = [
+            True if entity_id in self._motion_seen else self._bool_and_duration(entity_id, now)[0]
+            for entity_id in cfg.appliance_household_activity_entities
+        ]
+        if True in values:
+            return True
+        return None if None in values else False
 
     def _observe(self, sid, cfg, previous, tick, inputs, result, now) -> bool:
         """Store an independent shadow comparison, never a heating input."""
@@ -530,6 +570,7 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
                     cfg.shower_humidity_entity,
                     cfg.shower_ventilation_entity,
                     cfg.cold_appliance_entities,
+                    cfg.appliance_household_activity_entities,
                     cfg.supply_temp_entity,
                     cfg.shower_target_temp_c,
                     cfg.tank_cold_in_c,
@@ -546,9 +587,22 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
                 source_signature=signature,
                 water_l=inputs.water_counter_l,
                 motion=motion,
-                humidity=self._number(cfg.shower_humidity_entity),
+                humidity=self._number(cfg.shower_humidity_entity, humidity=True),
                 ventilation=ventilation,
                 appliance_active=self._appliance_activity(cfg.cold_appliance_entities),
+                appliance_states={
+                    entity_id: self._appliance_activity((entity_id,))
+                    for entity_id in cfg.cold_appliance_entities
+                },
+                household_activity=self._household_activity(cfg, now),
+                appliance_boundaries_known=(
+                    sid in self._observation_started
+                    and not any(
+                        self._appliance_change_counts.get(entity_id, 0) > 1
+                        for entity_id in cfg.cold_appliance_entities
+                    )
+                ),
+                observation_restarted=sid not in self._observation_started,
                 supply_temp_c=self._number(cfg.supply_temp_entity, temperature=True),
                 target_temp_c=cfg.shower_target_temp_c,
                 cold_in_c=cfg.tank_cold_in_c,
@@ -581,10 +635,17 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             ),
         )
         self._load.tank_observations[sid] = updated
+        self._observation_started.add(sid)
         result.observation = summarize_observation(updated)
         # Event/anchor transitions are promptly saved; active accumulators also
         # ride the existing periodic save and final unload flush.
-        return len(updated.get("events", [])) != len((saved or {}).get("events", []))
+        return (
+            len(updated.get("events", [])) != len((saved or {}).get("events", []))
+            or len(updated.get("appliance_observations", {}).get("runs", []))
+            != len((saved or {}).get("appliance_observations", {}).get("runs", []))
+            or updated.get("appliance_observations", {}).get("sequence")
+            != (saved or {}).get("appliance_observations", {}).get("sequence")
+        )
 
     async def async_report_shower_comfort(self, sid: str, event_id: str, comfort: str) -> None:
         """Attach feedback to one retained event without ticking or actuating."""

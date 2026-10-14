@@ -786,3 +786,56 @@ def test_appliance_unknown_is_not_idle() -> None:
     tracker.hass.states.get.return_value = SimpleNamespace(state="idle")
     assert tracker._appliance_activity(("sensor.washer",)) is False
     assert tracker._appliance_activity(()) is False
+
+
+async def test_appliance_context_records_short_pulses_and_does_not_change_control(
+    hass: HomeAssistant, freezer
+) -> None:
+    hass.states.async_set(_ENERGY, "100", _KWH)
+    hass.states.async_set(_WATER, "1000", {"unit_of_measurement": "L"})
+    hass.states.async_set(_SWITCH, "off")
+    hass.states.async_set(_LED, "off")
+    hass.states.async_set("sensor.washer", "power_off")
+    hass.states.async_set("binary_sensor.bathroom", "off")
+    base = {**_TANK_LOAD, "tank_boost_soc_pct": None}
+    observed = {
+        **base,
+        "name": "Observed",
+        "cold_appliance_entities": ["sensor.washer"],
+        "appliance_household_activity_entities": ["binary_sensor.bathroom"],
+    }
+    entry = await _setup(hass, [base, observed])
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    plain_sid, observed_sid = list(entry.subentries)
+    hass.states.async_set("sensor.washer", "detecting")
+    hass.states.async_set("binary_sensor.bathroom", "on")
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=10))
+    hass.states.async_set("binary_sensor.bathroom", "off")
+    await hass.async_block_till_done()
+    cfg = tracker.tank_configs()[observed_sid]
+    assert tracker._household_activity(cfg, dt_util.utcnow()) is True
+    assert "sensor.washer" in tracker._appliance_changed
+    for minute in range(1, 5):
+        freezer.tick(timedelta(seconds=20))
+        hass.states.async_set(_WATER, str(1000 + 4 * minute), {"unit_of_measurement": "L"})
+        await tracker.async_tick()
+        assert coord.tanks[plain_sid] == coord.tanks[observed_sid]
+    hass.states.async_set("sensor.washer", "unavailable")
+    await hass.async_block_till_done()
+    await tracker.async_tick()
+    assert any("sensor.washer" in item for item in tracker.data[observed_sid].quality_warnings)
+    assert tracker._appliance_activity(("sensor.washer",)) is None
+
+
+async def test_bad_context_units_never_corroborate_shower(hass: HomeAssistant) -> None:
+    from custom_components.load_need_predictor.tank_tracker import TankTracker
+
+    tracker = object.__new__(TankTracker)
+    tracker.hass = hass
+    hass.states.async_set("sensor.humidity", "50", {"unit_of_measurement": "g/m³"})
+    hass.states.async_set("sensor.supply", "12", {"unit_of_measurement": "bananas"})
+    assert tracker._number("sensor.humidity", humidity=True) is None
+    assert tracker._number("sensor.supply", temperature=True) is None
+    hass.states.async_set("sensor.humidity", "50", {"unit_of_measurement": "%"})
+    assert tracker._number("sensor.humidity", humidity=True) == 50

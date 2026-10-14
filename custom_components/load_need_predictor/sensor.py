@@ -278,6 +278,7 @@ class TankSocSensor(TankEntity, SensorEntity):
             "anchor_age_hours",
             "quality_warnings",
             "recent_showers",
+            "appliance_profiles",
             "shadow_evaluation",
             "comfort_risk",
         }
@@ -324,6 +325,7 @@ class TankSocSensor(TankEntity, SensorEntity):
             "recent_showers": result.observation.get("recent_showers", []),
             "comfort_risk": result.observation.get("comfort_risk", "unknown"),
             "shadow_evaluation": result.observation.get("evaluation", {}),
+            "appliance_profiles": result.observation.get("appliance_profiles", {}),
         }
 
 

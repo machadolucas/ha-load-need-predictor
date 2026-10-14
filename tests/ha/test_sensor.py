@@ -151,6 +151,7 @@ _TANK_ATTRS = {
     "anchor_age_hours",
     "quality_warnings",
     "recent_showers",
+    "appliance_profiles",
     "shadow_evaluation",
     "comfort_risk",
     "equivalent_liters_assumption",
@@ -207,6 +208,7 @@ def test_tank_soc_volatile_attributes_are_unrecorded() -> None:
         "anchor_age_hours",
         "quality_warnings",
         "recent_showers",
+        "appliance_profiles",
         "shadow_evaluation",
         "comfort_risk",
     }

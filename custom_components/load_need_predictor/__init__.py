@@ -24,6 +24,7 @@ from .forecast_coordinator import PriceForecastCoordinator, async_delete_stale_w
 from .frontend import async_register_card
 from .jobs import PredictorJobs
 from .runtime import LoadNeedPredictorConfigEntry, RuntimeData
+from .source_health import SourceHealthMonitor, async_delete_stale_source_issues
 from .tank_tracker import TankTracker
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,6 +48,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigE
     tank = TankTracker(hass, entry, load)
 
     entry.runtime_data = RuntimeData(load=load, forecast=forecast, tank=tank)
+
+    sources = SourceHealthMonitor(hass, entry)
+    sources.async_start()
+    entry.async_on_unload(sources.async_stop)
 
     # Both daily capabilities run on the hub's two daily wall-clock times.
     jobs = PredictorJobs(hass, entry)
@@ -120,8 +125,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfig
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> None:
-    """Drop this hub's Wattcast repair issues — nothing would clear them otherwise."""
+    """Drop this hub's repair issues — nothing would clear them otherwise."""
     async_delete_stale_wattcast_issues(hass, exclude_entry_id=entry.entry_id)
+    async_delete_stale_source_issues(hass, exclude_entry_id=entry.entry_id)
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: LoadNeedPredictorConfigEntry) -> None:

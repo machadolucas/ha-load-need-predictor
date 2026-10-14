@@ -245,6 +245,7 @@ Attributes carry the full rationale:
 | `comfort_risk` | `unknown` with sparse reports; after five reports, a descriptive report-history label, never a temperature or comfort guarantee. |
 | `anchor_age_hours` | Time since the most recent thermostat anchor, or unknown before an anchor. |
 | `quality_warnings` | Current gaps, fallback inputs or other limitations of the estimate. |
+| `appliance_profiles` | Optional 90-day appliance run summaries and unvalidated cold-water exploration; never a heating input. |
 | `observation_enabled` | Whether optional shower observation sources have been configured. |
 | `recent_showers` | Up to 10 recent possible shower events, newest first, with event ID, times, metered litres, confidence and any comfort feedback. |
 | `comfort_feedback_supported` | Whether this backend supports the card's comfort-feedback service. |
@@ -438,7 +439,8 @@ Examples from the author's existing household (select your own entities):
 | Shower-area motion | `binary_sensor.shower_motion_sensor_occupancy` |
 | Bathroom humidity | `sensor.core_humidity` |
 | Shower ventilation boost | `input_boolean.ventilation_boost_reason_shower` |
-| Cold-water appliance activity | `binary_sensor.dishwasher_running`, `sensor.front_load_washer` |
+| Cold-water appliance activity | `binary_sensor.dishwasher_running`, `sensor.front_load_washer_current_status` |
+| Household activity near water uses | Select bathroom, toilet and shower motion sensors to flag overlapping use |
 | Household water total (existing field) | `sensor.water_meter_mac_ocr_water_total` (m³; converted to litres) |
 
 Prefer actual binary running signals for appliances. For status sensors, select
@@ -468,6 +470,41 @@ Use the load's actual tank sensor ID (it may retain its previous name) and the
 ID of a specific logged event. Allowed comfort values are `comfortable`,
 `cooler_than_usual` and `not_warm_enough`. Feedback is attached to that event;
 it is not a command to turn on heating.
+
+### Cold-water appliance observations
+
+Each selected appliance now has a separate 90-day run log. The tank sensor's
+`appliance_profiles` attribute exposes recent runs, gross household litres,
+overlap and data-quality flags, and per-source summaries. These are **household
+water totals during a run**, not measured appliance consumption. A washer may
+use different amounts by program; activity during rinsing, spinning or drying
+does not prove water is flowing into it.
+
+Select optional **Household activity near water uses** sensors to flag possible
+concurrent taps/showers. Missing coverage remains unknown; no motion is not proof
+that everyone is asleep. Short activity pulses are remembered between ticks.
+Meter resets, missing readings, restarts, simultaneous appliances and uncertain
+run boundaries prevent confident attribution. A separate exploratory upper bound
+shows the maximum baseline draw that might be avoided in otherwise quiet
+intervals; it is not accepted cold attribution, does not alter the shower
+candidate, and cannot promote itself into control. Standby loss continues normally.
+
+All source IDs are editable in the load's reconfiguration form. Real entity-ID
+renames are followed through Home Assistant's entity registry. Replacing an
+integration creates a different source and requires explicitly selecting it;
+the integration does not guess a replacement from its display name. Unsupported
+appliance status strings remain unknown; a template binary sensor is suitable
+for appliance-specific status mappings.
+
+Configured missing/unavailable or unsupported sources appear in the tank's
+quality warnings. Persistent failures also appear under **Settings → System →
+Repairs** after 15 minutes of continuous failure. Recovery or correcting the configuration
+clears the corresponding issue. Optional fields left empty create no issue.
+
+Do not subtract a fixed allowance from live tank accounting yet. Existing learned
+hot-water fractions already absorb average cold-only usage; introducing an
+exclusion requires recalibration and held-out anchor-cycle evaluation, including
+bias, rather than reusing those fractions unchanged.
 
 ## Dashboard card
 

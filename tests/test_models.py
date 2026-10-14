@@ -198,3 +198,16 @@ def test_price_forecast_new_fields():
     assert cfg.price_series_entity == "sensor.nordpool"
     assert cfg.vat == pytest.approx(0.24)
     assert cfg.forecast_days == 9 and isinstance(cfg.forecast_days, int)
+
+
+def test_appliance_context_entity_selection_normalises() -> None:
+    cfg = load_config_from_data(
+        {
+            CONF_NAME: "LVV",
+            "cold_appliance_entities": ["binary_sensor.dishwasher", "sensor.washer"],
+            "appliance_household_activity_entities": "binary_sensor.bathroom",
+        }
+    )
+    assert cfg.cold_appliance_entities == ("binary_sensor.dishwasher", "sensor.washer")
+    assert cfg.appliance_household_activity_entities == ("binary_sensor.bathroom",)
+    assert load_config_from_data({CONF_NAME: "LVV"}).appliance_household_activity_entities == ()

@@ -76,6 +76,7 @@ CONF_TANK_BOOST_SOC_PCT = "tank_boost_soc_pct"
 CONF_SHOWER_MOTION_ENTITY = "shower_motion_entity"
 CONF_SHOWER_HUMIDITY_ENTITY = "shower_humidity_entity"
 CONF_SHOWER_VENTILATION_ENTITY = "shower_ventilation_entity"
+CONF_APPLIANCE_HOUSEHOLD_ACTIVITY_ENTITIES = "appliance_household_activity_entities"
 CONF_COLD_APPLIANCE_ENTITIES = "cold_appliance_entities"
 CONF_SHOWER_TARGET_TEMP_C = "shower_target_temp_c"
 

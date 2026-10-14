@@ -420,3 +420,236 @@ def test_retention_can_expire_disabled_observer_without_new_ticks():
     assert expired["cycles"] == []
     assert "water_l" not in expired
     assert state["events"]  # The old in-memory snapshot is not mutated.
+
+
+def appliance_tick(saved=None, minute=0, *, running=False, **overrides):
+    values = {
+        "appliance_states": {"washer": running},
+        "appliance_active": running,
+        "household_activity": False,
+    }
+    values.update(overrides)
+    return tick(saved, minute, **values)
+
+
+def test_appliances_unconfigured_do_not_claim_observations():
+    assert (
+        observation.summarize_observation(tick())["appliance_profiles"]["status"]
+        == "not_configured"
+    )
+
+
+def test_run_profiles_keep_gross_interior_flow_and_separate_exploratory_bound():
+    state = appliance_tick(anchored=True)
+    state = appliance_tick(state, 1, running=True, water_l=102, baseline_draw_kwh=0.1)
+    state = appliance_tick(state, 2, running=True, water_l=110, baseline_draw_kwh=0.2)
+    for minute in (3, 4):
+        state = appliance_tick(state, minute, running=True, water_l=110)
+    state = appliance_tick(state, 5, running=True, water_l=114, baseline_draw_kwh=0.1)
+    state = appliance_tick(state, 6, water_l=114, anchored=True, previous_cycle_unclamped_kwh=1)
+    store = state["appliance_observations"]
+    run = store["runs"][0]
+    assert run["complete"]
+    assert run["gross_household_l"] == 14
+    assert run["observed_interior_household_l"] == 12
+    assert run["observed_interior_seconds"] == 240
+    assert run["household_flow_episodes"] == 2
+    assert run["exploratory_cold_upper_liters"] == 12
+    assert run["exploratory_max_draw_reduction_kwh"] == pytest.approx(0.3)
+    assert run["attribution"] == "gross_household_water_during_run_not_appliance_fill"
+    cycle = state["cycles"][0]
+    assert cycle["shadow_residual_kwh"] == cycle["baseline_residual_kwh"] == 1
+    assert cycle["exploratory_min_residual_kwh"] == pytest.approx(0.7)
+    profile = observation.summarize_observation(state)["appliance_profiles"]
+    assert profile["accepted_cold_attribution_kwh"] == 0
+    assert profile["cold_attribution_status"] == "unvalidated"
+    assert profile["per_source"]["washer"]["mean_gross_household_l_per_metered_run"] == 14
+    assert profile["exploratory_cold_upper_liters"] == 12
+    json.dumps(state, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"household_activity": None},
+        {"household_activity": True},
+        {"motion": None},
+        {"motion": True},
+        {"appliance_states": {"washer": True, "dishwasher": None}},
+        {"appliance_states": {"washer": True, "dishwasher": True}},
+        {"appliance_boundaries_known": False},
+        {"draw_source": "fallback"},
+    ],
+)
+def test_ambiguous_intervals_never_contribute_to_cold_bound(overrides):
+    states = overrides.get("appliance_states", {"washer": True})
+    state = appliance_tick(appliance_states={source: False for source in states})
+    state = appliance_tick(state, 1, running=True, appliance_states=states)
+    state = appliance_tick(state, 2, running=True, water_l=108, baseline_draw_kwh=0.2, **overrides)
+    profile = observation.summarize_observation(state)["appliance_profiles"]
+    assert profile["exploratory_cold_upper_liters"] == 0
+    assert profile["exploratory_max_draw_reduction_kwh"] == 0
+    assert profile["accepted_cold_attribution_kwh"] == 0
+
+
+def test_overlapping_appliance_profiles_do_not_double_count_exploratory_water():
+    state = appliance_tick(appliance_states={"washer": False, "dishwasher": False})
+    state = appliance_tick(
+        state, 1, running=True, appliance_states={"washer": True, "dishwasher": True}
+    )
+    state = appliance_tick(
+        state,
+        2,
+        running=True,
+        water_l=110,
+        baseline_draw_kwh=0.3,
+        appliance_states={"washer": True, "dishwasher": True},
+    )
+    state = appliance_tick(
+        state, 3, water_l=110, appliance_states={"washer": False, "dishwasher": False}
+    )
+    runs = state["appliance_observations"]["runs"]
+    assert len(runs) == 2
+    assert [run["gross_household_l"] for run in runs] == [10, 10]
+    assert all("appliance_overlap" in run["quality_flags"] for run in runs)
+    summary = observation.summarize_observation(state)["appliance_profiles"]
+    assert summary["gross_liters_overlap_between_sources"] is True
+    assert summary["exploratory_cold_upper_liters"] == 0
+
+
+def test_no_metered_water_does_not_mean_demonstrated_zero_consumption():
+    state = appliance_tick()
+    state = appliance_tick(state, 1, running=True)
+    state = appliance_tick(state, 2, running=True)
+    state = appliance_tick(state, 3)
+    run = state["appliance_observations"]["runs"][0]
+    assert "no_metered_water" in run["quality_flags"]
+    assert run["interior_profile_usable"] is False
+    profile = observation.summarize_observation(state)["appliance_profiles"]["per_source"]["washer"]
+    assert profile["runs_with_metered_water"] == 0
+    assert profile["mean_gross_household_l_per_metered_run"] is None
+    assert profile["cold_volume_consistency_status"] == "not_established"
+
+
+def test_short_restart_cannot_attribute_unseen_flow_or_claim_complete_run():
+    state = appliance_tick()
+    state = appliance_tick(state, 1, running=True)
+    state = appliance_tick(
+        state,
+        2,
+        running=True,
+        water_l=110,
+        observation_restarted=True,
+        appliance_boundaries_known=False,
+        baseline_draw_kwh=0.3,
+    )
+    assert state["appliance_observations"]["runs"][0]["complete"] is False
+    assert "restart_or_gap" in state["appliance_observations"]["runs"][0]["quality_flags"]
+    assert state["appliance_observations"]["active_runs"]["washer"]["gross_household_l"] == 0
+    assert (
+        observation.summarize_observation(state)["appliance_profiles"][
+            "exploratory_cold_upper_liters"
+        ]
+        == 0
+    )
+
+
+def test_unknown_run_state_then_off_remains_incomplete():
+    state = appliance_tick()
+    state = appliance_tick(state, 1, running=True)
+    state = appliance_tick(state, 2, running=None, water_l=108)
+    state = appliance_tick(state, 3, water_l=108)
+    run = state["appliance_observations"]["runs"][0]
+    assert run["complete"] is False
+    assert "appliance_state_unknown" in run["quality_flags"]
+    assert run["gross_household_l"] == 8
+
+
+def test_normal_uncertain_edge_keeps_usable_observed_run_interior():
+    state = appliance_tick()
+    state = appliance_tick(state, 1, running=True, appliance_boundaries_known=False)
+    state = appliance_tick(state, 2, running=True, water_l=108, baseline_draw_kwh=0.2)
+    state = appliance_tick(state, 3, water_l=108, appliance_boundaries_known=False)
+    run = state["appliance_observations"]["runs"][0]
+    assert not run["complete"]
+    assert run["interior_profile_usable"]
+    assert run["observed_interior_household_l"] == 8
+    assert run["exploratory_cold_upper_liters"] == 8
+
+
+def test_between_tick_appliance_pulse_ending_idle_invalidates_shower():
+    state = None
+    for minute in range(4):
+        state = appliance_tick(state, minute, anchored=minute == 0)
+    for minute in range(4, 8):
+        state = appliance_tick(
+            state,
+            minute,
+            water_l=100 + (minute - 3) * 5,
+            motion=True,
+            humidity=50,
+            appliance_boundaries_known=minute != 5,
+            baseline_draw_kwh=0.1,
+        )
+    for minute in (8, 9):
+        state = appliance_tick(state, minute, water_l=120)
+    event = state["events"][0]
+    assert event["confidence"] == "ambiguous"
+    assert "appliance_boundary_unobserved" in event["quality_reasons"]
+    assert event["correction_kwh"] == 0
+
+
+def test_appliance_counter_and_source_changes_invalidate_in_progress_run():
+    state = appliance_tick()
+    state = appliance_tick(state, 1, running=True)
+    state = appliance_tick(state, 2, running=True, water_l=90)
+    state = appliance_tick(state, 3, water_l=90)
+    assert "meter_reset" in state["appliance_observations"]["runs"][0]["quality_flags"]
+    assert not state["appliance_observations"]["runs"][0]["complete"]
+    state = appliance_tick(state, 4, running=True, water_l=90)
+    state = appliance_tick(state, 5, running=True, water_l=94, source_signature="new")
+    assert "restart_or_gap" in state["appliance_observations"]["runs"][-1]["quality_flags"]
+    assert state["appliance_observations"]["active_runs"]["washer"]["complete"] is False
+
+
+def test_appliance_runs_and_bounds_expire_after_ninety_days():
+    state = appliance_tick()
+    state = appliance_tick(state, 1, running=True)
+    state = appliance_tick(state, 2, running=True, water_l=108, baseline_draw_kwh=0.2)
+    state = appliance_tick(state, 3, water_l=108)
+    expired = observation.prune_observation(state, (BASE + timedelta(days=91)).isoformat())
+    assert expired["appliance_observations"]["runs"] == []
+    assert expired["appliance_observations"]["daily_bounds"] == []
+    assert expired["appliance_observations"]["last_states"] == {}
+    assert (
+        observation.summarize_observation(expired)["appliance_profiles"][
+            "exploratory_cold_upper_liters"
+        ]
+        == 0
+    )
+
+
+def test_legacy_partial_appliance_store_loads_without_raising():
+    state = tick()
+    state["appliance_observations"] = {"runs": []}
+    state = appliance_tick(state, 1)
+    assert state["appliance_observations"]["last_states"] == {"washer": False}
+
+
+def test_improved_exploratory_error_never_passes_accepted_attribution_gate():
+    state = evaluation_state(baseline=1, candidate=1)
+    state["appliance_observations"] = {
+        "last_states": {"washer": False},
+        "daily_bounds": [],
+        "runs": [],
+    }
+    for row in state["cycles"]:
+        row["exploratory_max_draw_reduction_kwh"] = 1
+        row["confident_events"] = 0
+    report = observation.evaluate_observations(state)
+    assert report["status"] == "insufficient_evidence"
+    exploration = report["appliance_exploration"]
+    assert exploration["status"] == "unvalidated_upper_bound"
+    assert exploration["hypothetical_min_residual"]["rmse_kwh"] == 0
+    assert exploration["accepted_cold_attribution_kwh"] == 0
+    assert exploration["automatic_promotion"] is False

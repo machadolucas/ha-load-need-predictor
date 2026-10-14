@@ -33,6 +33,7 @@ _REDACT = {
     "shower_humidity_entity",
     "shower_ventilation_entity",
     "cold_appliance_entities",
+    "appliance_household_activity_entities",
     "price_entity",
     "wind_entity",
     "weather_entity",
@@ -53,6 +54,8 @@ def _observation_diagnostics(saved: dict | None) -> dict | None:
     saved = prune_observation(saved, dt_util.utcnow().isoformat())
     summary = summarize_observation(saved)
     summary.pop("recent_showers", None)
+    summary.pop("appliance_runs", None)
+    summary.pop("appliance_profiles", None)
     # Cycle boundaries are thermostat anchors, not individual shower times.
     return {
         **summary,

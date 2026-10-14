@@ -1,9 +1,11 @@
-"""Pure, diagnostic-only shower attribution alongside the existing tank model.
+"""Pure, diagnostic-only shower and appliance observations beside the tank model.
 
 The control model is never passed here or changed. Completed, well-observed
 events replace their baseline draw in a parallel energy ledger; everything else
 retains the baseline. Bathroom humidity and ventilation form ONE corroborating
 evidence family, since a fan commonly follows humidity automatically.
+Appliance running signals collect gross household-flow profiles. Their separate
+exploratory cold upper bound never changes the accepted shower candidate.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ KWH_PER_LITER_KELVIN = 4.186 / 3600.0
 RETENTION_DAYS = 90
 MAX_EVENTS = 2000
 MAX_CYCLES = 500
+MAX_APPLIANCE_RUNS = 1500
+MAX_APPLIANCE_RUN_S = 24 * 3600.0
 MAX_GAP_S = 180.0
 QUIET_BOUNDARY_S = 120.0
 MAX_EVENT_S = 3600.0
@@ -61,6 +65,10 @@ class ObservationInputs:
     draw_source: str = "meter"
     water_source_quality: str = "valid"
     energy_available: bool = True
+    appliance_states: dict[str, bool | None] | None = None
+    household_activity: bool | None = None
+    appliance_boundaries_known: bool = True
+    observation_restarted: bool = False
 
 
 def _time(value: str) -> datetime:
@@ -143,6 +151,19 @@ def _prune(saved: dict[str, Any], now: datetime) -> None:
     last_hot = saved.get("last_likely_hot_draw_iso")
     if last_hot and _time(last_hot) < cutoff:
         saved.pop("last_likely_hot_draw_iso", None)
+    appliances = saved.get("appliance_observations")
+    if appliances:
+        appliances["runs"] = [
+            row for row in appliances.get("runs", []) if _time(row["end"]) >= cutoff
+        ][-MAX_APPLIANCE_RUNS:]
+        appliances["daily_bounds"] = [
+            row for row in appliances.get("daily_bounds", []) if _time(row["end"]) >= cutoff
+        ][-RETENTION_DAYS:]
+        appliances["active_runs"] = {
+            source: run
+            for source, run in appliances.get("active_runs", {}).items()
+            if _time(run["start"]) >= cutoff
+        }
 
 
 def prune_observation(saved: dict[str, Any], now_iso: str) -> dict[str, Any]:
@@ -158,9 +179,216 @@ def prune_observation(saved: dict[str, Any], now_iso: str) -> dict[str, Any]:
     if result.get("last_iso") and _time(result["last_iso"]) < cutoff:
         # Expired sensor snapshots must not be revived as a new event baseline.
         result = {
-            key: result[key] for key in ("version", "mode", "events", "cycles") if key in result
+            key: result[key]
+            for key in ("version", "mode", "events", "cycles", "appliance_observations")
+            if key in result
         }
+        if appliances := result.get("appliance_observations"):
+            appliances["last_states"] = {}
+            appliances["active_runs"] = {}
     return result
+
+
+def _appliance_states(inputs: ObservationInputs) -> dict[str, bool | None]:
+    return {
+        str(source): value if isinstance(value, bool) else None
+        for source, value in (inputs.appliance_states or {}).items()
+    }
+
+
+def _run_flag(run: dict[str, Any], reason: str, *, incomplete: bool = False) -> None:
+    if reason not in run["quality_flags"]:
+        run["quality_flags"].append(reason)
+    if incomplete:
+        run["complete"] = False
+
+
+def _close_appliance_run(
+    store: dict[str, Any], source: str, now_iso: str, reason: str | None = None
+) -> None:
+    run = store["active_runs"].pop(source)
+    if reason:
+        _run_flag(run, reason, incomplete=True)
+    if run["gross_household_l"] <= 0:
+        _run_flag(run, "no_metered_water")
+    run["interior_profile_usable"] = run["observed_interior_household_l"] > 0
+    run["end"] = now_iso
+    run["attribution"] = "gross_household_water_during_run_not_appliance_fill"
+    store["runs"].append(run)
+    # Completion must trigger persistence even after the retained-list cap.
+    store["sequence"] += 1
+
+
+def _advance_appliances(
+    saved: dict[str, Any],
+    inputs: ObservationInputs,
+    *,
+    elapsed: float,
+    delta: float | None,
+    disruption: str | None,
+) -> tuple[float, float]:
+    """Collect run interiors and a *possible*, never attributed, cold upper bound.
+
+    A washer/dishwasher running signal is not a filling signal. Even otherwise
+    quiet, singly-active windows establish only an upper bound, not ownership.
+    Gross run litres may overlap across sources and must never be summed as
+    device consumption. Only the separate daily/cycle bound counts each meter
+    interval once, and only against that interval's existing baseline draw.
+    """
+    states = _appliance_states(inputs)
+    existing = saved.get("appliance_observations")
+    if not states and not existing:
+        return 0.0, 0.0
+    store = saved.get("appliance_observations")
+    if not isinstance(store, dict):
+        store = {}
+        saved["appliance_observations"] = store
+    for key, default in (
+        ("active_runs", {}),
+        ("runs", []),
+        ("last_states", {}),
+        ("sequence", 0),
+        ("daily_bounds", []),
+    ):
+        store.setdefault(key, default)
+    previous = store["last_states"]
+    previous_iso = saved.get("last_iso", inputs.now_iso)
+    now = _time(inputs.now_iso)
+    valid_interval = disruption is None and 0 < elapsed <= MAX_GAP_S
+    if inputs.observation_restarted:
+        valid_interval = False
+    positive_delta = max(0.0, delta or 0.0) if valid_interval else 0.0
+    active_sources = {source for source, value in states.items() if value is True}
+    previous_active = {source for source, value in previous.items() if value is True}
+    unknown_source = any(value is None for value in states.values())
+    changed_sources = {source for source in states if previous.get(source) != states[source]}
+    shower_overlap = inputs.motion is not False or bool(
+        saved.get("active_event", {}).get("motion_seen")
+    )
+    rejection = []
+    if not valid_interval:
+        rejection.append(disruption or "interval_unobserved")
+    if not inputs.appliance_boundaries_known or changed_sources:
+        rejection.append("run_boundary_uncertain")
+    if len(active_sources) != 1 or active_sources != previous_active:
+        rejection.append("not_one_stable_running_source")
+    if unknown_source:
+        rejection.append("appliance_state_unknown")
+    if inputs.household_activity is not False:
+        rejection.append("household_active_or_unknown")
+    if shower_overlap:
+        rejection.append("shower_active_or_unknown")
+    if inputs.draw_source != "meter":
+        rejection.append("baseline_draw_unobserved")
+    bound_l = positive_delta if not rejection else 0.0
+    bound_kwh = max(0.0, inputs.baseline_draw_kwh) if bound_l > 0 else 0.0
+
+    for source in list(store["active_runs"]):
+        run = store["active_runs"][source]
+        if source not in states:
+            _close_appliance_run(store, source, inputs.now_iso, "source_removed")
+        elif disruption in ("sources_changed", "observation_gap") or inputs.observation_restarted:
+            _close_appliance_run(store, source, inputs.now_iso, "restart_or_gap")
+        elif (now - _time(run["start"])).total_seconds() > MAX_APPLIANCE_RUN_S:
+            _close_appliance_run(store, source, inputs.now_iso, "run_too_long")
+
+    for source in sorted(active_sources):
+        if source in store["active_runs"]:
+            continue
+        observed_start = (
+            valid_interval and previous.get(source) is False and inputs.appliance_boundaries_known
+        )
+        store["sequence"] += 1
+        store["active_runs"][source] = {
+            "id": f"{inputs.now_iso}/appliance/{store['sequence']}",
+            "source": source,
+            "source_signature": inputs.source_signature,
+            "start": previous_iso if observed_start else inputs.now_iso,
+            "complete": observed_start,
+            "quality_flags": [] if observed_start else ["start_unobserved"],
+            "gross_household_l": 0.0,
+            "observed_interior_household_l": 0.0,
+            "observed_interior_seconds": 0.0,
+            "household_flow_episodes": 0,
+            "last_flow_iso": None,
+            "episode_l": 0.0,
+            "max_household_flow_episode_l": 0.0,
+            "exploratory_cold_upper_liters": 0.0,
+            "exploratory_max_draw_reduction_kwh": 0.0,
+        }
+
+    for source, run in list(store["active_runs"].items()):
+        state = states.get(source)
+        previous_state = previous.get(source)
+        if not valid_interval:
+            _run_flag(run, disruption or "restart_or_gap", incomplete=True)
+        if not inputs.appliance_boundaries_known:
+            _run_flag(run, "boundary_unobserved", incomplete=True)
+        if state is None or unknown_source:
+            _run_flag(run, "appliance_state_unknown", incomplete=True)
+        if len(active_sources | previous_active) > 1:
+            _run_flag(run, "appliance_overlap")
+        if inputs.household_activity is True:
+            _run_flag(run, "household_activity_overlap")
+        elif inputs.household_activity is None:
+            _run_flag(run, "household_activity_unknown")
+        if shower_overlap:
+            _run_flag(run, "shower_active_or_unknown")
+        if source in changed_sources:
+            _run_flag(run, "state_transition_interval")
+        # Runs retain gross contemporaneous household flow, including their
+        # uncertain edge intervals, but never turn it into appliance litres.
+        if state is True or previous_state is True or state is None:
+            run["gross_household_l"] += positive_delta
+            if (
+                valid_interval
+                and state is True
+                and previous_state is True
+                and inputs.appliance_boundaries_known
+            ):
+                run["observed_interior_household_l"] += positive_delta
+                run["observed_interior_seconds"] += elapsed
+            if positive_delta > 0:
+                last_flow = run["last_flow_iso"]
+                if last_flow is None or (now - _time(last_flow)).total_seconds() > QUIET_BOUNDARY_S:
+                    run["household_flow_episodes"] += 1
+                    run["episode_l"] = 0.0
+                run["episode_l"] += positive_delta
+                run["max_household_flow_episode_l"] = max(
+                    run["max_household_flow_episode_l"], run["episode_l"]
+                )
+                run["last_flow_iso"] = inputs.now_iso
+        if state is True and bound_l > 0:
+            run["exploratory_cold_upper_liters"] += bound_l
+            run["exploratory_max_draw_reduction_kwh"] += bound_kwh
+        if state is False:
+            _close_appliance_run(store, source, inputs.now_iso)
+
+    day = now.date().isoformat()
+    daily_rows = store["daily_bounds"]
+    if not daily_rows or daily_rows[-1]["day"] != day:
+        daily_rows.append(
+            {
+                "day": day,
+                "start": inputs.now_iso,
+                "end": inputs.now_iso,
+                "exploratory_cold_upper_liters": 0.0,
+                "exploratory_max_draw_reduction_kwh": 0.0,
+                "observed_intervals": 0,
+                "rejection_counts": {},
+            }
+        )
+    daily = daily_rows[-1]
+    daily["end"] = inputs.now_iso
+    daily["observed_intervals"] += int(valid_interval)
+    daily["exploratory_cold_upper_liters"] += bound_l
+    daily["exploratory_max_draw_reduction_kwh"] += bound_kwh
+    if positive_delta > 0:
+        for reason in rejection:
+            counts = daily["rejection_counts"]
+            counts[reason] = counts.get(reason, 0) + 1
+    store["last_states"] = states
+    return bound_l, bound_kwh
 
 
 def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs) -> dict[str, Any]:
@@ -183,6 +411,12 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
         and elapsed == 0
         and result.get("source_signature") == inputs.source_signature
         and previous_water == water
+        and not inputs.observation_restarted
+        and (
+            inputs.appliance_states is None
+            or result.get("appliance_observations", {}).get("last_states", {})
+            == _appliance_states(inputs)
+        )
     ):
         return result
     humidity = _number(inputs.humidity)
@@ -190,6 +424,8 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
     disruption = None
     if previous_iso and result.get("source_signature") != inputs.source_signature:
         disruption = "sources_changed"
+    elif previous_iso and inputs.observation_restarted:
+        disruption = "observation_gap"
     elif previous_iso and (elapsed <= 0 or elapsed > MAX_GAP_S):
         disruption = "observation_gap"
     elif delta is not None and delta < 0:
@@ -219,6 +455,9 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
         if cycle:
             _invalidate(cycle, disruption)
         delta = None
+    cold_bound_l, cold_bound_kwh = _advance_appliances(
+        result, inputs, elapsed=elapsed, delta=delta, disruption=disruption
+    )
     clean_tick = (
         inputs.previous_cycle_clean
         and inputs.draw_source == "meter"
@@ -244,6 +483,12 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
             ("water_l", max(0.0, delta or 0.0)),
         ):
             cycle[field] = cycle.get(field, 0.0) + value
+        cycle["exploratory_cold_upper_liters"] = (
+            cycle.get("exploratory_cold_upper_liters", 0.0) + cold_bound_l
+        )
+        cycle["exploratory_max_draw_reduction_kwh"] = (
+            cycle.get("exploratory_max_draw_reduction_kwh", 0.0) + cold_bound_kwh
+        )
 
     if not previous_iso:
         result["quiet_since_iso"] = inputs.now_iso
@@ -306,8 +551,14 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
         event["corroborated"] = event["corroborated"] or humidity_rise or ventilation_started
         if inputs.motion is None or inputs.appliance_active is None:
             _invalidate(event, "source_unknown")
-        if inputs.appliance_active is True:
+        if inputs.appliance_active is True or any(
+            value is True for value in _appliance_states(inputs).values()
+        ):
             _invalidate(event, "appliance_overlap")
+        if any(value is None for value in _appliance_states(inputs).values()):
+            _invalidate(event, "appliance_source_unknown")
+        if inputs.appliance_states and not inputs.appliance_boundaries_known:
+            _invalidate(event, "appliance_boundary_unobserved")
         if inputs.draw_source != "meter":
             _invalidate(event, "fallback_draw")
         event_age = (now - _time(event["start"])).total_seconds()
@@ -343,6 +594,11 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
                     "complete": cycle["complete"] and not anchor_mid_event,
                     "baseline_residual_kwh": baseline_residual,
                     "shadow_residual_kwh": baseline_residual + cycle["correction_kwh"],
+                    "exploratory_min_residual_kwh": (
+                        baseline_residual
+                        + cycle["correction_kwh"]
+                        - cycle.get("exploratory_max_draw_reduction_kwh", 0.0)
+                    ),
                     "anchor_raw_deficit_kwh": inputs.tank_deficit_kwh,
                     "anchor_shown_deficit_kwh": inputs.shown_deficit_kwh,
                     "anchor_uncertainty_kwh": inputs.uncertainty_kwh,
@@ -361,6 +617,8 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
             "standby_kwh": 0.0,
             "water_l": 0.0,
             "quality_reasons": ["anchor_mid_event"] if anchor_mid_event else [],
+            "exploratory_cold_upper_liters": 0.0,
+            "exploratory_max_draw_reduction_kwh": 0.0,
         }
 
     result.update(
@@ -380,6 +638,7 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
                 "shown_deficit_kwh": inputs.shown_deficit_kwh,
                 "uncertainty_kwh": inputs.uncertainty_kwh,
                 "shadow_correction_kwh": result.get("cycle", {}).get("correction_kwh", 0.0),
+                "accepted_appliance_cold_attribution_kwh": 0.0,
             },
         }
     )
@@ -446,6 +705,67 @@ def summarize_observation(saved: dict[str, Any]) -> dict[str, Any]:
         ],
         "latest": copy.deepcopy(saved.get("latest", {})),
         "evaluation": evaluate_observations(saved),
+        "appliance_profiles": _appliance_summary(saved),
+    }
+
+
+def _appliance_summary(saved: dict[str, Any]) -> dict[str, Any]:
+    store = saved.get("appliance_observations", {})
+    runs = store.get("runs", [])
+    active = store.get("active_runs", {})
+    configured = bool(store.get("last_states"))
+    profiles: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        source = run["source"]
+        profile = profiles.setdefault(
+            source,
+            {
+                "run_count": 0,
+                "complete_run_count": 0,
+                "runs_with_observed_interior": 0,
+                "runs_with_metered_water": 0,
+                "runs_with_usable_interior": 0,
+                "gross_household_l": 0.0,
+                "observed_interior_household_l": 0.0,
+                "observed_interior_minutes": 0.0,
+                "household_flow_episodes": 0,
+                "quality_flag_counts": {},
+            },
+        )
+        profile["run_count"] += 1
+        profile["complete_run_count"] += int(run["complete"])
+        profile["runs_with_observed_interior"] += int(run["observed_interior_seconds"] > 0)
+        profile["runs_with_metered_water"] += int(run["gross_household_l"] > 0)
+        profile["runs_with_usable_interior"] += int(run["interior_profile_usable"])
+        profile["gross_household_l"] += run["gross_household_l"]
+        profile["observed_interior_household_l"] += run["observed_interior_household_l"]
+        profile["observed_interior_minutes"] += run["observed_interior_seconds"] / 60.0
+        profile["household_flow_episodes"] += run["household_flow_episodes"]
+        for flag in run["quality_flags"]:
+            counts = profile["quality_flag_counts"]
+            counts[flag] = counts.get(flag, 0) + 1
+    for profile in profiles.values():
+        metered_runs = profile["runs_with_metered_water"]
+        profile["mean_gross_household_l_per_metered_run"] = (
+            profile["gross_household_l"] / metered_runs if metered_runs else None
+        )
+        profile["cold_volume_consistency_status"] = "not_established"
+    daily = store.get("daily_bounds", [])
+    return {
+        "status": "observational_only" if configured or runs or active else "not_configured",
+        "configured": configured,
+        "cold_attribution_status": "unvalidated",
+        "bound_basis": "possible_not_attributed",
+        "gross_liters_overlap_between_sources": True,
+        "automatic_promotion": False,
+        "accepted_cold_attribution_kwh": 0.0,
+        "per_source": profiles,
+        "recent_runs": [copy.deepcopy(run) for run in reversed(runs[-10:])],
+        "active_run_count": len(active),
+        "exploratory_cold_upper_liters": sum(row["exploratory_cold_upper_liters"] for row in daily),
+        "exploratory_max_draw_reduction_kwh": sum(
+            row["exploratory_max_draw_reduction_kwh"] for row in daily
+        ),
     }
 
 
@@ -513,6 +833,7 @@ def evaluate_observations(saved: dict[str, Any]) -> dict[str, Any]:
         "eligible_cycles": len(rows),
         "automatic_promotion": False,
         "comfort_risk": "not_inferred_from_anchor_residuals",
+        "appliance_exploration": evaluate_appliance_exploration(saved),
     }
     if len(rows) < 12:
         return report
@@ -536,4 +857,52 @@ def evaluate_observations(saved: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     )
+    return report
+
+
+def evaluate_appliance_exploration(saved: dict[str, Any]) -> dict[str, Any]:
+    """Show an exploratory residual envelope; even improved error proves no fill.
+
+    The upper-bound assumption removes at most the eligible interval's existing
+    draw. It is intentionally excluded from ``passes_shadow_comparison`` and
+    cannot validate any per-program appliance volume or cold-water ownership.
+    """
+    profiles = _appliance_summary(saved)
+    report: dict[str, Any] = {
+        "status": "unvalidated_upper_bound"
+        if profiles["status"] == "observational_only"
+        else "not_configured",
+        "automatic_promotion": False,
+        "accepted_cold_attribution_kwh": 0.0,
+        "bound_basis": "possible_not_attributed",
+        "exploratory_cold_upper_liters": profiles["exploratory_cold_upper_liters"],
+        "exploratory_max_draw_reduction_kwh": profiles["exploratory_max_draw_reduction_kwh"],
+    }
+    rows = sorted(
+        (
+            row
+            for row in saved.get("cycles", [])
+            if row.get("complete")
+            and row.get("clean")
+            and row.get("synchronized")
+            and row.get("source_signature") == saved.get("source_signature")
+            and _number(row.get("baseline_residual_kwh")) is not None
+            and _number(row.get("shadow_residual_kwh")) is not None
+        ),
+        key=lambda row: _time(row["end"]),
+    )
+    report["eligible_cycles"] = len(rows)
+    if len(rows) >= 12:
+        heldout = rows[len(rows) // 2 :]
+        exploratory_rows = [
+            {
+                "residual": row["shadow_residual_kwh"]
+                - max(0.0, row.get("exploratory_max_draw_reduction_kwh", 0.0))
+            }
+            for row in heldout
+        ]
+        report["heldout_cycles"] = len(heldout)
+        report["baseline"] = _metrics(heldout, "baseline_residual_kwh")
+        report["hypothetical_min_residual"] = _metrics(exploratory_rows, "residual")
+        report["interpretation"] = "hypothetical_bound_not_appliance_attribution_acceptance"
     return report

@@ -23,6 +23,7 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_APPLIANCE_HOUSEHOLD_ACTIVITY_ENTITIES,
     CONF_CAPTURE_TIME,
     CONF_COLD_APPLIANCE_ENTITIES,
     CONF_CONTROLLED_SWITCH_ENTITY,
@@ -229,6 +230,12 @@ def _load_schema(defaults: dict) -> vol.Schema:
                 selector.EntitySelectorConfig(
                     domain=["binary_sensor", "sensor", "input_boolean"], multiple=True
                 )
+            ),
+            vol.Optional(
+                CONF_APPLIANCE_HOUSEHOLD_ACTIVITY_ENTITIES,
+                description=suggest(CONF_APPLIANCE_HOUSEHOLD_ACTIVITY_ENTITIES),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="binary_sensor", multiple=True)
             ),
             vol.Optional(
                 CONF_SHOWER_TARGET_TEMP_C,

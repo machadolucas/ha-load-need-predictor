@@ -126,3 +126,11 @@ test("expired selection never silently reports comfort against a different event
   assert.equal(calls, 0);
   assert.match(card.shadowRoot.innerHTML, /no longer available/);
 });
+
+test("appliance shadow activity never promises cold-water subtraction", () => {
+  const { card } = loadCard();
+  card.hass = makeHass({ appliance_profiles: { status: "observational_only", active_run_count: 1 } });
+  assert.match(card.shadowRoot.innerHTML, /1 runs in progress/);
+  assert.match(card.shadowRoot.innerHTML, /Appliance water attribution is unvalidated/);
+  assert.match(card.shadowRoot.innerHTML, /stored heat is unchanged by this analysis/);
+});
