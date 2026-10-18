@@ -71,7 +71,7 @@ from .const import DOMAIN, TANK_TICK_SECONDS
 from .coordinator import LoadNeedPredictorCoordinator
 from .models import LoadConfig
 from .runtime import LoadNeedPredictorConfigEntry
-from .source_health import appliance_state, source_health_warnings
+from .source_health import appliance_offline, appliance_state, source_health_warnings
 from .tank_model import (
     TankParams,
     TickInputs,
@@ -161,6 +161,9 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         self._motion_seen: set[str] = set()
         self._appliance_changed: set[str] = set()
         self._appliance_change_counts: dict[str, int] = {}
+        # Appliances seen dropping offline straight out of a run (or an
+        # undecodable state): that one is a lost connection, not a power-off.
+        self._appliance_lost_mid_run: set[str] = set()
         self._observation_started: set[str] = set()
         self._ticks = 0
         # Per-load "don't retry the boost push before" after a failed push
@@ -219,6 +222,11 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         entity_id = event.data["entity_id"]
         if new is not None and new.state == "on":
             self._motion_seen.add(entity_id)
+        if appliance_offline(new) and old is not None and not appliance_offline(old):
+            if appliance_state(old.state) is not False:
+                self._appliance_lost_mid_run.add(entity_id)
+        elif new is not None and not appliance_offline(new):
+            self._appliance_lost_mid_run.discard(entity_id)
         if old is None or new is None or old.state != new.state:
             self._appliance_changed.add(entity_id)
             self._appliance_change_counts[entity_id] = (
@@ -237,6 +245,7 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         self._motion_seen.clear()
         self._appliance_changed.clear()
         self._appliance_change_counts.clear()
+        self._appliance_lost_mid_run.clear()
 
     async def _handle_tick(self, now: datetime) -> None:
         """Timer callback → run one tick."""
@@ -510,14 +519,25 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             return None
 
     def _appliance_activity(self, entity_ids: tuple[str, ...]) -> bool | None:
-        """Known idle states are evidence; an unfamiliar enum is uncertainty."""
+        """Known idle states are evidence; an unfamiliar enum is uncertainty.
+
+        An appliance its integration reports offline is powered down (idle) —
+        unless it went offline mid-run, which stays unknown until it returns.
+        """
         values = [
-            appliance_state(state.state) if (state := self.hass.states.get(entity_id)) else None
+            self._appliance_reading(entity_id, self.hass.states.get(entity_id))
             for entity_id in entity_ids
         ]
         if True in values:
             return True
         return None if None in values else False
+
+    def _appliance_reading(self, entity_id: str, state) -> bool | None:
+        if state is None:
+            return None
+        if appliance_offline(state):
+            return None if entity_id in self._appliance_lost_mid_run else False
+        return appliance_state(state.state)
 
     def _household_activity(self, cfg: LoadConfig, now: datetime) -> bool | None:
         """No detected motion is a coverage-limited observation, not proof of sleep."""

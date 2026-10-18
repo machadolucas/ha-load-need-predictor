@@ -88,7 +88,7 @@
             "shower_motion_entity": "Binary occupancy/motion sensor near the shower. Used with water and humidity to identify possible shower events; motion alone is not proof of a shower.",
             "shower_humidity_entity": "Bathroom relative-humidity sensor. Humidity rise adds evidence to a shower event; missing readings remain unknown.",
             "shower_ventilation_entity": "Binary sensor or input boolean indicating a shower-triggered ventilation boost. Supplemental evidence only; automatic ventilation alone does not confirm a shower.",
-            "cold_appliance_entities": "Running/status entities for cold-fed appliances such as a dishwasher or washing machine. Use actual running signals, not overall appliance availability. Unknown/unavailable states remain unknown. Used only in the shadow observation log.",
+            "cold_appliance_entities": "Running/status entities for cold-fed appliances such as a dishwasher or washing machine. Use actual running signals, not overall appliance availability. An unavailable appliance counts as powered off (cloud appliances drop offline when switched off) unless it dropped offline mid-run; unknown or unrecognised states remain unknown. Used only in the shadow observation log.",
             "shower_target_temp_c": "Preferred shower temperature (30–45 °C, default 40 °C) for observation context. This does not change the tank thermostat or heating target.",
             "appliance_household_activity_entities": "Motion or occupancy sources near other water uses (bathroom, toilet, shower). Activity flags possible household overlap; no activity does not prove all water belongs to an appliance. Empty or unavailable sources remain unknown. Shadow analysis only."
           }

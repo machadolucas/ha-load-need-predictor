@@ -56,12 +56,38 @@ def _issues(hass):
         ("rinsing", True),
         ("power_off", False),
         ("end", False),
+        ("initial", False),
+        ("reserved", False),
+        ("sleep", False),
+        ("pause", True),
+        ("error", None),
         ("unavailable", None),
         ("mystery", None),
     ],
 )
 def test_washer_status_semantics(state, expected):
     assert appliance_state(state) is expected
+
+
+async def test_offline_appliance_is_healthy_unless_restored(hass: HomeAssistant):
+    """Cloud appliances go unavailable when powered off; only a restored
+    (integration not providing it) state, ``unknown`` or a missing entity is a
+    source problem. Every LG ThinQ enum is recognised."""
+    cfg = load_config_from_data({"cold_appliance_entities": ["sensor.washer"]})
+    hass.states.async_set("sensor.washer", "unavailable")
+    assert source_health_warnings(hass, cfg) == []
+    for value in ("initial", "reserved", "sleep", "pause", "error", "rinse_hold"):
+        hass.states.async_set("sensor.washer", value)
+        assert source_health_warnings(hass, cfg) == [], value
+    hass.states.async_set("sensor.washer", "unavailable", {"restored": True})
+    assert source_health_warnings(hass, cfg) == [
+        "Configured source sensor.washer: state is unavailable "
+        "(source integration is not providing it)"
+    ]
+    # Non-appliance sources keep treating plain unavailable as a problem.
+    motion = load_config_from_data({"shower_motion_entity": "binary_sensor.motion"})
+    hass.states.async_set("binary_sensor.motion", "unavailable")
+    assert len(source_health_warnings(hass, motion)) == 1
 
 
 async def test_missing_appliance_warns_even_when_another_is_running(hass: HomeAssistant):
@@ -129,9 +155,15 @@ async def test_repairs_grace_recovery_and_recurrence(hass: HomeAssistant):
     hass.states.async_set("sensor.washer", "standby")
     monitor._check(now + SOURCE_ISSUE_GRACE + timedelta(seconds=1))
     assert not _issues(hass)
-    hass.states.async_set("sensor.washer", "unavailable")
+    hass.states.async_set("sensor.washer", "unknown")
     monitor._check(now + SOURCE_ISSUE_GRACE + timedelta(seconds=2))
     assert not _issues(hass)  # a recovered source earns a new transient grace
+    monitor._check(now + 2 * SOURCE_ISSUE_GRACE + timedelta(seconds=2))
+    assert len(_issues(hass)) == 1
+    # A powered-off cloud appliance (plain unavailable) clears the issue.
+    hass.states.async_set("sensor.washer", "unavailable")
+    monitor._check(now + 2 * SOURCE_ISSUE_GRACE + timedelta(seconds=3))
+    assert not _issues(hass)
 
 
 async def test_reconfiguration_and_entry_removal_clear_repairs(hass: HomeAssistant):

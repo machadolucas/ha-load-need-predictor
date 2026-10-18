@@ -821,11 +821,39 @@ async def test_appliance_context_records_short_pulses_and_does_not_change_contro
         hass.states.async_set(_WATER, str(1000 + 4 * minute), {"unit_of_measurement": "L"})
         await tracker.async_tick()
         assert coord.tanks[plain_sid] == coord.tanks[observed_sid]
+    # Dropping offline mid-run is a lost connection: unknown, not idle — and it
+    # outlives the tick that saw it.
     hass.states.async_set("sensor.washer", "unavailable")
     await hass.async_block_till_done()
     await tracker.async_tick()
-    assert any("sensor.washer" in item for item in tracker.data[observed_sid].quality_warnings)
+    await tracker.async_tick()
     assert tracker._appliance_activity(("sensor.washer",)) is None
+    assert not any("sensor.washer" in item for item in tracker.data[observed_sid].quality_warnings)
+    # Once it reports idle, a later drop offline is a power-off.
+    hass.states.async_set("sensor.washer", "power_off")
+    await hass.async_block_till_done()
+    assert tracker._appliance_activity(("sensor.washer",)) is False
+    hass.states.async_set("sensor.washer", "unavailable")
+    await hass.async_block_till_done()
+    await tracker.async_tick()
+    assert tracker._appliance_activity(("sensor.washer",)) is False
+    # A restored state means the integration isn't loaded: unknown and warned.
+    hass.states.async_set("sensor.washer", "unavailable", {"restored": True})
+    await hass.async_block_till_done()
+    await tracker.async_tick()
+    assert tracker._appliance_activity(("sensor.washer",)) is None
+    assert any("sensor.washer" in item for item in tracker.data[observed_sid].quality_warnings)
+
+
+async def test_appliance_offline_since_startup_is_idle(hass: HomeAssistant) -> None:
+    """An LG washer left off is ``unavailable`` from HA start until powered on."""
+    from custom_components.load_need_predictor.tank_tracker import TankTracker
+
+    tracker = object.__new__(TankTracker)
+    tracker.hass = hass
+    tracker._appliance_lost_mid_run = set()
+    hass.states.async_set("sensor.washer", "unavailable")
+    assert tracker._appliance_activity(("sensor.washer",)) is False
 
 
 async def test_bad_context_units_never_corroborate_shower(hass: HomeAssistant) -> None:

@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
@@ -43,6 +43,9 @@ _ACTIVE = frozenset(
         "rinse_hold",
         "refreshing",
         "steam_softening",
+        # A paused cycle resumes and fills again; it is still a run in progress.
+        "pause",
+        "paused",
     }
 )
 _IDLE = frozenset(
@@ -57,8 +60,15 @@ _IDLE = frozenset(
         "finished",
         "complete",
         "completed",
+        # LG ThinQ pre-run states: powered on / delay-start timer, no water yet.
+        "initial",
+        "reserved",
+        "sleep",
     }
 )
+# Recognised enums that say nothing about water use: uncertain, but not a
+# misconfigured source, so they must not raise a Repair.
+_UNCERTAIN = frozenset({"error"})
 _FIELDS = {
     "delivered_energy_entity": "energy",
     "water_total_entity": "volume",
@@ -73,14 +83,34 @@ _FIELDS = {
 }
 
 
+def _normalize(value: str) -> str:
+    return value.strip().lower().replace(" ", "_")
+
+
 def appliance_state(value: str) -> bool | None:
     """Decode run status; unknown enums must never become evidence of idleness."""
-    normalized = value.strip().lower().replace(" ", "_")
+    normalized = _normalize(value)
     if normalized in _ACTIVE:
         return True
     if normalized in _IDLE:
         return False
     return None
+
+
+def appliance_offline(state: State | None) -> bool:
+    """True when a loaded integration reports the appliance itself as gone.
+
+    Cloud appliances (LG ThinQ, SmartThings, Home Connect, …) drop to
+    ``unavailable`` when powered down, and stay there after an HA restart until
+    switched on again — so that state is an off appliance, not a broken source.
+    A *restored* state means the integration isn't providing the entity at all
+    (not loaded, entity orphaned): that one stays a genuine source problem.
+    """
+    return (
+        state is not None
+        and state.state == "unavailable"
+        and not state.attributes.get("restored", False)
+    )
 
 
 @dataclass(frozen=True)
@@ -105,10 +135,15 @@ def _problem(hass: HomeAssistant, source: _Source) -> str | None:
     if state is None:
         return "entity is missing"
     value = state.state
+    if source.kind == "appliance" and appliance_offline(state):
+        return None
     if value.lower() in {"unknown", "unavailable"}:
+        if state.attributes.get("restored", False):
+            return f"state is {value.lower()} (source integration is not providing it)"
         return f"state is {value.lower()}"
     if source.kind == "appliance":
-        return "run state is unsupported" if appliance_state(value) is None else None
+        known = appliance_state(value) is not None or _normalize(value) in _UNCERTAIN
+        return None if known else "run state is unsupported"
     if source.kind == "binary":
         return "expected an on/off state" if value not in {"on", "off"} else None
     try:

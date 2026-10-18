@@ -494,7 +494,12 @@ renames are followed through Home Assistant's entity registry. Replacing an
 integration creates a different source and requires explicitly selecting it;
 the integration does not guess a replacement from its display name. Unsupported
 appliance status strings remain unknown; a template binary sensor is suitable
-for appliance-specific status mappings.
+for appliance-specific status mappings. An appliance whose integration reports it
+`unavailable` counts as **powered off** — cloud appliances such as LG ThinQ drop
+offline when switched off and stay that way after an HA restart — so it raises no
+Repair. Two exceptions stay unknown: an appliance that went offline straight out
+of a run (a lost connection, not a power-off) and a *restored* state (the source
+integration isn't loaded), which is still reported as a source problem.
 
 Configured missing/unavailable or unsupported sources appear in the tank's
 quality warnings. Persistent failures also appear under **Settings → System →

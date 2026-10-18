@@ -91,6 +91,7 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `coordinator.py` | Load `DataUpdateCoordinator`; per-load `LoadResult` + the push-time `PublishedTarget` cache; predict/capture serialised by one lock, per-load work isolated | yes |
 | `forecast_coordinator.py` | Price-forecast coordinator: 5-min due-check tick → hourly Wattcast fetch (persisted cache, backoff, repair issue) → mapping refit → build slots → per-source snapshot; daily local refit; nightly per-source scoring; `ForecastResult` | yes |
 | `tank_tracker.py` | 60 s-tick coordinator: reads counters/switch/detector states, drives `tank_model.apply_tick`, publishes per-load `TankResult`, fires the low-charge boost | yes |
+| `source_health.py` | Per-source health checks + `source_unhealthy_*` Repairs (15-min grace) + registry-rename follow. Appliance sources: plain `unavailable` = **powered off** (cloud appliances like LG ThinQ go offline when off), never a Repair; a `restored` state (integration not loaded) still is. The tracker keeps an appliance that went offline *mid-run* unknown until it reports again | yes |
 | `runtime.py` | `RuntimeData` (both coordinators) + the `ConfigEntry` type alias | yes |
 | `config_flow.py` | Hub flow + `load` and `price_forecast` subentry wizards | yes |
 | `entity.py` | `PredictorEntity` (load) + `ForecastEntity` bases | yes |
