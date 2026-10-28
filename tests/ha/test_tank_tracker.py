@@ -232,10 +232,58 @@ async def test_stale_meter_uses_fallback(hass: HomeAssistant, freezer) -> None:
     await tracker.async_tick()  # establishes the water baseline at T0
 
     hass.states.async_set(_WATER, "unavailable")
-    freezer.tick(timedelta(seconds=1000))  # > WATER_STALE_AFTER_S (900)
-    await tracker.async_tick()
+    # Watched missing tick by tick past WATER_STALE_AFTER_S (900 s) → a real outage.
+    for _ in range(16):
+        freezer.tick(timedelta(seconds=60))
+        await tracker.async_tick()
 
     assert tracker.data[sid].draw_source == "fallback"
+
+
+async def test_meter_missing_after_a_restart_gap_waits(hass: HomeAssistant, freezer) -> None:
+    # The first tick after HA was down often runs before the MQTT meter is
+    # restored: that downtime wasn't observed, so it must not fall back (v0.14.0).
+    entry = await _setup(hass)
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+
+    hass.states.async_set(_WATER, "500.0", {"unit_of_measurement": "m³"})
+    coord.tanks[sid] = replace(initial_state(_CAPACITY), last_tick_iso=dt_util.utcnow().isoformat())
+    await tracker.async_tick()
+
+    hass.states.async_set(_WATER, "unavailable")
+    freezer.tick(timedelta(seconds=1800))  # one tick spanning a 30-min restart
+    await tracker.async_tick()
+
+    assert tracker.data[sid].draw_source == "none"
+    assert coord.tanks[sid].cycle_clean is True
+
+
+async def test_outdoor_temperature_drives_cold_standby(hass: HomeAssistant, freezer) -> None:
+    entry = await _setup(hass, [{**_TANK_LOAD, "outdoor_temp_entity": "sensor.outdoor"}])
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    sid = _tank_sid(entry)
+
+    hass.states.async_set(
+        "sensor.outdoor", "5.0", {"unit_of_measurement": "°C", "device_class": "temperature"}
+    )
+    coord.tanks[sid] = replace(
+        initial_state(_CAPACITY),
+        last_tick_iso=dt_util.utcnow().isoformat(),
+        standby_w=100.0,
+        standby_w_per_k=2.0,
+    )
+    freezer.tick(timedelta(seconds=60))
+    await tracker.async_tick()
+
+    result = tracker.data[sid]
+    assert result.standby_now_w == pytest.approx(120.0)  # 100 + 2 W/K × (15 − 5) K
+    assert coord.tanks[sid].last_ambient_c == 5.0
+    attrs = hass.states.get(_sensor_id(hass, sid, "tank_soc")).attributes
+    assert attrs["standby_w"] == 100.0
+    assert attrs["standby_w_per_k"] == 2.0
+    assert attrs["standby_now_w"] == pytest.approx(120.0)
+    assert "last_cutoff" in attrs
 
 
 # 5 ─ the m³ water meter is normalised to litres ──────────────────────────────

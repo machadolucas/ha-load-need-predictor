@@ -274,6 +274,8 @@ class TankSocSensor(TankEntity, SensorEntity):
             "uncertainty_kwh",
             "latched",
             "draw_source",
+            # Follows the outdoor temperature, so it moves every few minutes.
+            "standby_now_w",
             "equivalent_liters_40c",
             "anchor_age_hours",
             "quality_warnings",
@@ -306,9 +308,14 @@ class TankSocSensor(TankEntity, SensorEntity):
             "hot_fraction": round(result.hot_fraction, 3),
             "hot_fraction_profile": [round(value, 3) for value in result.hot_fraction_profile],
             "standby_w": round(result.standby_w, 1),
+            "standby_w_per_k": round(result.standby_w_per_k, 2),
+            "standby_now_w": (
+                round(result.standby_now_w, 1) if result.standby_now_w is not None else None
+            ),
             "calibrated": result.calibrated,
             "latched": result.latched,
             "last_full": result.last_full,
+            "last_cutoff": result.last_cutoff,
             "draw_source": result.draw_source,
             "equivalent_liters_40c": round(result.liters_40c, 0),
             "equivalent_liters_assumption": (

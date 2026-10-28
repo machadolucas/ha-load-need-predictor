@@ -80,7 +80,7 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `predictor.py` | **Pure** load model: features → kWh → minutes, seeds, gain EWMA, prior↔empirical blend, `build_features`, rolling MAE, deficit carryover (`close_cycle`/`open_cycle`) | no |
 | `price_model.py` | **Pure** price model: ridge regression of price on wind+temp with a cold interaction; seed fallback; fit/predict/serialize | no |
 | `spot_forecast.py` | **Pure** Wattcast parse + compact cache (`WattcastSeries`), spot→retail mapping (`fit_retail_mapping`), local intraday shape, DST-safe 15-min `build_slots`, per-hour scoring + `select_primary` | no |
-| `tank_model.py` | **Pure** tank state-of-charge: energy-deficit integration (`apply_tick`), 100 %-anchor + EWMA calibration of `hot_fraction`/`standby_w`, hot-flow cap, meter-misread/fallback guards, boost gating (`should_boost`), liters/showers helpers | no |
+| `tank_model.py` | **Pure** tank state-of-charge: energy-deficit integration (`apply_tick`), 100 %-anchor + joint NLMS calibration of the hot-fraction profile / base standby / cold-standby slope, no-trip cut-off floor + learning, hot-flow cap, meter-misread/fallback guards, boost gating (`should_boost`), liters/showers helpers | no |
 | `models.py` | Subentry config → frozen `LoadConfig` / `PriceForecastConfig`; `LoadConfig.tank_tracking_enabled` is the one "is the tank live?" predicate | no |
 | `statistics_source.py` | Load delivery from the recorder (`change` over an arbitrary window via the singular `statistic_during_period`, kWh-normalised) + commanded switch on-time over a window (`async_commanded_minutes`, for deficit carryover); every helper returns `None` on a recorder error, never raises | yes |
 | `forecast_source.py` | Wind series + daily temp forecast + LTS fit rows / realised price (daily + hourly); the Wattcast HTTP fetch (never raises → `WattcastFetch`); real-price slot/pair helpers | yes |
@@ -341,6 +341,18 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   (it stays 0 — the replay is identical to the pre-cadence model). The first
   water reading (no baseline) is adopted with zero draw, source `none`, cycle
   still clean — not treated as a misread.
+- **Missing meter vs. restarts** (v0.14.0): staleness (`WATER_STALE_AFTER_S`) is
+  timed from `water_missing_since_iso` — when a *running* tracker first saw the
+  reading missing — not from the last read, and a tick after an unobserved gap
+  (`elapsed_s ≥ 900`, i.e. HA was down) restarts that clock. The first tick after
+  a restart often runs before the MQTT meter is restored; it used to fall back
+  over the whole downtime and dirty the cycle, so a later anchor learned nothing
+  (that's what dirtied the 2026-10-26→28 cycle). The cumulative reading
+  reconciles the gap when it returns. If the wait gives up, the fallback charges
+  the whole span since the last valid read, net of `pending_fallback_kwh`, so a
+  meter that never returns before the next anchor doesn't lose its downtime.
+  The outdoor temperature is held across a dropout for at most `AMBIENT_HOLD_H`
+  (6 h, `last_ambient_iso`), so a removed sensor stops driving the cold term.
 - **Counter gaps across an anchor**: a counter that is unavailable *on* the
   anchor tick has an unknown delta straddling the trip, so that cycle doesn't
   learn, its baseline (if any) is dropped (the returning reading is adopted with
@@ -399,16 +411,62 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   as the profile's mean. The replay separated evening ≈ 0.27 (showers) from
   the rest of the day ≈ 0.20 (toilets/dishwasher/washer — cold-only) on the
   author's house.
-- **Learner regimes** (`learn_from_cycle`, gated on `calibrated` + a clean
-  cycle — no fallback/misread ticks): cycles < 4 h are post-trip re-heats and
-  teach `hysteresis_kwh` only; ≥ 50 L metered in a longer cycle → the
-  hot-fraction profile learns; < 10 L over ≥ 12 h → `standby_w` absorbs the
-  residual instead. Long cycles also EWMA-update `residual_ratio` (the
+- **Learner** (`learn_from_cycle`, gated on `calibrated` + a clean cycle — no
+  fallback/misread ticks): cycles < 4 h are post-trip re-heats and teach
+  `hysteresis_kwh` only. Every longer cycle takes **one joint step**
+  (`_attribute_residual`, v0.14.0): the cycle's modelled loss is linear in the
+  params (`Σ hf_b·X_b + standby_w·H + standby_w_per_k·C`), so a normalised-LMS
+  step preconditioned by the `PRIOR_*` scales (0.08 per hot fraction, 30 W,
+  3 W/K) moves each param ∝ `s²·x` — the total correction is always `β·r` (as
+  before), split ∝ `(s·x)²`. The hot fractions only take part with ≥ 50 L
+  metered (then the 5 % ridge pull too); a dry cycle teaches standby alone (the
+  old dry-cycle formula exactly), no cold hours ⇒ no slope change. **Why**: the
+  old regimes only taught standby from < 10 L over ≥ 12 h, which never happened
+  between daily anchors — standby sat at its 114 W seed for months while the hot
+  fractions absorbed its error, until a near-dry 47 h cycle (2026-10-26→28)
+  missed by > 3 kWh. On the August replay the joint step barely moves standby
+  (wet summer cycles are dominated by the hot-fraction term) and residual rms
+  went 1.165 → 1.150. Long cycles also EWMA-update `residual_ratio` (the
   saturation curve's σ scale). Step size is `LEARN_BETA = 0.1` (hysteresis and
   residual_ratio use a faster 0.2) — the replay showed a faster learner chases
   ±1 kWh of cycle-to-cycle noise and gets worse. Meter dropouts fall back to
   an occupancy-based draw and reconcile via `pending_fallback_kwh` when the
   meter returns (no double-count).
+- **Cold-weather standing loss** (v0.14.0): `standby_w_at = standby_w +
+  standby_w_per_k × max(0, STANDBY_REF_C − T)` (ref 15 °C; base clamp 20–250 W,
+  slope 0–15 W/K, sum ≤ 400 W) with `T` = the load's `outdoor_temp_entity` via
+  `TickInputs.ambient_c` (°C-converted by the tracker; a dropout holds
+  `last_ambient_c`; never configured ⇒ no cold term). The author's tank is in an
+  exterior NE kitchen corner. `cycle_cold_kh` (K·h below the ref) is the
+  slope's learning feature, reset at anchors. Seed slope 0 = the old model.
+- **No-trip cut-offs** (v0.14.0): the contactor opening while the element is
+  still heating (`heating_prev` True → heating + contactor both off, the element
+  not idle ≥ `CUTOFF_TRIP_MARGIN_S` before the contactor, and *observed*: not on
+  a tick after a gap > `CUTOFF_MAX_GAP_S`, since startup resets every
+  `last_changed`) proves the tank is **not** full. `heating_prev` stays True for
+  an element idle < 30 s with the contactor still on (the LED once dropped 22 s
+  early). After `CUTOFF_SETTLE_S` (2 min, for a lagging energy counter; a run
+  resuming inside it cancels) **and once both counters are accounted for**
+  (energy present; water present or already in fallback — a settle during a
+  meter wait would learn from the unmetered draw and then charge it again on
+  top of the floor), cycles < 4 h (post-trip re-heats) are dropped outright;
+  otherwise `learn_from_cutoff` steps on the part of the learning ledger beyond
+  −(`hysteresis_kwh` + 0.3) — or, once a cut-off in this cycle has learned,
+  beyond `cycle_cutoff_mark_kwh` (the re-based level it learned down to), so the
+  same contradiction is never learned twice — a lower bound on the error, so
+  only the excess, and `residual_ratio` may only grow — and returns the extra
+  losses the new params explain, which **re-base** the learning ledger (so the
+  next anchor's residual is measured against the new params, no double count);
+  then the displayed deficit (via `cycle_display_lift_kwh`, which first gives up
+  the re-based amount) and the control `deficit_kwh` are **floored at σ**. The
+  band exists because a re-heated tank legitimately holds ~`hysteresis_kwh`
+  more than at a first trip; short cycles (< 4 h) never learn here. **Why**: on
+  2026-10-28 the scheduler had cut every run before the trip for 47 h; the
+  ledger sat at −1.2 kWh ("beyond full") and the curve's 1/|u| tail shrank every
+  later loss to ~8 % — the live sensor read 98.9 % with ≥ 1.9 kWh missing; the
+  replayed fixture now ends at 86 %. A settled cut-off can step the % *down* by
+  ≤ σ (≈ 3–5 points) — like an anchor steps it up; the replay records these as
+  `cutoff_steps`, not `jumps`. Anchors clear the lift and any pending cut-off.
 - **The anchor + latch**: contactor commanded on + heating-active detector off,
   both sustained (≥ 120 s / ≥ 60 s via `last_changed` age — `unknown`/
   `unavailable` map to `None` = "don't anchor", never "off"). The *transition*
@@ -433,10 +491,12 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   derived from), `deficit_raw_kwh` (the clamped control ledger — what the
   SoC→prediction feedback actually uses), `uncertainty_kwh` (σ),
   `hysteresis_kwh`, `hot_fraction_profile`, `latched`, plus the pre-existing
-  `capacity_kwh`, `hot_fraction`, `standby_w`, `calibrated`, `last_full`,
-  `draw_source`, `liters_40c`, `showers_left`. The per-tick-volatile ones
-  (`deficit_kwh`, `deficit_raw_kwh`, `uncertainty_kwh`, `latched`,
-  `draw_source`, `liters_40c`, `showers_left`) are `_unrecorded_attributes` —
+  `capacity_kwh`, `hot_fraction`, `standby_w` (the *base*), `standby_w_per_k`,
+  `standby_now_w` (base + cold term now), `calibrated`, `last_full`,
+  `last_cutoff`, `draw_source`, `liters_40c`, `showers_left`. The
+  per-tick-volatile ones (`deficit_kwh`, `deficit_raw_kwh`, `uncertainty_kwh`,
+  `latched`, `draw_source`, `standby_now_w`, `liters_40c`, `showers_left`) are
+  `_unrecorded_attributes` —
   otherwise the recorder writes a new attributes row every minute; nothing
   reads their history (the card reads them live, the replay only the state).
   The slow learned params stay recorded.
@@ -466,9 +526,12 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   1) — the v2 fields (`hot_fraction_profile`, `hysteresis_kwh`,
   `residual_ratio`, `cycle_unclamped_kwh`, `cycle_relax_kwh`,
   `led_kwh_since_counter`, `water_changed_iso`,
-  `water_cadence_min`, `energy_source`/`water_source`, …) all default so a
-  pre-v2 payload loads as a flat profile with no learning history (and the
-  counter timing/sources as "unknown" = the old behaviour). `TankState` lives in
+  `water_cadence_min`, `energy_source`/`water_source`, and v0.14.0's
+  `standby_w_per_k`, `last_ambient_c`, `cycle_cold_kh`, `heating_prev`,
+  `cutoff_pending_iso`, `last_cutoff_iso`, `cycle_display_lift_kwh`,
+  `water_missing_since_iso`, …) all default so a pre-v2 payload loads as a flat
+  profile with no learning history (and the counter timing/sources as
+  "unknown", no cold slope, nothing pending = the old behaviour). `TankState` lives in
   `LoadNeedPredictorCoordinator.tanks` because `_runtime_snapshot` rebuilds the
   whole dict on every save — state owned elsewhere would be dropped. Saves:
   immediately on anchor/learn/boost, else every ~15 ticks (the cumulative
@@ -481,6 +544,10 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   `tests/fixtures/tank_week_2026-08-28.csv` (exported from HA history JSON via
   `tools/replay_tank.py`) + `tests/test_tank_replay.py` replay a real week
   through `apply_tick` and report/assert on the trip-residual distribution.
+  `tank_notrip_2026-10-19.csv` (with an optional `ambient_c` series) replays the
+  47 h no-trip stretch: it must end < 90 % (v0.13 read 98.6 %), teach standby
+  upward, and bound every cut-off step by σ; its only `jumps` are two water-meter
+  OCR catch-ups on 2026-10-25 (real litres arriving in one reading).
   **Re-run the replay before changing any tank constant** — it's what caught
   the old hard-floor design silently discarding delivered energy in the first
   place. Future work: room-occupancy draw attribution (bathroom motion ⇒ hot)

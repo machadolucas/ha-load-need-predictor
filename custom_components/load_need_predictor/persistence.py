@@ -145,6 +145,17 @@ def tank_to_dict(state: TankState) -> dict:
         "water_cadence_min": state.water_cadence_min,
         "energy_source": state.energy_source,
         "water_source": state.water_source,
+        # v0.14.0: cold-weather standby, no-trip cut-offs, observed meter outage.
+        "standby_w_per_k": state.standby_w_per_k,
+        "last_ambient_c": state.last_ambient_c,
+        "last_ambient_iso": state.last_ambient_iso,
+        "cycle_cold_kh": state.cycle_cold_kh,
+        "heating_prev": state.heating_prev,
+        "cutoff_pending_iso": state.cutoff_pending_iso,
+        "last_cutoff_iso": state.last_cutoff_iso,
+        "cycle_display_lift_kwh": state.cycle_display_lift_kwh,
+        "cycle_cutoff_mark_kwh": state.cycle_cutoff_mark_kwh,
+        "water_missing_since_iso": state.water_missing_since_iso,
         "version": state.version,
     }
 
@@ -167,6 +178,10 @@ def tank_from_dict(data: dict | None) -> TankState | None:
     def _opt_float(key: str, fallback: float | None) -> float | None:
         value = data.get(key, fallback)
         return None if value is None else float(value)
+
+    def _opt_bool(key: str, fallback: bool | None) -> bool | None:
+        value = data.get(key, fallback)
+        return None if value is None else bool(value)
 
     def _float_tuple(key: str, fallback: tuple[float, ...]) -> tuple[float, ...]:
         value = data.get(key)
@@ -208,5 +223,19 @@ def tank_from_dict(data: dict | None) -> TankState | None:
         water_cadence_min=float(data.get("water_cadence_min", defaults.water_cadence_min)),
         energy_source=str(data.get("energy_source", defaults.energy_source)),
         water_source=str(data.get("water_source", defaults.water_source)),
+        standby_w_per_k=float(data.get("standby_w_per_k", defaults.standby_w_per_k)),
+        last_ambient_c=_opt_float("last_ambient_c", defaults.last_ambient_c),
+        last_ambient_iso=str(data.get("last_ambient_iso", defaults.last_ambient_iso)),
+        cycle_cold_kh=float(data.get("cycle_cold_kh", defaults.cycle_cold_kh)),
+        heating_prev=_opt_bool("heating_prev", defaults.heating_prev),
+        cutoff_pending_iso=str(data.get("cutoff_pending_iso", defaults.cutoff_pending_iso)),
+        last_cutoff_iso=str(data.get("last_cutoff_iso", defaults.last_cutoff_iso)),
+        cycle_display_lift_kwh=float(
+            data.get("cycle_display_lift_kwh", defaults.cycle_display_lift_kwh)
+        ),
+        cycle_cutoff_mark_kwh=_opt_float("cycle_cutoff_mark_kwh", defaults.cycle_cutoff_mark_kwh),
+        water_missing_since_iso=str(
+            data.get("water_missing_since_iso", defaults.water_missing_since_iso)
+        ),
         version=str(data.get("version", defaults.version)),
     )

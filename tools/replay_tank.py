@@ -62,7 +62,10 @@ HEATING = "heating"
 ENERGY = "energy_kwh"
 WATER = "water_m3"
 LIVE_SOC = "live_soc_pct"
-SERIES = (CONTACTOR, HEATING, ENERGY, WATER, LIVE_SOC)
+# Optional (v0.14.0): the outdoor temperature driving the cold-weather standing
+# loss. Fixtures exported before it existed simply have no rows → no cold term.
+AMBIENT = "ambient_c"
+SERIES = (CONTACTOR, HEATING, ENERGY, WATER, LIVE_SOC, AMBIENT)
 # The four the tick actually consumes; ``live_soc_pct`` only seeds the starting
 # deficit and provides the informational replay-vs-live comparison.
 REQUIRED_SERIES = (CONTACTOR, HEATING, ENERGY, WATER)
@@ -73,6 +76,7 @@ ENTITY_TO_SERIES = {
     "sensor.leddetector_water_heater_energy": ENERGY,
     "sensor.water_meter_mac_ocr_water_total": WATER,
     "sensor.lvv_water_heater_tank_charge": LIVE_SOC,
+    "sensor.outdoor_sensor_temperature": AMBIENT,
 }
 
 # ── Replay setup (the author's LVV; see CLAUDE.md "The tank model") ───────────
@@ -313,6 +317,9 @@ def replay(
     heating_minutes = 0
     prev_soc: float | None = None
     jumps: list[tuple[str, float]] = []
+    # A settled no-trip cut-off may step the % down (the floor at σ), like an
+    # anchor steps it up: recorded separately, with the σ that bounds it.
+    cutoff_steps: list[tuple[str, float, float]] = []
     corrections: list[float] = []
     anchor_socs: list[float] = []
     residuals: list[tuple[str, float]] = []
@@ -337,6 +344,7 @@ def replay(
         water_state, water_changed_at = cursors[WATER].at(now)
         water = _as_float(water_state)
         live = _as_float(cursors[LIVE_SOC].at(now)[0])
+        ambient = _as_float(cursors[AMBIENT].at(now)[0])
 
         inputs = tank.TickInputs(
             now_iso=now.isoformat(),
@@ -361,6 +369,7 @@ def replay(
                 if water is not None and water_changed_at is not None
                 else None
             ),
+            ambient_c=ambient,
         )
         before = state
         result = tank.apply_tick(state, params, inputs)
@@ -371,6 +380,7 @@ def replay(
                 hot_fraction=hot_fraction,
                 hot_fraction_profile=(hot_fraction,) * tank.N_DAYPARTS,
                 standby_w=standby_w,
+                standby_w_per_k=tank.SEED_STANDBY_W_PER_K,
                 hysteresis_kwh=tank.SEED_HYSTERESIS_KWH,
                 residual_ratio=tank.SEED_RESIDUAL_RATIO,
             )
@@ -406,6 +416,14 @@ def replay(
                 }
             )
             last_trip = now
+        elif getattr(result, "cutoff", False):
+            cutoff_steps.append(
+                (
+                    now.isoformat(),
+                    0.0 if prev_soc is None else soc_pct - prev_soc,
+                    result.uncertainty_kwh / capacity * 100.0,
+                )
+            )
         elif prev_soc is not None and abs(soc_pct - prev_soc) >= JUMP_PTS:
             jumps.append((now.isoformat(), soc_pct - prev_soc))
 
@@ -448,6 +466,8 @@ def replay(
         "start_soc_live": live_start,
         "heating_minutes": heating_minutes,
         "jumps": jumps,
+        "cutoff_steps": cutoff_steps,
+        "final_soc_pct": prev_soc,
         "anchors": len(anchor_socs),
         "anchor_socs": anchor_socs,
         "anchor_corrections": corrections,

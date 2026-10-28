@@ -126,6 +126,42 @@ def test_tank_from_dict_without_counter_timing_keys_defaults_to_unknown():
     assert state.energy_baseline_kwh == 100.0
 
 
+def test_tank_v014_fields_round_trip():
+    # Cold-weather standby, the cut-off bookkeeping and the observed meter
+    # outage survive a save+load — including the genuinely nullable ones.
+    state = TankState(
+        deficit_kwh=2.0,
+        standby_w_per_k=1.75,
+        last_ambient_c=-4.5,
+        last_ambient_iso="2026-10-28T03:40:00+00:00",
+        cycle_cold_kh=180.0,
+        heating_prev=True,
+        cutoff_pending_iso="2026-10-28T03:45:35+00:00",
+        last_cutoff_iso="2026-10-28T02:17:40+00:00",
+        cycle_display_lift_kwh=1.3,
+        cycle_cutoff_mark_kwh=-1.8,
+        water_missing_since_iso="2026-10-28T03:00:00+00:00",
+    )
+    assert tank_from_dict(tank_to_dict(state)) == state
+    unknown = TankState(
+        deficit_kwh=2.0, last_ambient_c=None, heating_prev=None, cycle_cutoff_mark_kwh=None
+    )
+    assert tank_from_dict(tank_to_dict(unknown)) == unknown
+
+
+def test_tank_from_dict_without_v014_keys_keeps_the_old_behaviour():
+    # A v0.13 payload: no cold slope, nothing pending, no lift, meter not missing.
+    state = tank_from_dict({"deficit_kwh": 3.0, "standby_w": 114.0})
+    assert state.standby_w == 114.0
+    assert state.standby_w_per_k == 0.0
+    assert state.last_ambient_c is None
+    assert state.cycle_cold_kh == 0.0
+    assert state.heating_prev is None
+    assert state.cutoff_pending_iso == ""
+    assert state.cycle_display_lift_kwh == 0.0
+    assert state.water_missing_since_iso == ""
+
+
 def test_tank_from_dict_none_and_defaults():
     # Missing/empty → None (nothing stored); a partial payload keeps the rest at
     # its dataclass default, and the nullable baselines stay None.

@@ -10,6 +10,7 @@ import importlib.util
 import math
 import pathlib
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import pytest
@@ -1069,9 +1070,11 @@ def test_apply_tick_second_anchor_learns_hot_fraction_on_clean_cycle():
     assert res.anchored is True
     assert res.state.deficit_kwh == 0.0
     assert res.state.cycle_unclamped_kwh == 0.0
-    # Normalised-LMS step on the single wet bucket, then the ridge pull.
+    # Preconditioned NLMS step shared by the wet bucket and the 10 h of standby,
+    # then the ridge pull.
     x = 100.0 * 63.0 * K
-    stepped = 0.25 - tank.LEARN_BETA * 1.0 / x
+    step = _joint_step([0.0, 0.0, 0.0, x], 10.0, 0.0, 1.0)
+    stepped = 0.25 + step * tank.PRIOR_HOT_FRACTION**2 * x
     mean = (3 * 0.25 + stepped) / tank.N_DAYPARTS
     assert res.state.hot_fraction_profile[3] == pytest.approx(
         0.95 * stepped + 0.05 * mean, abs=1e-9
@@ -1084,6 +1087,16 @@ def test_apply_tick_second_anchor_learns_hot_fraction_on_clean_cycle():
 
 
 # ── learn_from_cycle: gates ───────────────────────────────────────────────────
+
+
+def _joint_step(x_hot, hours, cold_kh, residual):
+    """The scalar of the preconditioned NLMS step (``−β·r / Σ s²x²``)."""
+    norm = (
+        tank.PRIOR_HOT_FRACTION**2 * sum(x * x for x in x_hot)
+        + tank.PRIOR_STANDBY_W**2 * (hours / 1000.0) ** 2
+        + tank.PRIOR_STANDBY_W_PER_K**2 * (cold_kh / 1000.0) ** 2
+    )
+    return -tank.LEARN_BETA * residual / norm
 
 
 def _learn(**over) -> TankState:
@@ -1173,16 +1186,22 @@ def test_learn_profile_lms_step_single_bucket():
     # 100 evening litres, +1 kWh residual ⇒ the model over-charged that bucket.
     st = _learn(cycle_liters=100.0, cycle_hot_liters_by_bucket=(0.0, 0.0, 0.0, 100.0))
     out = tank.learn_from_cycle(st, PARAMS, 10.0, 1.0)
-    # x_b = L_b·ΔT·k; with one wet bucket the normalised step is β·residual/x.
+    # x_b = L_b·ΔT·k. The step is shared with the cycle's 10 h of standby,
+    # ∝ (prior scale × feature)²: here ~79 % to the bucket, ~21 % to standby.
     x = 100.0 * 63.0 * K
-    stepped = 0.25 - tank.LEARN_BETA * 1.0 / x
+    step = _joint_step([0.0, 0.0, 0.0, x], 10.0, 0.0, 1.0)
+    stepped = 0.25 + step * tank.PRIOR_HOT_FRACTION**2 * x
     mean = (3 * 0.25 + stepped) / tank.N_DAYPARTS
     assert out.hot_fraction_profile[3] == pytest.approx(0.95 * stepped + 0.05 * mean, abs=1e-9)
-    assert out.hot_fraction_profile[3] == pytest.approx(0.2368610, abs=1e-6)
+    assert out.hot_fraction_profile[3] == pytest.approx(0.2395892, abs=1e-6)
     # The dry buckets only feel the ridge, not the step.
     for index in (0, 1, 2):
         assert out.hot_fraction_profile[index] == pytest.approx(0.95 * 0.25 + 0.05 * mean, abs=1e-9)
-        assert out.hot_fraction_profile[index] == pytest.approx(0.2498294, abs=1e-6)
+        assert out.hot_fraction_profile[index] == pytest.approx(0.2498648, abs=1e-6)
+    # Standby took the rest of the correction: together exactly β × residual.
+    d_standby = out.standby_w - 70.0
+    assert d_standby < 0
+    assert (stepped - 0.25) * x + d_standby * 10.0 / 1000.0 == pytest.approx(-tank.LEARN_BETA * 1.0)
     # hot_fraction is kept as the profile mean, which the ridge preserves.
     assert out.hot_fraction == pytest.approx(mean, abs=1e-9)
     assert out.hot_fraction == pytest.approx(sum(out.hot_fraction_profile) / 4.0)
@@ -1207,9 +1226,9 @@ def test_learn_profile_step_scales_with_bucket_litres():
     out = tank.learn_from_cycle(st, PARAMS, 10.0, 1.0)
     x_day = 50.0 * 63.0 * K
     x_eve = 100.0 * 63.0 * K
-    norm = x_day**2 + x_eve**2
-    step_day = tank.LEARN_BETA * 1.0 * x_day / norm
-    step_eve = tank.LEARN_BETA * 1.0 * x_eve / norm
+    step = _joint_step([0.0, 0.0, x_day, x_eve], 10.0, 0.0, 1.0)
+    step_day = -step * tank.PRIOR_HOT_FRACTION**2 * x_day
+    step_eve = -step * tank.PRIOR_HOT_FRACTION**2 * x_eve
     assert step_eve == pytest.approx(2.0 * step_day)
     assert out.hot_fraction_profile[2] - out.hot_fraction_profile[3] == pytest.approx(
         (1.0 - tank.PROFILE_RIDGE) * (step_eve - step_day), abs=1e-9
@@ -1289,20 +1308,22 @@ def test_learn_standby_clamped_both_ends():
     assert tank.learn_from_cycle(st, PARAMS, 24.0, 100.0).standby_w == tank.STANDBY_W_MIN
 
 
-def test_learn_standby_needs_a_long_cycle():
-    # ≥ 4 h (so not a re-heat) but < STANDBY_MIN_HOURS → standby doesn't dominate.
+def test_learn_standby_from_any_long_dry_cycle():
+    # v0.14.0: no ≥ 12 h gate any more — it never fired between daily anchors, so
+    # standby sat at its seed. A 6 h dry cycle teaches it: 70 − 0.1×0.48/6×1000.
     st = _learn(cycle_liters=5.0)
     out = tank.learn_from_cycle(st, PARAMS, 6.0, 0.48)
-    assert out.standby_w == 70.0
+    assert out.standby_w == pytest.approx(62.0)
 
 
-def test_learn_midsize_cycle_learns_no_structure():
-    # 10–50 L matches neither the profile nor the standby regime.
+def test_learn_midsize_cycle_teaches_standby_not_the_profile():
+    # < LEARN_MIN_LITERS can't tell showers from toilets, so the profile stays and
+    # standby absorbs the whole step: 70 − 0.1×1.0/24×1000.
     st = _learn(cycle_liters=30.0, cycle_hot_liters_by_bucket=(0.0, 0.0, 0.0, 30.0))
     out = tank.learn_from_cycle(st, PARAMS, 24.0, 1.0)
     assert out.hot_fraction == 0.25
-    assert out.standby_w == 70.0
     assert out.hot_fraction_profile == pytest.approx((0.25,) * 4)
+    assert out.standby_w == pytest.approx(70.0 - 100.0 / 24.0)
 
 
 # ── learn_from_cycle: residual_ratio (the σ scale) ───────────────────────────
@@ -1357,17 +1378,21 @@ def test_pending_fallback_reconciled_into_next_metered_draw():
         calibrated=True,
         standby_w=0.0,
     )
-    # Tick A: meter stale (>900 s) → fallback charged, pending accumulates.
+    # Tick A: meter seen missing for > 900 s → fallback charged, pending accumulates.
+    st = replace(st, water_missing_since_iso="2026-07-16T00:00:00+03:00")
     a = tank.apply_tick(
         st,
         PARAMS,
         _inputs(
             now_iso="2026-07-16T00:16:40+03:00",  # +1000 s
-            elapsed_s=1000.0,
+            elapsed_s=60.0,
             energy_counter_kwh=0.0,
             water_counter_l=None,
         ),
     )
+    # The first fallback tick charges the whole span since the last valid read
+    # (the waited-out ticks included), so nothing is lost if the meter never
+    # comes back before the next anchor.
     fb = tank.fallback_draw_kwh(3.0, 2.2, 0.4, 1, 0.0, 1000.0 / 60.0)
     assert a.draw_source == "fallback"
     assert a.state.pending_fallback_kwh == pytest.approx(fb)
@@ -1498,6 +1523,444 @@ def test_restart_reconciliation_single_tick_over_8h_gap():
     assert res.state.deficit_kwh == pytest.approx(4.0 + draw + standby - 2.0)
     assert res.state.energy_baseline_kwh == 1002.0
     assert res.state.water_baseline_l == 2100.0
+
+
+# ── apply_tick: a missing water meter across an HA restart (v0.14.0) ─────────
+
+
+def _restart_state(**over) -> TankState:
+    base = dict(
+        deficit_kwh=4.0,
+        energy_baseline_kwh=1000.0,
+        water_baseline_l=2000.0,
+        water_baseline_iso=_iso(-30),
+        last_tick_iso=_iso(-30),
+        calibrated=True,
+        standby_w=70.0,
+        hot_fraction=0.25,
+    )
+    base.update(over)
+    return TankState(**base)
+
+
+def test_restart_with_meter_not_yet_restored_waits_instead_of_falling_back():
+    # HA was down 30 min and the MQTT meter isn't restored on the first tick: the
+    # downtime was unobserved, so it isn't a 30-min outage — wait, stay clean.
+    res = tank.apply_tick(
+        _restart_state(),
+        PARAMS,
+        _inputs(now_iso=_iso(0), elapsed_s=1800.0, energy_counter_kwh=1000.0),
+    )
+    assert res.draw_source == "none"
+    assert res.draw_kwh == 0.0
+    assert res.state.cycle_clean is True
+    assert res.state.pending_fallback_kwh == 0.0
+    assert res.state.water_missing_since_iso == _iso(0)
+    # The meter returns a minute later: the whole gap's litres are metered at once
+    # (rated over the time since the last read, so the caps don't clip them).
+    back = tank.apply_tick(
+        res.state,
+        PARAMS,
+        _inputs(now_iso=_iso(1), energy_counter_kwh=1000.0, water_counter_l=2040.0),
+    )
+    assert back.draw_source == "meter"
+    assert back.draw_kwh == pytest.approx(tank.draw_kwh_from_liters(40.0, 0.25, 75.0, 12.0))
+    assert back.state.water_missing_since_iso == ""
+    assert back.state.cycle_clean is True
+
+
+def test_meter_seen_missing_past_the_stale_age_still_falls_back():
+    # The running tracker watched it be missing for 16 min → a real outage.
+    st = _restart_state(water_baseline_iso=_iso(-17), water_missing_since_iso=_iso(-16))
+    res = tank.apply_tick(
+        st, PARAMS, _inputs(now_iso=_iso(0), elapsed_s=60.0, energy_counter_kwh=1000.0)
+    )
+    assert res.draw_source == "fallback"
+    assert res.state.cycle_clean is False
+    assert res.state.water_missing_since_iso == _iso(-16)
+
+
+def test_an_unobserved_gap_restarts_the_missing_clock():
+    # Missing since long before a restart: the downtime still doesn't count, so
+    # the meter gets a fresh 15 min to come back.
+    st = _restart_state(water_missing_since_iso=_iso(-60))
+    res = tank.apply_tick(
+        st, PARAMS, _inputs(now_iso=_iso(0), elapsed_s=1800.0, energy_counter_kwh=1000.0)
+    )
+    assert res.draw_source == "none"
+    assert res.state.water_missing_since_iso == _iso(0)
+
+
+# ── cold-weather standing loss (v0.14.0) ──────────────────────────────────────
+
+
+def test_cold_hinge_and_standby_at():
+    st = _state(standby_w=100.0, standby_w_per_k=2.0)
+    assert tank.cold_hinge_k(None) == 0.0
+    assert tank.cold_hinge_k(tank.STANDBY_REF_C + 5.0) == 0.0
+    assert tank.cold_hinge_k(5.0) == pytest.approx(tank.STANDBY_REF_C - 5.0)
+    assert tank.standby_w_at(st, None) == 100.0  # no temperature ⇒ base only
+    assert tank.standby_w_at(st, 25.0) == 100.0  # warm ⇒ base only
+    assert tank.standby_w_at(st, 5.0) == pytest.approx(100.0 + 2.0 * (tank.STANDBY_REF_C - 5.0))
+    hot = _state(standby_w=250.0, standby_w_per_k=15.0)
+    assert tank.standby_w_at(hot, -30.0) == tank.STANDBY_EFFECTIVE_MAX_W
+
+
+def test_apply_tick_charges_cold_standby_and_accumulates_cold_hours():
+    st = _state(deficit_kwh=5.0, standby_w=100.0, standby_w_per_k=2.0, cycle_start_iso=_iso(-60))
+    res = tank.apply_tick(st, PARAMS, _inputs(now_iso=_iso(0), ambient_c=5.0))
+    watts = 100.0 + 2.0 * (tank.STANDBY_REF_C - 5.0)
+    assert res.standby_w_now == pytest.approx(watts)
+    assert res.standby_kwh == pytest.approx(tank.standby_kwh(watts, 1.0))
+    assert res.state.cycle_cold_kh == pytest.approx((tank.STANDBY_REF_C - 5.0) / 60.0)
+    assert res.state.last_ambient_c == 5.0
+    # A temperature dropout holds the last value instead of reading as a warm spell.
+    held = tank.apply_tick(res.state, PARAMS, _inputs(now_iso=_iso(1), ambient_c=None))
+    assert held.standby_w_now == pytest.approx(watts)
+    assert held.state.cycle_cold_kh == pytest.approx(2 * (tank.STANDBY_REF_C - 5.0) / 60.0)
+
+
+def test_anchor_resets_the_cold_hours():
+    st = _state(
+        deficit_kwh=0.5,
+        calibrated=True,
+        cycle_cold_kh=120.0,
+        cycle_start_iso=_iso(-60),
+        energy_baseline_kwh=10.0,
+        water_baseline_l=100.0,
+    )
+    res = tank.apply_tick(
+        st,
+        PARAMS,
+        _inputs(
+            now_iso=_iso(0),
+            energy_counter_kwh=10.0,
+            water_counter_l=100.0,
+            contactor_on=True,
+            heating_on=False,
+            contactor_on_for_s=300.0,
+            heating_off_for_s=90.0,
+            ambient_c=0.0,
+        ),
+    )
+    assert res.anchored is True
+    assert res.state.cycle_cold_kh == 0.0
+
+
+def test_learn_cold_dry_cycle_splits_between_base_and_slope():
+    # 24 h at a 10 K hinge: base and slope have equal (scale × feature)² here, so
+    # each takes half of the β·r correction (r = −1 ⇒ losses under-counted).
+    st = _learn(cycle_liters=0.0, cycle_cold_kh=240.0, standby_w=100.0)
+    out = tank.learn_from_cycle(st, PARAMS, 24.0, -1.0)
+    assert out.standby_w == pytest.approx(100.0 + 0.05 / 0.024)
+    assert out.standby_w_per_k == pytest.approx(0.05 / 0.24)
+    assert out.hot_fraction_profile == pytest.approx((0.25,) * 4)
+
+
+def test_learn_without_cold_hours_leaves_the_slope():
+    st = _learn(cycle_liters=0.0, standby_w=100.0, standby_w_per_k=1.0)
+    out = tank.learn_from_cycle(st, PARAMS, 24.0, -1.0)
+    assert out.standby_w_per_k == 1.0
+    assert out.standby_w == pytest.approx(100.0 + 0.1 / 0.024)
+
+
+def test_learn_cold_slope_never_goes_negative():
+    st = _learn(cycle_liters=0.0, cycle_cold_kh=240.0, standby_w=100.0)
+    out = tank.learn_from_cycle(st, PARAMS, 24.0, 5.0)
+    assert out.standby_w_per_k == tank.STANDBY_W_PER_K_MIN
+    assert out.standby_w < 100.0
+
+
+# ── learn_from_cutoff (v0.14.0) ───────────────────────────────────────────────
+
+
+def _cutoff_learn(**over) -> TankState:
+    base = dict(
+        cycle_liters=0.0,
+        cycle_gross_kwh=8.0,
+        standby_w=100.0,
+        hysteresis_kwh=0.8,
+        residual_ratio=0.1,
+    )
+    base.update(over)
+    return _learn(**base)
+
+
+def test_learn_from_cutoff_gates():
+    st = _cutoff_learn()
+    for bad in (
+        replace(st, calibrated=False),
+        replace(st, cycle_clean=False),
+    ):
+        assert tank.learn_from_cutoff(bad, PARAMS, 20.0, -5.0) == (bad, 0.0)
+    # A short cycle is a post-trip re-heat: being past the first trip is normal.
+    assert tank.learn_from_cutoff(st, PARAMS, 3.0, -5.0) == (st, 0.0)
+
+
+def test_learn_from_cutoff_ignores_a_contradiction_inside_the_band():
+    st = _cutoff_learn()
+    tolerance = 0.8 + tank.CUTOFF_LEARN_MARGIN_KWH
+    assert tank.learn_from_cutoff(st, PARAMS, 20.0, -tolerance + 0.01) == (st, 0.0)
+
+
+def test_learn_from_cutoff_steps_on_the_excess_and_reports_the_rebase():
+    # Ledger −3.1 kWh with a 1.1 kWh band ⇒ excess −2.0 on a dry 20 h cycle: all
+    # standby, +β·2.0 kWh over 20 h = +10 W, and the cycle now explains +0.2 kWh.
+    st = _cutoff_learn()
+    out, extra = tank.learn_from_cutoff(st, PARAMS, 20.0, -3.1)
+    assert out.standby_w == pytest.approx(110.0)
+    assert extra == pytest.approx(0.2)
+    # σ's scale may only grow on a bound: 0.8·0.1 + 0.2·(2.0 / 8.0).
+    assert out.residual_ratio == pytest.approx(0.13)
+    already_wide = replace(st, residual_ratio=0.5)
+    out2, _ = tank.learn_from_cutoff(already_wide, PARAMS, 20.0, -3.1)
+    assert out2.residual_ratio == 0.5
+
+
+# ── apply_tick: no-trip cut-offs (v0.14.0) ────────────────────────────────────
+
+
+def _cut_state(**over) -> TankState:
+    base = dict(
+        deficit_kwh=0.0,
+        cycle_unclamped_kwh=-3.0,
+        calibrated=True,
+        cycle_clean=True,
+        cycle_start_iso=_iso(-20 * 60),
+        cycle_gross_kwh=8.0,
+        cycle_liters=0.0,
+        energy_baseline_kwh=100.0,
+        water_baseline_l=1000.0,
+        water_baseline_iso=_iso(-1),
+        last_tick_iso=_iso(-1),
+        heating_prev=True,
+        standby_w=100.0,
+        hysteresis_kwh=0.8,
+        residual_ratio=0.1,
+    )
+    base.update(over)
+    return TankState(**base)
+
+
+def _off_tick(minute: float, **over) -> TickInputs:
+    base = dict(
+        now_iso=_iso(minute),
+        energy_counter_kwh=100.0,
+        water_counter_l=1000.0,
+        contactor_on=False,
+        heating_on=False,
+        contactor_on_for_s=20.0 + minute * 60.0,
+        heating_off_for_s=20.0 + minute * 60.0,
+    )
+    base.update(over)
+    return _inputs(**base)
+
+
+def _run(state: TankState, minutes, **over):
+    results = []
+    for minute in minutes:
+        res = tank.apply_tick(state, PARAMS, _off_tick(minute, **over))
+        results.append(res)
+        state = res.state
+    return results
+
+
+def test_cutoff_settles_floors_and_learns():
+    first, second, settled, after = _run(_cut_state(), (0, 1, 2, 3))
+    # Seen, then waiting out the settle delay: nothing changes yet.
+    assert first.state.cutoff_pending_iso == _iso(0)
+    assert not first.cutoff and not second.cutoff
+    assert first.deficit_shown_kwh < first.uncertainty_kwh  # the curve still credits a surplus
+    # Settled: learned more standby, re-based the ledger, floored display + control.
+    assert settled.cutoff is True
+    assert settled.state.cutoff_pending_iso == ""
+    assert settled.state.last_cutoff_iso == _iso(2)
+    assert settled.state.standby_w > 100.0
+    assert settled.state.cycle_unclamped_kwh > second.state.cycle_unclamped_kwh + 0.1
+    assert settled.deficit_shown_kwh == pytest.approx(settled.uncertainty_kwh)
+    assert settled.state.deficit_kwh >= settled.uncertainty_kwh - 1e-9
+    assert settled.soc < second.soc
+    # From here on the display tracks losses one-for-one.
+    assert after.deficit_shown_kwh - settled.deficit_shown_kwh == pytest.approx(
+        after.standby_kwh, rel=0.05
+    )
+
+
+def test_cutoff_inside_the_band_floors_without_learning():
+    _, _, settled = _run(_cut_state(cycle_unclamped_kwh=-0.5), (0, 1, 2))
+    assert settled.cutoff is True
+    assert settled.state.standby_w == 100.0
+    assert settled.deficit_shown_kwh == pytest.approx(settled.uncertainty_kwh)
+
+
+def test_cutoff_on_a_dirty_cycle_floors_without_learning():
+    _, _, settled = _run(_cut_state(cycle_clean=False), (0, 1, 2))
+    assert settled.cutoff is True
+    assert settled.state.standby_w == 100.0
+    assert settled.deficit_shown_kwh == pytest.approx(settled.uncertainty_kwh)
+
+
+def test_thermostat_trip_just_before_the_contactor_is_not_a_cutoff():
+    st = _cut_state()
+    res = tank.apply_tick(
+        st, PARAMS, _off_tick(0, heating_off_for_s=20.0 + tank.CUTOFF_TRIP_MARGIN_S)
+    )
+    assert res.state.cutoff_pending_iso == ""
+
+
+def test_no_cutoff_without_having_seen_the_element_heat():
+    for prev in (None, False):
+        res = tank.apply_tick(_cut_state(heating_prev=prev), PARAMS, _off_tick(0))
+        assert res.state.cutoff_pending_iso == ""
+
+
+def test_unknown_states_never_start_a_cutoff():
+    st = _cut_state()
+    unknown = tank.apply_tick(st, PARAMS, _off_tick(0, contactor_on=None))
+    assert unknown.state.cutoff_pending_iso == ""
+    blip = tank.apply_tick(st, PARAMS, _off_tick(0, heating_on=None))
+    assert blip.state.cutoff_pending_iso == ""
+    assert blip.state.heating_prev is True  # a blip doesn't overwrite the last known state
+
+
+def test_a_run_resuming_inside_the_settle_delay_cancels_the_cutoff():
+    st = _cut_state()
+    seen = tank.apply_tick(st, PARAMS, _off_tick(0))
+    resumed = tank.apply_tick(
+        seen.state,
+        PARAMS,
+        _off_tick(1, contactor_on=True, heating_on=True, heating_off_for_s=30.0),
+    )
+    assert resumed.state.cutoff_pending_iso == ""
+    assert resumed.cutoff is False
+    assert resumed.state.standby_w == 100.0
+
+
+def test_anchor_clears_the_cutoff_lift_and_pending():
+    st = _cut_state(
+        deficit_kwh=0.5,
+        cycle_display_lift_kwh=1.2,
+        cutoff_pending_iso=_iso(-1),
+        heating_prev=False,
+    )
+    res = tank.apply_tick(
+        st,
+        PARAMS,
+        _off_tick(0, contactor_on=True, contactor_on_for_s=300.0, heating_off_for_s=90.0),
+    )
+    assert res.anchored is True
+    assert res.state.cycle_display_lift_kwh == 0.0
+    assert res.state.cutoff_pending_iso == ""
+
+
+def test_a_second_cutoff_without_new_evidence_learns_nothing_more():
+    # Two cut-offs in one stretch with no energy delivered in between: the second
+    # sees the same contradiction (already learned down to the mark) → no step,
+    # and the floor isn't stacked on the first lift.
+    *_, settled = _run(_cut_state(), (0, 1, 2))
+    assert settled.state.cycle_cutoff_mark_kwh is not None
+    again = replace(settled.state, heating_prev=True)
+    *_, second = _run(again, (10, 11, 12))
+    assert second.cutoff is True
+    assert second.state.standby_w == settled.state.standby_w
+    assert second.state.residual_ratio == settled.state.residual_ratio
+    assert second.deficit_shown_kwh == pytest.approx(
+        settled.deficit_shown_kwh + 4 * settled.standby_kwh, rel=0.05
+    )
+
+
+def test_a_second_cutoff_learns_from_energy_delivered_since():
+    # Another run delivered 2 kWh without a trip → the ledger went 2 kWh further
+    # past the mark: that, and only that, is new evidence.
+    *_, settled = _run(_cut_state(), (0, 1, 2))
+    mark = settled.state.cycle_cutoff_mark_kwh
+    again = replace(
+        settled.state,
+        heating_prev=True,
+        cycle_unclamped_kwh=settled.state.cycle_unclamped_kwh - 2.0,
+    )
+    *_, second = _run(again, (10, 11, 12))
+    assert second.state.standby_w > settled.state.standby_w
+    assert second.state.cycle_cutoff_mark_kwh < mark
+
+
+def test_cutoff_waits_for_a_missing_water_reading():
+    # Due to settle while the meter is briefly missing: its draws aren't in the
+    # ledger yet, so learning now would chase a phantom surplus. Wait; settle on
+    # the tick the reading (and its litres) returns.
+    st = _cut_state()
+    seen, _ = _run(st, (0, 1))
+    waiting = tank.apply_tick(seen.state, PARAMS, _off_tick(2, water_counter_l=None))
+    assert waiting.cutoff is False
+    assert waiting.state.cutoff_pending_iso == _iso(0)
+    back = tank.apply_tick(waiting.state, PARAMS, _off_tick(3, water_counter_l=1020.0))
+    assert back.cutoff is True
+    assert back.draw_kwh > 0
+
+
+def test_cutoff_waits_for_a_missing_energy_reading():
+    seen, _ = _run(_cut_state(), (0, 1))
+    waiting = tank.apply_tick(seen.state, PARAMS, _off_tick(2, energy_counter_kwh=None))
+    assert waiting.cutoff is False
+    assert waiting.state.cutoff_pending_iso == _iso(0)
+
+
+def test_no_cutoff_detected_across_an_unobserved_gap():
+    # First tick after a restart: both states look freshly changed (startup
+    # resets last_changed), so a trip during downtime would pass the margin.
+    res = tank.apply_tick(_cut_state(), PARAMS, _off_tick(0, elapsed_s=1800.0))
+    assert res.state.cutoff_pending_iso == ""
+    assert res.state.heating_prev is False
+
+
+def test_cutoff_in_a_post_trip_reheat_cycle_is_dropped():
+    # < LEARN_MIN_CYCLE_HOURS since the anchor: past the first trip's level is
+    # physics there, so no floor (it would discard real stored heat) and no learning.
+    st = _cut_state(cycle_start_iso=_iso(-90), cycle_unclamped_kwh=-0.7, cycle_gross_kwh=0.5)
+    *_, settled = _run(st, (0, 1, 2))
+    assert settled.cutoff is False
+    assert settled.state.cutoff_pending_iso == ""
+    assert settled.state.cycle_display_lift_kwh == 0.0
+    assert settled.state.standby_w == 100.0
+
+
+def test_led_dropping_seconds_before_the_contactor_still_counts_as_a_cutoff():
+    # 2026-10-24: the LED went off 22 s before the contactor. The tick between
+    # the two must not record "idle", or the cut-off is lost.
+    st = _cut_state()
+    between = tank.apply_tick(
+        st,
+        PARAMS,
+        _off_tick(0, contactor_on=True, contactor_on_for_s=3600.0, heating_off_for_s=10.0),
+    )
+    assert between.state.heating_prev is True
+    cut = tank.apply_tick(
+        between.state, PARAMS, _off_tick(1, heating_off_for_s=70.0, contactor_on_for_s=48.0)
+    )
+    assert cut.state.cutoff_pending_iso == _iso(1)
+
+
+def test_an_idle_element_with_the_contactor_on_is_a_trip_not_a_heating_prev():
+    st = _cut_state()
+    idle = tank.apply_tick(
+        st,
+        PARAMS,
+        _off_tick(0, contactor_on=True, contactor_on_for_s=3600.0, heating_off_for_s=45.0),
+    )
+    assert idle.state.heating_prev is False
+
+
+def test_ambient_is_held_only_for_a_while():
+    st = _state(deficit_kwh=5.0, standby_w=100.0, standby_w_per_k=2.0)
+    read = tank.apply_tick(st, PARAMS, _inputs(now_iso=_iso(0), ambient_c=5.0))
+    assert read.state.last_ambient_iso == _iso(0)
+    held = tank.apply_tick(read.state, PARAMS, _inputs(now_iso=_iso(60), ambient_c=None))
+    assert held.standby_w_now > 100.0
+    expired = tank.apply_tick(
+        held.state, PARAMS, _inputs(now_iso=_iso(60 * (tank.AMBIENT_HOLD_H + 1)), ambient_c=None)
+    )
+    assert expired.standby_w_now == 100.0
+    assert expired.state.last_ambient_c is None
 
 
 # ── should_boost (truth table) ────────────────────────────────────────────────

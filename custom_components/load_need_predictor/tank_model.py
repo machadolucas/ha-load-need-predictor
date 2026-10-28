@@ -56,14 +56,24 @@ trip. ``σ`` scales with the flow the balance had to attribute since the last
 anchor (× a learned ``residual_ratio``), so it is ~0 right at an anchor (no
 post-anchor drop) and grows with unmetered draw.
 
+**…but not past a no-trip cut-off.** That curve is meant for *while heating*. If
+the contactor opens with the element still drawing, the thermostat hasn't
+tripped, so the tank is not full — a "beyond full" balance is then provably
+wrong, and the curve's heavy tail would keep crediting it against every later
+loss. A settled cut-off therefore floors the displayed and control deficits at
+``σ`` and, when the contradiction exceeds the thermostat band, learns from it
+(see ``CUTOFF_SETTLE_S``).
+
 **Learning, with guardrails.** Each qualifying anchor→anchor cycle closes with a
 *residual* — the unclamped deficit at the trip, which is exactly the model's error
 over that cycle. Short cycles (< 4 h, the post-trip re-heats) teach
-``hysteresis_kwh`` only. Long cycles teach the daypart ``hot_fraction_profile``
-(a normalised-LMS step on the residual, ridge-pulled toward the profile mean so
-sparse buckets can't run away) when they metered enough water, or ``standby_w``
-when they metered almost none. Everything is EWMA-slow and hard-clamped: the
-replay showed a fast learner chases the ±1 kWh cycle noise and gets worse.
+``hysteresis_kwh`` only. Every long cycle takes one preconditioned normalised-LMS
+step that splits the residual between the daypart ``hot_fraction_profile`` (only
+when it metered enough water; then ridge-pulled toward the profile mean so sparse
+buckets can't run away), the base ``standby_w`` and its cold-weather slope
+``standby_w_per_k`` — each in proportion to the energy it accounts for. Everything
+is EWMA-slow and hard-clamped: the replay showed a fast learner chases the ±1 kWh
+cycle noise and gets worse.
 
 Every public function here is pure; ``apply_tick`` is the orchestrator the
 HA-side ``tank_tracker`` calls once per tick, and ``dataclasses.replace`` is the
@@ -97,9 +107,21 @@ DAYPART_BOUNDS = ((0, 6), (6, 11), (11, 17), (17, 24))
 N_DAYPARTS = len(DAYPART_BOUNDS)
 PROFILE_RIDGE = 0.05  # per-anchor pull of each bucket toward the profile mean
 # standby_w: standing loss. Seed 70 W ≈ 1.68 kWh/day, matching the observed
-# ~1.7 kWh gap between mean delivery and estimated draws.
+# ~1.7 kWh gap between mean delivery and estimated draws. Since v0.14.0 this is
+# the *base* loss (ambient at/above ``STANDBY_REF_C``); the cap was raised from
+# 200 W because that near-dry 47 h cycle needed ≥ 178 W to close.
 SEED_STANDBY_W = 70.0
-STANDBY_W_MIN, STANDBY_W_MAX = 20.0, 200.0
+STANDBY_W_MIN, STANDBY_W_MAX = 20.0, 250.0
+# Cold-weather standing loss: the author's tank sits in an exterior (NE) kitchen
+# corner, so it loses more when it's cold outside. Modelled as a hinge on the
+# configured outdoor temperature — ``standby_w + standby_w_per_k × max(0,
+# STANDBY_REF_C − T)`` — with the slope learned like every other loss term. The
+# 0 W/K seed is the old constant model: the slope only grows once cycles at
+# different temperatures disagree with a constant. No temperature ⇒ no cold term.
+STANDBY_REF_C = 15.0
+SEED_STANDBY_W_PER_K = 0.0
+STANDBY_W_PER_K_MIN, STANDBY_W_PER_K_MAX = 0.0, 15.0
+STANDBY_EFFECTIVE_MAX_W = 400.0  # base + cold term, whatever the two learned
 # hysteresis_kwh: the post-trip top-up the thermostat asks for once mixing has
 # pulled it back below its band. Observed 0.81 kWh twice on the author's LVV.
 SEED_HYSTERESIS_KWH = 0.8
@@ -114,11 +136,53 @@ SIGMA_MIN_KWH = 0.05  # numerical floor for σ (never divide by ~0)
 LEARN_BETA = 0.1  # per-anchor step (~daily anchors → adapts over 2–4 weeks)
 LEARN_BETA_FAST = 0.2  # for hysteresis / residual_ratio (few, clean observations)
 LEARN_MIN_LITERS = 50.0  # a cycle must meter ≥ this to move the hot-fraction profile
-STANDBY_MAX_LITERS = 10.0  # near-zero-draw cycle → its energy is (almost) all standby
-STANDBY_MIN_HOURS = 12.0  # …and long enough that standby dominates the balance
+STANDBY_MAX_LITERS = 10.0  # a post-trip re-heat must be ~dry to teach the hysteresis
 LEARN_MIN_CYCLE_HOURS = 4.0  # shorter cycles are post-trip re-heats: hysteresis only
 HYSTERESIS_MIN_ENERGY_KWH = 0.2  # a re-heat must deliver this much to count as one
 RESIDUAL_RATIO_MIN_GROSS_KWH = 0.5  # don't learn σ from cycles with ~no flow
+# Prior scales for splitting a cycle residual across the loss terms (v0.14.0):
+# one normalised-LMS step preconditioned by each parameter's prior spread, so a
+# term takes a share ∝ (scale × its energy in the cycle)². A dry cycle teaches
+# standby alone (as before), a wet one splits between the hot fractions and
+# standby, and a cold one also moves the cold slope. Before this, standby only
+# learned from ≥ 12 h cycles metering < 10 L — which never happened between the
+# daily anchors, so standby sat at its seed for months while the hot fractions
+# absorbed its error, until a near-dry 47 h cycle missed by > 3 kWh (2026-10-28).
+PRIOR_HOT_FRACTION = 0.08
+PRIOR_STANDBY_W = 30.0
+PRIOR_STANDBY_W_PER_K = 3.0
+
+# ── No-trip cut-offs ──────────────────────────────────────────────────────────
+# When the contactor opens while the element is still heating, the thermostat has
+# not tripped, so the tank is *not* full. If the learning ledger says it is past
+# full by more than the thermostat band, the model has provably under-counted
+# losses since the last anchor. That is evidence like an anchor, but one-sided:
+# - the display and control ledgers are floored at the model's own σ, so the %
+#   stops crediting a phantom surplus (the curve's 1/|u| tail otherwise shrank
+#   every later loss to a few percent of its size — on 2026-10-28, 2 kWh of real
+#   losses moved the display 0.6 points);
+# - the learner takes a normal step on the excess beyond the band, and the
+#   learning ledger is re-based to the corrected params, so the next anchor's
+#   residual doesn't count the same error twice.
+# The settle delay lets a lagging energy counter publish the run's last kWh first;
+# a settle also waits while either counter is missing (its unmetered energy would
+# otherwise read as a phantom surplus, be learned from, and be charged again on
+# top of the floor once the reading returns). Cycles shorter than
+# LEARN_MIN_CYCLE_HOURS are post-trip re-heats, where a balance past the first
+# trip's level is physics, not error — they are neither floored nor learned from.
+CUTOFF_SETTLE_S = 120.0
+# The element stopping this much *before* the contactor opened means the
+# thermostat tripped first (a full tank), not a cut-off.
+CUTOFF_TRIP_MARGIN_S = 30.0
+# A cut-off must be *seen*: a tick after a longer gap (HA was down; startup also
+# resets every ``last_changed``) can't tell a trip from a cut-off.
+CUTOFF_MAX_GAP_S = 180.0
+# Beyond the learned thermostat band (a re-heated tank holds ~hysteresis more
+# than at a first trip), a smaller contradiction is noise, not evidence.
+CUTOFF_LEARN_MARGIN_KWH = 0.3
+# An outdoor reading older than this is dropped (a removed or broken sensor must
+# not keep a stale cold term running); until then a dropout holds the last value.
+AMBIENT_HOLD_H = 6.0
 
 # ── Water-meter attribution + guards ──────────────────────────────────────────
 # Hot water only reaches taps + showers, whose combined flow tops out ~8 L/min;
@@ -269,7 +333,12 @@ class TankState:
     window) and ``*_source`` names the entity each baseline came from, so a
     reconfigured counter re-baselines. ``hot_fraction`` is kept as the mean
     of ``hot_fraction_profile`` (an empty profile means "all buckets = hot_fraction",
-    which is how pre-v2 stored state migrates).
+    which is how pre-v2 stored state migrates). ``standby_w`` is the base standing
+    loss and ``standby_w_per_k`` its cold-weather slope (see :func:`standby_w_at`);
+    ``cycle_cold_kh`` accumulates the cycle's K·h below ``STANDBY_REF_C`` as that
+    slope's learning feature. ``heating_prev`` / ``cutoff_pending_iso`` detect and
+    settle a no-trip cut-off, and ``cycle_display_lift_kwh`` is the floor it put
+    under the displayed deficit (reset at an anchor).
     """
 
     deficit_kwh: float
@@ -309,6 +378,24 @@ class TankState:
     # reconfigured counter must re-baseline, not dump its whole difference.
     energy_source: str = ""
     water_source: str = ""
+    # v0.14.0 additions (defaulted: an older payload loads as "no slope, nothing
+    # pending, no lift" — exactly the previous behaviour until the next events).
+    standby_w_per_k: float = SEED_STANDBY_W_PER_K
+    last_ambient_c: float | None = None  # last known ambient, held across a dropout
+    last_ambient_iso: str = ""  # …for at most AMBIENT_HOLD_H after it was read
+    cycle_cold_kh: float = 0.0
+    heating_prev: bool | None = None  # last *known* element state (blips don't count)
+    cutoff_pending_iso: str = ""  # a cut-off seen, waiting out CUTOFF_SETTLE_S
+    last_cutoff_iso: str = ""
+    cycle_display_lift_kwh: float = 0.0
+    # The learning ledger level the last cut-off of this cycle learned down to
+    # (None ⇒ none yet: the band edge). A later cut-off learns only from going
+    # further past it — the same contradiction is never learned twice.
+    cycle_cutoff_mark_kwh: float | None = None
+    # When a *running* tracker first saw the water reading missing ("" ⇒ present).
+    # Staleness is measured from here, not from the last read, so an HA restart
+    # (whose downtime nobody observed) doesn't count as a meter outage.
+    water_missing_since_iso: str = ""
     version: str = TANK_VERSION
 
 
@@ -346,6 +433,9 @@ class TickInputs:
     # When the water reading last changed on the meter's side (the entity's
     # ``last_changed``); ``None`` ⇒ unknown, the tick time stands in.
     water_changed_iso: str | None = None
+    # Ambient (outdoor) temperature in °C for the cold-weather standing loss;
+    # ``None`` ⇒ unknown, the last known value is held (none ever ⇒ no cold term).
+    ambient_c: float | None = None
 
 
 @dataclass(frozen=True)
@@ -358,7 +448,10 @@ class TickResult:
     ``anchored`` is True only on the anchor *transition* tick (the moment the tank
     is known full and the model learns); ``latched`` while the trip still holds.
     ``soc`` is derived from ``deficit_shown_kwh`` (the saturation-curve display
-    deficit), not from the clamped control ``state.deficit_kwh``.
+    deficit), not from the clamped control ``state.deficit_kwh``. ``cutoff`` is
+    True on the tick a no-trip cut-off settled (floored, maybe learned) — like
+    ``anchored``, a "persist now" signal. ``standby_w_now`` is the standing loss
+    this tick actually used (base + cold term).
     """
 
     state: TankState
@@ -372,6 +465,8 @@ class TickResult:
     standby_kwh: float
     deficit_shown_kwh: float
     uncertainty_kwh: float
+    cutoff: bool = False
+    standby_w_now: float = SEED_STANDBY_W
 
 
 def capacity_kwh(volume_l: float, setpoint_c: float, cold_in_c: float) -> float:
@@ -533,6 +628,25 @@ def standby_kwh(standby_w: float, elapsed_min: float) -> float:
     return standby_w * elapsed_min / 60.0 / 1000.0
 
 
+def cold_hinge_k(ambient_c: float | None) -> float:
+    """Kelvin below ``STANDBY_REF_C`` — 0 when warmer, or when the ambient is unknown."""
+    if ambient_c is None:
+        return 0.0
+    return max(0.0, STANDBY_REF_C - ambient_c)
+
+
+def standby_w_at(state: TankState, ambient_c: float | None) -> float:
+    """Standing loss (W) at an ambient temperature: base + learned cold slope.
+
+    Only the sum is capped — each term is already clamped where it is learned.
+    """
+    return _clamp(
+        state.standby_w + state.standby_w_per_k * cold_hinge_k(ambient_c),
+        0.0,
+        STANDBY_EFFECTIVE_MAX_W,
+    )
+
+
 def post_trip_relax_kwh(
     hysteresis_kwh: float, hours_since_trip_start: float, hours_since_trip_end: float
 ) -> float:
@@ -622,19 +736,18 @@ def learn_from_cycle(
       ``hysteresis_kwh`` learns, from the energy the element delivered beyond
       standby, and only when the cycle metered ~no water and delivered a real
       top-up.
-    - **long, wet** (≥ ``LEARN_MIN_LITERS``): the ``hot_fraction_profile`` takes
-      a normalised-LMS step on the residual across the buckets that carried
-      litres, then every bucket is pulled ``PROFILE_RIDGE`` toward the mean.
-    - **long, dry** (< ``STANDBY_MAX_LITERS`` and ≥ ``STANDBY_MIN_HOURS``):
-      ``standby_w`` absorbs the residual.
+    - **long**: one :func:`_attribute_residual` step splits the residual between
+      the hot-fraction profile (only when the cycle metered ≥
+      ``LEARN_MIN_LITERS``; then every bucket is also pulled ``PROFILE_RIDGE``
+      toward the mean), the base ``standby_w`` and the cold slope
+      ``standby_w_per_k`` — a dry cycle therefore teaches standby alone.
 
     Long cycles also update ``residual_ratio`` (|residual| per kWh of attributed
     flow) — the saturation curve's σ. Every update is EWMA-slow and hard-clamped.
     """
     if not state.calibrated or not state.cycle_clean or cycle_hours <= 0:
         return state
-    delta_t = max(params.setpoint_c - params.cold_in_c, 1.0)
-    standby_over_cycle = state.standby_w * cycle_hours / 1000.0
+    standby_over_cycle = _standby_over_cycle_kwh(state, cycle_hours)
 
     if cycle_hours < LEARN_MIN_CYCLE_HOURS:
         if (
@@ -651,32 +764,7 @@ def learn_from_cycle(
                 return replace(state, hysteresis_kwh=new_hyst)
         return state
 
-    profile = profile_of(state)
-    new_profile = profile
-    new_standby_w = state.standby_w
-    if state.cycle_liters >= LEARN_MIN_LITERS:
-        buckets = state.cycle_hot_liters_by_bucket
-        if len(buckets) != N_DAYPARTS:
-            buckets = _ZERO_PROFILE
-        features = [liters * delta_t * KWH_PER_LITER_KELVIN for liters in buckets]
-        norm = sum(x * x for x in features)
-        if norm > 0:
-            stepped = [
-                hf - LEARN_BETA * residual_kwh * x / norm
-                for hf, x in zip(profile, features, strict=True)
-            ]
-            mean = sum(stepped) / N_DAYPARTS
-            new_profile = tuple(
-                _clamp(hf - PROFILE_RIDGE * (hf - mean), HOT_FRACTION_MIN, HOT_FRACTION_MAX)
-                for hf in stepped
-            )
-    elif state.cycle_liters < STANDBY_MAX_LITERS and cycle_hours >= STANDBY_MIN_HOURS:
-        new_standby_w = _clamp(
-            state.standby_w - LEARN_BETA * residual_kwh / cycle_hours * 1000.0,
-            STANDBY_W_MIN,
-            STANDBY_W_MAX,
-        )
-
+    learned, _ = _attribute_residual(state, params, cycle_hours, residual_kwh)
     new_ratio = state.residual_ratio
     if state.cycle_gross_kwh >= RESIDUAL_RATIO_MIN_GROSS_KWH:
         observed_ratio = min(RESIDUAL_RATIO_MAX, abs(residual_kwh) / state.cycle_gross_kwh)
@@ -685,14 +773,119 @@ def learn_from_cycle(
             RESIDUAL_RATIO_MIN,
             RESIDUAL_RATIO_MAX,
         )
+    return replace(learned, residual_ratio=new_ratio)
 
-    return replace(
+
+def learn_from_cutoff(
+    state: TankState, params: TankParams, cycle_hours: float, ledger_kwh: float
+) -> tuple[TankState, float]:
+    """Learn from a no-trip cut-off → ``(new_state, extra_losses_kwh)``.
+
+    The element was still heating when the contactor opened, so the tank is not
+    full — yet ``ledger_kwh`` (the learning ledger) may say it is past full. Only
+    the part beyond the thermostat band (``hysteresis_kwh`` +
+    ``CUTOFF_LEARN_MARGIN_KWH``) is a contradiction, and it is a *lower bound*
+    on the model's error, so the step uses just that excess: the same
+    :func:`_attribute_residual` step an anchor takes, and ``residual_ratio`` may
+    only grow (a bound can't show the model is better than it thought). Gated
+    like an anchor: calibrated, clean, and a long cycle (a short one is a
+    post-trip re-heat, where being past the first trip's level is normal).
+    Within one cycle the threshold is ``cycle_cutoff_mark_kwh`` once a cut-off
+    has learned: a later one only learns from going *further* past it (more
+    energy delivered without a trip), never from the same contradiction again.
+
+    ``extra_losses_kwh`` is how much more the corrected params say the cycle so
+    far lost; the caller adds it to the learning ledger (and sets the mark to
+    the re-based level) so the next anchor's residual is measured against the
+    new params and the same error isn't learned twice.
+    """
+    if not state.calibrated or not state.cycle_clean or cycle_hours < LEARN_MIN_CYCLE_HOURS:
+        return state, 0.0
+    threshold = state.cycle_cutoff_mark_kwh
+    if threshold is None:
+        threshold = -(state.hysteresis_kwh + CUTOFF_LEARN_MARGIN_KWH)
+    if ledger_kwh >= threshold:
+        return state, 0.0
+    excess = ledger_kwh - threshold
+    learned, extra = _attribute_residual(state, params, cycle_hours, excess)
+    learned = replace(learned, cycle_cutoff_mark_kwh=ledger_kwh + extra)
+    if state.cycle_gross_kwh >= RESIDUAL_RATIO_MIN_GROSS_KWH:
+        bound_ratio = min(RESIDUAL_RATIO_MAX, -excess / state.cycle_gross_kwh)
+        if bound_ratio > state.residual_ratio:
+            learned = replace(
+                learned,
+                residual_ratio=_clamp(
+                    (1.0 - LEARN_BETA_FAST) * state.residual_ratio + LEARN_BETA_FAST * bound_ratio,
+                    RESIDUAL_RATIO_MIN,
+                    RESIDUAL_RATIO_MAX,
+                ),
+            )
+    return learned, extra
+
+
+def _standby_over_cycle_kwh(state: TankState, cycle_hours: float) -> float:
+    """Standing loss the current params attribute to the cycle so far (kWh)."""
+    return (state.standby_w * cycle_hours + state.standby_w_per_k * state.cycle_cold_kh) / 1000.0
+
+
+def _attribute_residual(
+    state: TankState, params: TankParams, cycle_hours: float, residual_kwh: float
+) -> tuple[TankState, float]:
+    """One preconditioned normalised-LMS step on a cycle residual.
+
+    → ``(new_state, extra_losses_kwh)``. The cycle's modelled loss is linear in
+    the learnable params — ``Σ hf_b·X_b + standby_w·H + standby_w_per_k·C`` (X_b
+    the bucket's hot litres as kWh per unit fraction, H hours, C cold K·h, both
+    ÷ 1000 for W→kWh) — so the step moves each param by ``−β·r·s²·x / Σ s²x²``
+    with ``s`` its ``PRIOR_*`` scale. The total correction to the cycle's loss is
+    always ``β·r`` (as the single-term learners had), split ∝ ``(s·x)²``: no
+    litres ⇒ all standby, no cold hours ⇒ no slope change. The hot fractions only
+    take part when the cycle metered ≥ ``LEARN_MIN_LITERS`` (fewer can't tell a
+    shower from a toilet), and only then are they ridge-pulled toward their mean.
+    ``extra_losses_kwh`` is recomputed from the *clamped* new params, so a clamp
+    can't fake a correction.
+    """
+    delta_t = max(params.setpoint_c - params.cold_in_c, 1.0)
+    buckets = state.cycle_hot_liters_by_bucket
+    if len(buckets) != N_DAYPARTS or state.cycle_liters < LEARN_MIN_LITERS:
+        buckets = _ZERO_PROFILE
+    x_hot = [liters * delta_t * KWH_PER_LITER_KELVIN for liters in buckets]
+    x_base = cycle_hours / 1000.0
+    x_cold = state.cycle_cold_kh / 1000.0
+    s_hot = PRIOR_HOT_FRACTION**2
+    s_base = PRIOR_STANDBY_W**2
+    s_cold = PRIOR_STANDBY_W_PER_K**2
+    norm = s_hot * sum(x * x for x in x_hot) + s_base * x_base**2 + s_cold * x_cold**2
+    if norm <= 0:
+        return state, 0.0
+    step = -LEARN_BETA * residual_kwh / norm
+
+    profile = profile_of(state)
+    new_profile = profile
+    if any(x > 0 for x in x_hot):
+        stepped = [hf + step * s_hot * x for hf, x in zip(profile, x_hot, strict=True)]
+        mean = sum(stepped) / N_DAYPARTS
+        new_profile = tuple(
+            _clamp(hf - PROFILE_RIDGE * (hf - mean), HOT_FRACTION_MIN, HOT_FRACTION_MAX)
+            for hf in stepped
+        )
+    new_base = _clamp(state.standby_w + step * s_base * x_base, STANDBY_W_MIN, STANDBY_W_MAX)
+    new_slope = _clamp(
+        state.standby_w_per_k + step * s_cold * x_cold, STANDBY_W_PER_K_MIN, STANDBY_W_PER_K_MAX
+    )
+    extra = (
+        sum((new - old) * x for new, old, x in zip(new_profile, profile, x_hot, strict=True))
+        + (new_base - state.standby_w) * x_base
+        + (new_slope - state.standby_w_per_k) * x_cold
+    )
+    learned = replace(
         state,
         hot_fraction=sum(new_profile) / N_DAYPARTS,
         hot_fraction_profile=new_profile,
-        standby_w=new_standby_w,
-        residual_ratio=new_ratio,
+        standby_w=new_base,
+        standby_w_per_k=new_slope,
     )
+    return learned, extra
 
 
 def _water_span_minutes(state: TankState, inputs: TickInputs, elapsed_min: float) -> float:
@@ -761,6 +954,7 @@ class _WaterTick:
     changed_iso: str
     cadence_min: float
     pending_kwh: float
+    missing_since_iso: str = ""
 
 
 def _resolve_draw(
@@ -769,6 +963,7 @@ def _resolve_draw(
     inputs: TickInputs,
     elapsed_min: float,
     hot_fraction: float,
+    standby_w: float,
 ) -> _WaterTick:
     """Decide this tick's draw + water bookkeeping (meter / fallback / none).
 
@@ -787,7 +982,7 @@ def _resolve_draw(
         inputs.e_draw_per_person,
         inputs.empty_house_factor,
         inputs.people_home,
-        state.standby_w,
+        standby_w,
         elapsed_min,
     )
     reading = inputs.water_counter_l
@@ -842,14 +1037,25 @@ def _resolve_draw(
             fallback, "fallback", False, 0.0, reading, now_iso, reading_changed_iso, cadence, 0.0
         )
     # No reading. A short gap is a blip — draw nothing and let the cumulative meter
-    # catch up; only fall back (and accumulate pending) once the meter is stale.
-    base_dt = _parse_iso(state.water_baseline_iso)
-    now_dt = _parse_iso(inputs.now_iso)
+    # catch up; only fall back (and accumulate pending) once the meter has been
+    # *seen* missing for WATER_STALE_AFTER_S. A tick that follows an unobserved
+    # gap (HA was down) restarts that clock: nobody watched the meter meanwhile,
+    # and the cumulative reading reconciles the whole gap once it's back. Before
+    # v0.14.0 the first tick after a restart — which often runs before the MQTT
+    # meter is restored — fell back over the whole downtime and dirtied the cycle.
+    unobserved_gap = inputs.elapsed_s >= WATER_STALE_AFTER_S
+    missing_since = (
+        state.water_missing_since_iso
+        if state.water_missing_since_iso and not unobserved_gap
+        else now_iso
+    )
+    missing_dt = _parse_iso(missing_since)
+    now_dt = _parse_iso(now_iso)
     fresh = (
         state.water_baseline_l is not None
-        and base_dt is not None
+        and missing_dt is not None
         and now_dt is not None
-        and (now_dt - base_dt).total_seconds() < WATER_STALE_AFTER_S
+        and (now_dt - missing_dt).total_seconds() < WATER_STALE_AFTER_S
     )
     if fresh:
         return _WaterTick(
@@ -862,7 +1068,24 @@ def _resolve_draw(
             state.water_changed_iso,
             cadence,
             state.pending_fallback_kwh,
+            missing_since,
         )
+    if state.water_baseline_l is not None and state.water_baseline_iso:
+        # Stale with a baseline: the fallback covers everything since the last
+        # valid read, net of what it already charged — so the ticks spent waiting
+        # (and a restart's downtime) are charged once the wait gives up, instead
+        # of being lost if the meter never returns before the next anchor. When
+        # it does return, the metered delta is netted against all of it.
+        since_read = _span_minutes(state.water_baseline_iso, now_iso, elapsed_min)
+        owed = fallback_draw_kwh(
+            inputs.e_base,
+            inputs.e_draw_per_person,
+            inputs.empty_house_factor,
+            inputs.people_home,
+            standby_w,
+            since_read,
+        )
+        fallback = max(0.0, owed - state.pending_fallback_kwh)
     return _WaterTick(
         fallback,
         "fallback",
@@ -873,6 +1096,7 @@ def _resolve_draw(
         state.water_changed_iso,
         cadence,
         state.pending_fallback_kwh + fallback,
+        missing_since,
     )
 
 
@@ -886,12 +1110,28 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
     so the % drifts down after a trip instead of being held at 100. Restart
     reconciliation is just the ordinary first tick after a gap: the counters are
     cumulative, so the deltas and the standby-over-the-gap all fall out of the
-    same arithmetic.
+    same arithmetic. A no-trip cut-off (see ``CUTOFF_SETTLE_S``) is detected
+    here, settled ``CUTOFF_SETTLE_S`` later, and then floors the display and
+    control ledgers and may teach the learner.
     """
     capacity = capacity_kwh(params.volume_l, params.setpoint_c, params.cold_in_c)
     elapsed_min = max(0.0, inputs.elapsed_s) / 60.0
     bucket = daypart_bucket(_local_hour(inputs))
     hot_fraction = profile_of(state)[bucket]
+    # A temperature dropout holds the last known value rather than snapping the
+    # cold term to zero (that would read as a sudden warm spell) — but only for
+    # AMBIENT_HOLD_H, so a removed sensor stops driving the cold term.
+    if inputs.ambient_c is not None:
+        ambient, ambient_iso = inputs.ambient_c, inputs.now_iso
+    elif (
+        state.last_ambient_c is not None
+        and state.last_ambient_iso
+        and _hours_between(state.last_ambient_iso, inputs.now_iso) < AMBIENT_HOLD_H
+    ):
+        ambient, ambient_iso = state.last_ambient_c, state.last_ambient_iso
+    else:
+        ambient, ambient_iso = None, ""
+    standby_w_now = standby_w_at(state, ambient)
 
     # Energy in (cumulative counter delta; rollback-tolerant, reset-safe).
     energy_in, new_energy_baseline = counter_delta(
@@ -899,11 +1139,11 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
     )
 
     # Draw + water bookkeeping (meter / fallback / none).
-    water = _resolve_draw(state, params, inputs, elapsed_min, hot_fraction)
+    water = _resolve_draw(state, params, inputs, elapsed_min, hot_fraction, standby_w_now)
     draw_kwh, draw_source, tick_clean = water.draw_kwh, water.source, water.clean
     metered_hot_liters = water.hot_liters
 
-    standby = standby_kwh(state.standby_w, elapsed_min)
+    standby = standby_kwh(standby_w_now, elapsed_min)
 
     # Post-trip relaxation: the mixing loss the thermostat feels after a trip,
     # accrued between the previous tick and now (zero before the first anchor).
@@ -964,6 +1204,7 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
         liters + (metered_hot_liters if index == bucket else 0.0)
         for index, liters in enumerate(buckets)
     )
+    acc_cold = state.cycle_cold_kh + cold_hinge_k(ambient) * elapsed_min / 60.0
 
     # Tick-level bookkeeping applied on every branch.
     base = replace(
@@ -973,9 +1214,13 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
         water_baseline_iso=water.baseline_iso,
         water_changed_iso=water.changed_iso,
         water_cadence_min=water.cadence_min,
+        water_missing_since_iso=water.missing_since_iso,
         pending_fallback_kwh=water.pending_kwh,
         last_tick_iso=inputs.now_iso,
         led_kwh_since_counter=led_since,
+        last_ambient_c=ambient,
+        last_ambient_iso=ambient_iso,
+        heating_prev=_next_heating_prev(state.heating_prev, inputs),
     )
 
     latched = latch_holds(state.anchor_latched, inputs.contactor_on, inputs.heating_on)
@@ -1016,6 +1261,7 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
             cycle_clean=acc_clean and not counter_gap,
             cycle_gross_kwh=acc_gross,
             cycle_hot_liters_by_bucket=acc_buckets,
+            cycle_cold_kh=acc_cold,
         )
         learned = learn_from_cycle(accumulated, params, cycle_hours, new_unclamped)
         if energy_gap:
@@ -1038,11 +1284,16 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
             cycle_gross_kwh=0.0,
             cycle_relax_kwh=0.0,
             cycle_hot_liters_by_bucket=_ZERO_PROFILE,
+            cycle_cold_kh=0.0,
+            cycle_display_lift_kwh=0.0,
+            cycle_cutoff_mark_kwh=None,
+            cutoff_pending_iso="",
             led_kwh_since_counter=0.0,
             pending_fallback_kwh=0.0,
         )
         shown = 0.0
         sigma = SIGMA_MIN_KWH
+        cutoff_settled = False
     else:
         # Ordinary integrating tick (latched or not): carry both ledgers and the
         # cycle forward. A latched tank keeps accruing standby/relaxation/draws so
@@ -1060,11 +1311,22 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
             cycle_gross_kwh=acc_gross,
             cycle_relax_kwh=new_relax,
             cycle_hot_liters_by_bucket=acc_buckets,
+            cycle_cold_kh=acc_cold,
         )
-        sigma = uncertainty_kwh(state.residual_ratio, acc_gross)
-        shown = _clamp(
-            display_deficit_kwh(new_unclamped + new_relax - led_since, sigma), 0.0, capacity
+        # Both sides of the balance must be accounted for before a cut-off may
+        # settle: a missing energy reading, or a water reading we're still
+        # waiting on ("none"), would leave its energy out of the ledger.
+        counters_ready = inputs.energy_counter_kwh is not None and (
+            inputs.water_counter_l is not None or draw_source == "fallback"
         )
+        new_state, cutoff_settled = _advance_cutoff(
+            new_state, state, params, inputs, capacity, counters_ready
+        )
+        sigma = uncertainty_kwh(new_state.residual_ratio, acc_gross)
+        display_ledger = (
+            _ledger(new_state) + new_relax - led_since + new_state.cycle_display_lift_kwh
+        )
+        shown = _clamp(display_deficit_kwh(display_ledger, sigma), 0.0, capacity)
 
     return TickResult(
         state=new_state,
@@ -1078,7 +1340,113 @@ def apply_tick(state: TankState, params: TankParams, inputs: TickInputs) -> Tick
         standby_kwh=standby,
         deficit_shown_kwh=shown,
         uncertainty_kwh=sigma,
+        cutoff=cutoff_settled,
+        standby_w_now=standby_w_now,
     )
+
+
+def _ledger(state: TankState) -> float:
+    """The learning ledger (``cycle_unclamped_kwh``, or the control one pre-v2)."""
+    return state.deficit_kwh if state.cycle_unclamped_kwh is None else state.cycle_unclamped_kwh
+
+
+def _next_heating_prev(prev: bool | None, inputs: TickInputs) -> bool | None:
+    """The element state cut-off detection remembers for the next tick.
+
+    An unknown reading keeps the last known one. An element that went idle less
+    than ``CUTOFF_TRIP_MARGIN_S`` ago with the contactor still on stays
+    "heating" for now: the LED can drop a few seconds before the contactor opens
+    (seen 22 s early on 2026-10-24), and recording that tick as "idle" would hide
+    the cut-off the next tick sees. Idle for longer is a real trip (the anchor's
+    business), and the margin check in :func:`is_cutoff` still tells the two apart.
+    """
+    if inputs.heating_on is None:
+        return prev
+    if (
+        inputs.heating_on is False
+        and prev is True
+        and inputs.contactor_on is True
+        and inputs.heating_off_for_s is not None
+        and inputs.heating_off_for_s < CUTOFF_TRIP_MARGIN_S
+    ):
+        return True
+    return inputs.heating_on
+
+
+def is_cutoff(heating_prev: bool | None, inputs: TickInputs) -> bool:
+    """True when the contactor opened while the element was still heating.
+
+    Needs the element last *seen* heating, both now definitely off (an unknown
+    reading never counts), and an observed transition: a tick after a gap longer
+    than ``CUTOFF_MAX_GAP_S`` (HA was down — and startup resets every
+    ``last_changed``, so the durations can't tell a trip from a cut-off) never
+    counts. If the element went idle ``CUTOFF_TRIP_MARGIN_S`` before the
+    contactor opened, the thermostat tripped first — a full tank whose contactor
+    dropped before the anchor's sustain thresholds were met — so that is not a
+    cut-off. The durations are each entity's time in its current state.
+    """
+    if heating_prev is not True or inputs.heating_on is not False:
+        return False
+    if inputs.contactor_on is not False or inputs.elapsed_s > CUTOFF_MAX_GAP_S:
+        return False
+    heating_off_s, contactor_off_s = inputs.heating_off_for_s, inputs.contactor_on_for_s
+    if heating_off_s is not None and contactor_off_s is not None:
+        if heating_off_s - contactor_off_s >= CUTOFF_TRIP_MARGIN_S:
+            return False
+    return True
+
+
+def _advance_cutoff(
+    new_state: TankState,
+    prev: TankState,
+    params: TankParams,
+    inputs: TickInputs,
+    capacity: float,
+    counters_ready: bool,
+) -> tuple[TankState, bool]:
+    """Detect, settle and apply a no-trip cut-off → ``(state, settled_this_tick)``.
+
+    Detection only starts the settle clock; a run that resumes inside it (the
+    scheduler's slot-boundary re-toggle) cancels it, and its real end decides.
+    A settle due while a counter is missing waits for it (``counters_ready``).
+    A cut-off in a short cycle (a post-trip re-heat) is dropped: its balance may
+    legitimately sit past the first trip's level. On settling,
+    :func:`learn_from_cutoff` may correct the params, the learning ledger takes
+    the extra losses they now explain (and the display lift gives up the same
+    amount — the params now explain what it stood in for), then the displayed and
+    control deficits are floored at the new σ: the tank isn't full, so it can't
+    read as fuller than the model's own uncertainty allows.
+    """
+    pending = prev.cutoff_pending_iso
+    if not pending and is_cutoff(prev.heating_prev, inputs):
+        pending = inputs.now_iso
+    if pending and inputs.heating_on is True:
+        pending = ""
+    if (
+        not pending
+        or _hours_between(pending, inputs.now_iso) * 3600.0 < CUTOFF_SETTLE_S
+        or not counters_ready
+    ):
+        return replace(new_state, cutoff_pending_iso=pending), False
+
+    cycle_hours = _hours_between(new_state.cycle_start_iso, inputs.now_iso)
+    if cycle_hours < LEARN_MIN_CYCLE_HOURS:
+        return replace(new_state, cutoff_pending_iso=""), False
+    learned, extra = learn_from_cutoff(new_state, params, cycle_hours, _ledger(new_state))
+    ledger = _clamp(_ledger(new_state) + extra, -capacity, capacity)
+    lift = max(0.0, new_state.cycle_display_lift_kwh - extra)
+    sigma = uncertainty_kwh(learned.residual_ratio, learned.cycle_gross_kwh)
+    led_since = new_state.led_kwh_since_counter
+    lift += max(0.0, sigma - (ledger + new_state.cycle_relax_kwh - led_since + lift))
+    settled = replace(
+        learned,
+        cycle_unclamped_kwh=ledger,
+        cycle_display_lift_kwh=lift,
+        deficit_kwh=_clamp(max(new_state.deficit_kwh, sigma), 0.0, capacity),
+        cutoff_pending_iso="",
+        last_cutoff_iso=inputs.now_iso,
+    )
+    return settled, True
 
 
 def should_boost(

@@ -117,7 +117,9 @@ class TankResult:
     (the saturation-curve display value the SoC % is derived from), while
     ``deficit_raw_kwh`` is the clamped control ledger the SoC→prediction feedback
     actually asks heating for. ``uncertainty_kwh`` is the σ that curve uses, so
-    the card can say how much of the reading is model slack.
+    the card can say how much of the reading is model slack. ``standby_w`` is the
+    learned *base* standing loss, ``standby_w_per_k`` its cold-weather slope and
+    ``standby_now_w`` what the model charges at the current outdoor temperature.
     """
 
     soc_pct: float
@@ -134,6 +136,9 @@ class TankResult:
     last_full: str | None
     draw_source: str
     liters_40c: float
+    standby_w_per_k: float = 0.0
+    standby_now_w: float | None = None
+    last_cutoff: str | None = None
     anchor_age_hours: float | None = None
     quality_warnings: list[str] = field(default_factory=list)
     observation: dict = field(default_factory=dict)
@@ -366,10 +371,10 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
     ) -> tuple[TankResult, bool]:
         """Run one load's tick; returns ``(result, save_now)``.
 
-        ``save_now`` is True when the tick took an anchor *transition* (which is
-        also the only time the model learns) — the event worth persisting
-        promptly (a successful boost persists from its own task). Ordinary
-        latched ticks are just drift and ride the periodic save.
+        ``save_now`` is True when the tick took an anchor *transition* or settled
+        a no-trip cut-off (the only times the model learns) — the events worth
+        persisting promptly (a successful boost persists from its own task).
+        Ordinary latched ticks are just drift and ride the periodic save.
         """
         params = TankParams(cfg.tank_volume_l, cfg.tank_setpoint_c, cfg.tank_cold_in_c)
         capacity = capacity_kwh(cfg.tank_volume_l, cfg.tank_setpoint_c, cfg.tank_cold_in_c)
@@ -415,6 +420,9 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             water_changed_iso=(
                 self._changed_iso(cfg.water_total_entity) if water_l is not None else None
             ),
+            # Drives the cold-weather standing loss (the tank's corner gets colder
+            # with the weather); unknown ⇒ the model holds the last value.
+            ambient_c=self._number(cfg.outdoor_temp_entity, temperature=True),
         )
 
         tick = apply_tick(state, params, inputs)
@@ -480,6 +488,9 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             last_full=tick.state.last_anchor_iso or None,
             draw_source=tick.draw_source,
             liters_40c=liters_40c,
+            standby_w_per_k=tick.state.standby_w_per_k,
+            standby_now_w=tick.standby_w_now,
+            last_cutoff=tick.state.last_cutoff_iso or None,
         )
         # Observation failures must never prevent the existing tank/boost paths
         # from publishing. No observation value is fed back into either path.
@@ -490,7 +501,7 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
         except Exception:  # noqa: BLE001 - diagnostic path cannot break control
             _LOGGER.exception("Tank observation failed for load %s", sid)
             result.quality_warnings.append("Shower observations unavailable")
-        return result, tick.anchored or observation_changed
+        return result, tick.anchored or tick.cutoff or observation_changed
 
     def _number(
         self, entity_id: str | None, *, temperature: bool = False, humidity: bool = False

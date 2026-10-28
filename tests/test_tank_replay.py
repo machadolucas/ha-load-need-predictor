@@ -166,3 +166,70 @@ def test_a_responsive_meter_keeps_its_one_tick_rate_caps(week):
     ~0.5 kWh/week of evening flow and worsen the trip residuals (rms 1.17 → 1.24).
     """
     assert week["max_water_cadence_min"] <= 1.0
+
+
+# ── The no-trip stretch (2026-10-19 → 10-28) ──────────────────────────────────
+#
+# Daily anchors until 26 Oct, then 47 h in which the scheduler cut every run
+# while the element was still drawing ~3 kW, so the thermostat never tripped.
+# The model believed the tank full an hour into the last night's run and the
+# saturation curve shrank every later loss to ~8 % of its size: the live sensor
+# read 98.9 % with ≥ 1.9 kWh demonstrably missing. v0.14.0's no-trip cut-off
+# floor + learning exist for exactly this; these are its acceptance criteria.
+
+NOTRIP = _ROOT / "tests" / "fixtures" / "tank_notrip_2026-10-19.csv"
+NOTRIP_HOT_FRACTION = 0.229  # the live learned profile mean on 2026-10-28
+
+
+@pytest.fixture(scope="module")
+def notrip():
+    """The October stretch replayed once, learning ON, from the live params."""
+    return replay_tank.replay(
+        NOTRIP,
+        hot_fraction=NOTRIP_HOT_FRACTION,
+        standby_w=replay_tank.LIVE_STANDBY_W,
+        learn=True,
+    )
+
+
+def test_a_no_trip_stretch_does_not_read_full(notrip):
+    """Without a trip the tank was never full; v0.13 still read 98.6 % at the end."""
+    assert notrip["cutoff_steps"], "the cut-offs were never settled"
+    assert notrip["final_soc_pct"] < 90.0
+
+
+def test_cutoff_steps_are_bounded_by_sigma(week, notrip):
+    """A cut-off floors the shown deficit at σ, so its step is at most σ (≈ points).
+
+    It only ever lowers the % (the tank isn't as full as the curve claimed); a
+    rise beyond rounding would mean the re-base double-counted the lift.
+    """
+    for run in (week, notrip):
+        for at, step, sigma_pts in run["cutoff_steps"]:
+            assert step <= 0.5, (at, step)
+            assert -step <= sigma_pts + 0.5, (at, step, sigma_pts)
+
+
+def test_no_trip_cutoff_teaches_more_standby(notrip):
+    """The 47 h near-dry contradiction is standing loss the model under-counted."""
+    state = notrip["final_state"]
+    assert state.standby_w > replay_tank.LIVE_STANDBY_W
+    assert state.standby_w_per_k >= 0.0
+    profile = state.hot_fraction_profile or (state.hot_fraction,) * 4
+    assert abs(statistics.fmean(profile) - NOTRIP_HOT_FRACTION) < 0.03
+
+
+def test_no_trip_stretch_anchors_still_close_cleanly(notrip):
+    """The earlier daily cycles must keep closing within the usual ~1 kWh."""
+    assert notrip["long_cycle_anchors"] >= 3
+    assert notrip["residual_rms"] < 1.5, notrip["residuals"]
+    assert all(value == pytest.approx(100.0) for value in notrip["anchor_socs"])
+
+
+def test_no_trip_stretch_only_jumps_at_the_meter_catch_ups(notrip):
+    """The only other steps are the two OCR catch-ups on 25 Oct (250 L, 100 L).
+
+    Those litres were really drawn while the OCR was failing; they arrive in one
+    reading and step every model version down — not a cut-off artefact.
+    """
+    assert [at[:10] for at, _ in notrip["jumps"]] == ["2026-10-25", "2026-10-25"]

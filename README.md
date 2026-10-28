@@ -190,7 +190,12 @@ The estimate uses:
   separately for four times of day (night / morning / day / evening), since an
   evening's showers draw a different share of the household's water than a
   daytime's toilets and appliances.
-- **Standing loss** as a learned constant wattage.
+- **Standing loss** as a learned base wattage plus a learned cold-weather slope:
+  `standby_w + standby_w_per_k × max(0, 15 °C − outdoor)`, using the load's
+  configured outdoor-temperature sensor (a tank on an exterior wall loses more
+  when it's cold outside). The slope starts at 0 W/K — the plain constant — and
+  only grows once cycles at different temperatures disagree with a constant. No
+  outdoor sensor configured ⇒ no cold term.
 
 **What "100 %" actually means.** When the contactor is commanded *on* but the
 heating-active detector shows the element *idle* for a sustained spell, the
@@ -210,16 +215,35 @@ temperature. That transition is the *only* moment the sensor reads 100 %:
   usually is and folds it in, so the estimate doesn't overshoot what a brief
   re-heat can explain.
 - Between two trips the energy balance closes exactly, which is what
-  self-calibrates the hot fraction (large-draw cycles), the standing loss
-  (near-zero-draw cycles) and the thermostat's typical top-up size, every
-  time. Every learned parameter is clamped and adapts slowly on purpose, so a
+  self-calibrates the thermostat's typical top-up size (short re-heat cycles)
+  and, on every longer cycle, the loss terms: the cycle's error is split
+  between the hot fractions (only when it metered ≥ 50 L), the base standing
+  loss and its cold slope, each in proportion to how much energy it accounts
+  for in that cycle — a dry cycle teaches standby alone, a cold one also the
+  slope. Every learned parameter is clamped and adapts slowly on purpose, so a
   single noisy day can't swing the estimate. The model also tracks its own
   uncertainty, so the estimate is confident right after a trip and gets
   softer as more time passes without one. Until the first trip the sensor
   reports `calibrated: false` and shows a cold-start guess.
+- **When heating stops without a trip.** If the contactor opens while the
+  element is still drawing power, the thermostat hasn't tripped — so the tank
+  is *not* full, whatever the balance says. Two minutes later (so a lagging
+  energy counter can catch up) the estimate is floored at its own uncertainty:
+  the % can't keep crediting a "beyond full" surplus that would otherwise
+  absorb later draws (before v0.14.0 a multi-day stretch of such cut-offs could
+  leave it near 99 % with several kWh missing). If the balance claimed the tank
+  was past full by more than the thermostat's band, that contradiction is also
+  learned from, like a trip — but only from the excess, since it is a lower
+  bound on the error, and never twice from the same contradiction. A cut-off
+  waits for both counters to be reporting, and one shortly after a trip (a
+  re-heat, < 4 h) is ignored — a re-heated tank really can hold more than at
+  the trip. The timestamp is in `last_cutoff`.
 - If the water meter drops out, the model falls back to an occupancy-based draw
   estimate (flagged via the `draw_source` attribute) and reconciles when the
-  meter returns, so OCR dropouts neither stall nor double-count. A counter that
+  meter returns, so OCR dropouts neither stall nor double-count. Only an outage
+  the running integration has *watched* for 15 min counts: right after an HA
+  restart the meter is often not restored yet, and that downtime is reconciled
+  from the cumulative reading instead of being treated as an outage. A counter that
   is unavailable right at a trip, or whose entity you change in the load's
   settings, simply restarts from its next reading (that cycle isn't used for
   learning) — so neither can make the tank jump to full.
@@ -234,11 +258,14 @@ Attributes carry the full rationale:
 | `capacity_kwh` | The tank's full-to-empty energy span, from its configured volume/setpoint/cold-inlet. |
 | `hot_fraction` | The learned average share of metered water attributed to the tank. |
 | `hot_fraction_profile` | That same share, broken out by time of day (night/morning/day/evening). |
-| `standby_w` | The learned standing-loss wattage. |
+| `standby_w` | The learned base standing-loss wattage (outdoor ≥ 15 °C). |
+| `standby_w_per_k` | The learned extra standing loss per kelvin below 15 °C outdoors. |
+| `standby_now_w` | The standing loss charged right now, at the current outdoor temperature (live-only). |
 | `hysteresis_kwh` | The learned size of the thermostat's post-trip top-up. |
 | `calibrated` | Whether a first trip has happened yet (before that, the estimate is a cold-start guess). |
 | `latched` | Whether the tank is currently sitting right at a trip (contactor on, element idle). |
 | `last_full` | Timestamp of the most recent trip. |
+| `last_cutoff` | Timestamp of the most recent heating run that ended without a trip (the estimate was floored then). |
 | `draw_source` | Where this tick's draw came from: the water meter, the occupancy fallback, or none (a brief meter gap). |
 | `equivalent_liters_40c` | Optional energy-equivalent litres at 40 °C under the accompanying assumption; not measured usable water. |
 | `equivalent_liters_assumption` | Explicit mixing/temperature assumption needed to interpret equivalent litres. |
@@ -251,7 +278,8 @@ Attributes carry the full rationale:
 | `comfort_feedback_supported` | Whether this backend supports the card's comfort-feedback service. |
 
 The minute-by-minute attributes (`deficit_kwh`, `deficit_raw_kwh`,
-`uncertainty_kwh`, `latched`, `draw_source` and recent observations) are
+`uncertainty_kwh`, `latched`, `draw_source`, `standby_now_w` and recent
+observations) are
 live-only — they aren't written to the recorder, so they don't bloat the
 database; the charge % itself and the learned parameters keep their history.
 
