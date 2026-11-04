@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import math
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -29,6 +30,32 @@ MAX_EVENT_FLOW_LPM = 15.0
 MIN_EVENT_LITERS = 8.0
 MIN_EVENT_DURATION_S = 120.0
 HUMIDITY_RISE_PCT = 3.0
+# Mirrors tank_model.LEARN_MIN_CYCLE_HOURS: shorter cycles are post-trip re-heats.
+EVAL_MIN_CYCLE_S = 4 * 3600.0
+# Mirrored from tank_model so path-loaded offline tools stay HA-free; parity is tested.
+DAYPART_BOUNDS = ((0, 6), (6, 11), (11, 17), (17, 24))
+REFIT_PRIOR_SCALES = (0.08, 0.08, 0.08, 0.08, 30.0, 3.0)
+REFIT_PARAM_BOUNDS = ((0.05, 0.9),) * 4 + ((20.0, 250.0), (0.0, 15.0))
+REFIT_RUN_REJECTIONS = frozenset(
+    (
+        "household_activity_overlap",
+        "household_activity_unknown",
+        "shower_active_or_unknown",
+        "appliance_overlap",
+        "batched_or_overlapping_flow",
+        "appliance_state_unknown",
+        "no_metered_water",
+        "start_unobserved",
+        "boundary_unobserved",
+        "restart_or_gap",
+        "observation_gap",
+        "sources_changed",
+        "water_unavailable",
+        "water_quality",
+        "run_too_long",
+        "source_removed",
+    )
+)
 FEEDBACK_REPORTS = frozenset(("comfortable", "cooler_than_usual", "not_warm_enough"))
 
 
@@ -37,7 +64,8 @@ class ObservationInputs:
     """One observed tick and the baseline model's *actual* accounting terms.
 
     ``previous_cycle_unclamped_kwh`` and ``previous_cycle_clean`` are captured
-    BEFORE apply_tick, all other tank values AFTER. The old residual must be
+    BEFORE apply_tick, as are all ``previous_*`` refit features. Other tank values
+    are AFTER. The old residual must be
     reconstructed before the anchor's reset can hide it. Signatures must cover
     configured sources and attribution settings, not mutable source states.
     """
@@ -69,6 +97,15 @@ class ObservationInputs:
     household_activity: bool | None = None
     appliance_boundaries_known: bool = True
     observation_restarted: bool = False
+    local_hour: int | None = None
+    kwh_per_hot_liter: float | None = None
+    previous_cycle_hot_liters_by_bucket: tuple[float, ...] | None = None
+    previous_cycle_cold_kh: float | None = None
+    previous_hot_fraction_profile: tuple[float, ...] | None = None
+    previous_standby_w: float | None = None
+    previous_standby_w_per_k: float | None = None
+    previous_cutoff_rebased: bool = False
+    tick_cold_kh: float = 0.0
 
 
 def _time(value: str) -> datetime:
@@ -86,6 +123,50 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return numeric if math.isfinite(numeric) else None
+
+
+def _daypart(inputs: ObservationInputs) -> int:
+    hour = inputs.local_hour if inputs.local_hour is not None else _time(inputs.now_iso).hour
+    return next(index for index, (start, end) in enumerate(DAYPART_BOUNDS) if start <= hour < end)
+
+
+def _close_refit_features(cycle: dict[str, Any], inputs: ObservationInputs) -> dict | None:
+    features = cycle.get("features")
+    buckets = inputs.previous_cycle_hot_liters_by_bucket
+    profile = inputs.previous_hot_fraction_profile
+    e = inputs.kwh_per_hot_liter
+    if (
+        features is None
+        or buckets is None
+        or len(buckets) != 4
+        or profile is None
+        or len(profile) != 4
+        or e is None
+        or e <= 0
+        or inputs.previous_cycle_cold_kh is None
+        or inputs.previous_standby_w is None
+        or inputs.previous_standby_w_per_k is None
+    ):
+        return None
+    bucket = _daypart(inputs)
+    if profile[bucket] <= 0:
+        return None
+    hot_liters = list(buckets)
+    # apply_tick resets the buckets at an anchor. Invert its actual draw to retain
+    # the final interval, including the model's hot-flow cap, rather than raw water.
+    hot_liters[bucket] += inputs.baseline_draw_kwh / (e * profile[bucket])
+    return {
+        **features,
+        "hot_liters_by_bucket": hot_liters,
+        "cycle_hours": (_time(inputs.now_iso) - _time(cycle["start"])).total_seconds() / 3600,
+        "cold_kh": inputs.previous_cycle_cold_kh + inputs.tick_cold_kh,
+        "kwh_per_hot_liter": e,
+        "params": {
+            "hot_fraction_profile": list(profile),
+            "standby_w": inputs.previous_standby_w,
+            "standby_w_per_k": inputs.previous_standby_w_per_k,
+        },
+    }
 
 
 def _invalidate(event: dict[str, Any], reason: str) -> None:
@@ -210,7 +291,11 @@ def _close_appliance_run(
     if reason:
         _run_flag(run, reason, incomplete=True)
     if run["gross_household_l"] <= 0:
-        _run_flag(run, "no_metered_water")
+        # Dishwashers and washers always fill, so a run that metered nothing
+        # means the meter missed it (2026-11-04: the OCR held its last total
+        # all night and a 145-min dishwasher run was kept as "complete", 0 L).
+        # It can never be a clean volume sample.
+        _run_flag(run, "no_metered_water", incomplete=True)
     run["interior_profile_usable"] = run["observed_interior_household_l"] > 0
     run["end"] = now_iso
     run["attribution"] = "gross_household_water_during_run_not_appliance_fill"
@@ -282,6 +367,15 @@ def _advance_appliances(
         rejection.append("baseline_draw_unobserved")
     bound_l = positive_delta if not rejection else 0.0
     bound_kwh = max(0.0, inputs.baseline_draw_kwh) if bound_l > 0 else 0.0
+    cycle_features = saved.get("cycle", {}).get("features")
+    if cycle_features is not None:
+        bucket = _daypart(inputs)
+        for source in sorted(active_sources | previous_active):
+            features = cycle_features["appliances"].setdefault(
+                source, {"run_starts_by_bucket": [0] * 4, "liters_by_bucket": [0.0] * 4}
+            )
+            # Edges remain household-flow observations; they are not clean fills.
+            features["liters_by_bucket"][bucket] += positive_delta
 
     for source in list(store["active_runs"]):
         run = store["active_runs"][source]
@@ -299,6 +393,8 @@ def _advance_appliances(
             valid_interval and previous.get(source) is False and inputs.appliance_boundaries_known
         )
         store["sequence"] += 1
+        if cycle_features is not None:
+            cycle_features["appliances"][source]["run_starts_by_bucket"][bucket] += 1
         store["active_runs"][source] = {
             "id": f"{inputs.now_iso}/appliance/{store['sequence']}",
             "source": source,
@@ -465,6 +561,10 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
         and disruption is None
     )
     if cycle:
+        if features := cycle.get("features"):
+            features["cutoff_rebased"] = (
+                features["cutoff_rebased"] or inputs.previous_cutoff_rebased
+            )
         cycle["clean"] = cycle["clean"] and clean_tick
         if saturated:
             _invalidate(cycle, "baseline_saturated")
@@ -582,6 +682,11 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
             if cycle:
                 _invalidate(cycle, "anchor_mid_event")
         if cycle:
+            features = _close_refit_features(cycle, inputs)
+            # An in-progress pre-upgrade cycle has no complete appliance history.
+            cycle.pop("features", None)
+            if features is not None:
+                cycle["features"] = features
             baseline_residual = residual_before_reset
             if inputs.tank_capacity_kwh > 0:
                 baseline_residual = max(
@@ -619,6 +724,7 @@ def advance_observation(saved: dict[str, Any] | None, inputs: ObservationInputs)
             "quality_reasons": ["anchor_mid_event"] if anchor_mid_event else [],
             "exploratory_cold_upper_liters": 0.0,
             "exploratory_max_draw_reduction_kwh": 0.0,
+            "features": {"appliances": {}, "cutoff_rebased": False},
         }
 
     result.update(
@@ -807,15 +913,16 @@ def _metrics(rows: list[dict[str, Any]], field: str) -> dict[str, float]:
     }
 
 
-def evaluate_observations(saved: dict[str, Any]) -> dict[str, Any]:
-    """Chronological holdout comparison, never a command to promote control.
+def _eligible_cycles(saved: dict[str, Any]) -> list[dict[str, Any]]:
+    """Clean draw cycles of the current setup, oldest first.
 
-    The formula has no fitted parameters. The early half is an observation
-    development window and the later half is held out. A changed source setup
-    starts its own evidence window instead of borrowing acceptance from old data.
+    Post-trip re-heats (< ``EVAL_MIN_CYCLE_S``) and cycles that metered no water
+    carry no draw for a correction to act on — their shadow residual equals the
+    baseline by construction — so counting them only dilutes the held-out error
+    (2026-11-04: 6 of the 10 held-out "cycles" were such re-heats).
     """
     signature = saved.get("source_signature")
-    rows = sorted(
+    return sorted(
         (
             row
             for row in saved.get("cycles", [])
@@ -825,15 +932,28 @@ def evaluate_observations(saved: dict[str, Any]) -> dict[str, Any]:
             and row.get("source_signature") == signature
             and _number(row.get("baseline_residual_kwh")) is not None
             and _number(row.get("shadow_residual_kwh")) is not None
+            and (_time(row["end"]) - _time(row["start"])).total_seconds() >= EVAL_MIN_CYCLE_S
+            and (_number(row.get("water_l")) or 0.0) > 0
         ),
         key=lambda row: _time(row["end"]),
     )
+
+
+def evaluate_observations(saved: dict[str, Any]) -> dict[str, Any]:
+    """Chronological holdout comparison, never a command to promote control.
+
+    The formula has no fitted parameters. The early half is an observation
+    development window and the later half is held out. A changed source setup
+    starts its own evidence window instead of borrowing acceptance from old data.
+    """
+    rows = _eligible_cycles(saved)
     report: dict[str, Any] = {
         "status": "insufficient_evidence",
         "eligible_cycles": len(rows),
         "automatic_promotion": False,
         "comfort_risk": "not_inferred_from_anchor_residuals",
         "appliance_exploration": evaluate_appliance_exploration(saved),
+        "appliance_refit": evaluate_appliance_refit(saved),
     }
     if len(rows) < 12:
         return report
@@ -860,6 +980,212 @@ def evaluate_observations(saved: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _param_vector(params: dict[str, Any]) -> list[float]:
+    return [*params["hot_fraction_profile"], params["standby_w"], params["standby_w_per_k"]]
+
+
+def _param_dict(values: list[float]) -> dict[str, Any]:
+    return {
+        "hot_fraction_profile": values[:4],
+        "standby_w": values[4],
+        "standby_w_per_k": values[5],
+    }
+
+
+def _has_refit_features(row: dict[str, Any]) -> bool:
+    """Old and partial payloads must not silently turn into zero-valued evidence."""
+    features = row.get("features")
+    if not isinstance(features, dict) or features.get("cutoff_rebased") is not False:
+        return False
+    params = features.get("params", {})
+    if not isinstance(params, dict) or not isinstance(features.get("appliances"), dict):
+        return False
+    vectors = [features.get("hot_liters_by_bucket"), params.get("hot_fraction_profile")]
+    for appliance in features["appliances"].values():
+        if not isinstance(appliance, dict):
+            return False
+        vectors.extend([appliance.get("run_starts_by_bucket"), appliance.get("liters_by_bucket")])
+    if any(
+        not isinstance(vector, (list, tuple))
+        or len(vector) != 4
+        or any(
+            not isinstance(value, (int, float)) or _number(value) is None or value < 0
+            for value in vector
+        )
+        for vector in vectors
+    ):
+        return False
+    return (
+        all(
+            isinstance(value, (int, float)) and _number(value) is not None and value >= 0
+            for value in (
+                features.get("cycle_hours"),
+                features.get("cold_kh"),
+                features.get("kwh_per_hot_liter"),
+                params.get("standby_w"),
+                params.get("standby_w_per_k"),
+            )
+        )
+        and features["kwh_per_hot_liter"] > 0
+    )
+
+
+def _refit_terms(row: dict[str, Any], volumes: dict[str, float]) -> list[float]:
+    features = row["features"]
+    adjusted = list(features["hot_liters_by_bucket"])
+    for bucket in range(4):
+        deduction = sum(
+            volume
+            * features["appliances"].get(source, {}).get("run_starts_by_bucket", [0] * 4)[bucket]
+            for source, volume in volumes.items()
+        )
+        adjusted[bucket] = max(0.0, adjusted[bucket] - deduction)
+    return [
+        *(features["kwh_per_hot_liter"] * liters for liters in adjusted),
+        features["cycle_hours"] / 1000,
+        features["cold_kh"] / 1000,
+    ]
+
+
+def _refit_residual(row: dict[str, Any], params: list[float], volumes: dict[str, float]) -> float:
+    original = _refit_terms(row, {})
+    adjusted = _refit_terms(row, volumes)
+    previous = _param_vector(row["features"]["params"])
+    return row["baseline_residual_kwh"] + sum(
+        value * term - old * raw
+        for value, term, old, raw in zip(params, adjusted, previous, original, strict=True)
+    )
+
+
+def _solve_refit(matrix: list[list[float]], rhs: list[float]) -> list[float]:
+    """Partial-pivot elimination; the unit ridge makes this 6×6 system nonsingular."""
+    rows = [row[:] + [value] for row, value in zip(matrix, rhs, strict=True)]
+    for column in range(6):
+        pivot = max(range(column, 6), key=lambda index: abs(rows[index][column]))
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        divisor = rows[column][column]
+        rows[column] = [value / divisor for value in rows[column]]
+        for index in range(column + 1, 6):
+            factor = rows[index][column]
+            rows[index] = [
+                value - factor * reference
+                for value, reference in zip(rows[index], rows[column], strict=True)
+            ]
+    result = [0.0] * 6
+    for index in reversed(range(6)):
+        result[index] = rows[index][6] - sum(
+            rows[index][column] * result[column] for column in range(index + 1, 6)
+        )
+    return result
+
+
+def _fit_refit(rows: list[dict[str, Any]], volumes: dict[str, float]) -> list[float]:
+    prior = _param_vector(rows[-1]["features"]["params"])
+    matrix = [[float(i == j) for j in range(6)] for i in range(6)]
+    rhs = [0.0] * 6
+    # Solve in units of each prior spread: λ=1 becomes an identity ridge.
+    for row in rows:
+        terms = _refit_terms(row, volumes)
+        scaled = [term * scale for term, scale in zip(terms, REFIT_PRIOR_SCALES, strict=True)]
+        residual = _refit_residual(row, prior, volumes)
+        for i in range(6):
+            rhs[i] -= scaled[i] * residual
+            for j in range(6):
+                matrix[i][j] += scaled[i] * scaled[j]
+    step = _solve_refit(matrix, rhs)
+    return [
+        max(low, min(high, value + scale * delta))
+        for value, scale, delta, (low, high) in zip(
+            prior, REFIT_PRIOR_SCALES, step, REFIT_PARAM_BOUNDS, strict=True
+        )
+    ]
+
+
+def evaluate_appliance_refit(saved: dict[str, Any]) -> dict[str, Any]:
+    """Refit both hypotheses on early cycles and compare only later residuals."""
+    rows = [row for row in _eligible_cycles(saved) if _has_refit_features(row)]
+    train, heldout = rows[: len(rows) // 2], rows[len(rows) // 2 :]
+    heldout_start = heldout[0]["start"] if heldout else None
+    sources = {source for row in rows for source in row["features"]["appliances"]}
+    samples: dict[str, list[float]] = {source: [] for source in sources}
+    for run in saved.get("appliance_observations", {}).get("runs", []):
+        source = run.get("source")
+        if source is None:
+            continue
+        samples.setdefault(source, [])
+        volume = _number(run.get("observed_interior_household_l"))
+        if (
+            heldout_start is not None
+            and run.get("complete") is True
+            and not REFIT_RUN_REJECTIONS.intersection(run.get("quality_flags", []))
+            and run.get("source_signature") == saved.get("source_signature")
+            and _time(run["start"]) < _time(heldout_start)
+            # A run crossing the split has future interiors: do not leak them.
+            and _time(run["end"]) <= _time(heldout_start)
+            and volume is not None
+            and volume > 0
+        ):
+            samples[source].append(volume)
+    stats = {}
+    for source, values in sorted(samples.items()):
+        mean = statistics.fmean(values) if values else None
+        sd = statistics.pstdev(values) if values else None
+        cv = sd / mean if mean is not None else None
+        stats[source] = {
+            "n": len(values),
+            "median_l": statistics.median(values) if values else None,
+            "mean_l": mean,
+            "sd_l": sd,
+            "cv": cv,
+            "consistent": len(values) >= 5 and cv < 0.25,
+        }
+    volumes = {source: item["median_l"] for source, item in stats.items() if item["consistent"]}
+    with_runs = sum(
+        any(
+            sum(row["features"]["appliances"].get(source, {}).get("run_starts_by_bucket", [])) > 0
+            for source in volumes
+        )
+        for row in heldout
+    )
+    reasons = []
+    if len(rows) < 12:
+        reasons.append("too_few_cycles")
+    if not volumes:
+        reasons.append("no_consistent_appliance")
+    if with_runs < 10:
+        reasons.append("too_few_heldout_cycles_with_runs")
+    report = {
+        "status": "insufficient_evidence",
+        "reasons": reasons,
+        "eligible_cycles": len(rows),
+        "train_cycles": len(train),
+        "heldout_cycles": len(heldout),
+        "heldout_start": heldout_start,
+        "n_heldout_with_consistent_runs": with_runs,
+        "per_appliance": stats,
+        "B1": None,
+        "C2": None,
+        "automatic_promotion": False,
+        "accepted_cold_attribution_kwh": 0.0,
+        "interpretation": "shadow_refit_comparison_not_control",
+    }
+    if len(rows) < 12:
+        return report
+    for variant, deduction in (("B1", {}), ("C2", volumes)):
+        params = _fit_refit(train, deduction)
+        residuals = [{"residual": _refit_residual(row, params, deduction)} for row in heldout]
+        report[variant] = {"params": _param_dict(params), **_metrics(residuals, "residual")}
+    if not reasons:
+        baseline, candidate = report["B1"], report["C2"]
+        report["status"] = (
+            "passes_shadow_comparison"
+            if candidate["rmse_kwh"] < baseline["rmse_kwh"]
+            and abs(candidate["bias_kwh"]) <= abs(baseline["bias_kwh"]) + 1e-12
+            else "fails_shadow_comparison"
+        )
+    return report
+
+
 def evaluate_appliance_exploration(saved: dict[str, Any]) -> dict[str, Any]:
     """Show an exploratory residual envelope; even improved error proves no fill.
 
@@ -878,19 +1204,7 @@ def evaluate_appliance_exploration(saved: dict[str, Any]) -> dict[str, Any]:
         "exploratory_cold_upper_liters": profiles["exploratory_cold_upper_liters"],
         "exploratory_max_draw_reduction_kwh": profiles["exploratory_max_draw_reduction_kwh"],
     }
-    rows = sorted(
-        (
-            row
-            for row in saved.get("cycles", [])
-            if row.get("complete")
-            and row.get("clean")
-            and row.get("synchronized")
-            and row.get("source_signature") == saved.get("source_signature")
-            and _number(row.get("baseline_residual_kwh")) is not None
-            and _number(row.get("shadow_residual_kwh")) is not None
-        ),
-        key=lambda row: _time(row["end"]),
-    )
+    rows = _eligible_cycles(saved)
     report["eligible_cycles"] = len(rows)
     if len(rows) >= 12:
         heldout = rows[len(rows) // 2 :]

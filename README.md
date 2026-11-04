@@ -534,6 +534,25 @@ quality warnings. Persistent failures also appear under **Settings → System �
 Repairs** after 15 minutes of continuous failure. Recovery or correcting the configuration
 clears the corresponding issue. Optional fields left empty create no issue.
 
+Each anchor cycle also stores the inputs needed to test a deduction offline:
+model-attributable litres per time-of-day bucket, cycle hours, cold K·h, the
+parameters in force, and per-appliance run starts and litres per bucket. The
+`shadow_evaluation.appliance_refit` report refits the hot fractions and standby
+loss on the earlier half of clean cycles twice — without a deduction (B1) and
+with a fixed per-run volume for each appliance (C2) — and compares them only on
+the later half. A volume is used only when at least five clean, fully observed
+runs (no overlapping household use, no meter gaps) agree within a 25 %
+coefficient of variation, and a verdict needs at least 12 eligible cycles with 10
+held-out cycles containing such runs. C2 passes only with lower held-out RMSE and
+no worse absolute bias. The report never changes heating; it is evidence for a
+later, separately approved change. Evaluations count only cycles of at least
+4 hours that metered water — shorter post-trip re-heats carry no draw to correct.
+
+An appliance run that meters no water at all is recorded as incomplete: these
+appliances always fill, so 0 L means the meter missed the run. Run boundaries
+count only changes in decoded activity, so an LG washer's
+`initial → detecting → running` burst within one minute is one observed start.
+
 Do not subtract a fixed allowance from live tank accounting yet. Existing learned
 hot-water fractions already absorb average cold-only usage; introducing an
 exclusion requires recalibration and held-out anchor-cycle evaluation, including

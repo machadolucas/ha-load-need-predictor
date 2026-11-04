@@ -8,6 +8,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import pytest
@@ -22,6 +23,12 @@ _spec = importlib.util.spec_from_file_location("lnp_tank_observation", _PATH)
 observation = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = observation
 _spec.loader.exec_module(observation)
+_tank_spec = importlib.util.spec_from_file_location(
+    "lnp_observation_tank", _PATH.with_name("tank_model.py")
+)
+tank = importlib.util.module_from_spec(_tank_spec)
+sys.modules[_tank_spec.name] = tank
+_tank_spec.loader.exec_module(tank)
 BASE = datetime.fromisoformat("2026-10-01T12:00:00+03:00")
 
 
@@ -314,6 +321,7 @@ def evaluation_state(baseline=1.0, candidate=0.5):
                 "synchronized": True,
                 "source_signature": "same",
                 "confident_events": 1,
+                "water_l": 100.0,
                 "baseline_residual_kwh": baseline,
                 "shadow_residual_kwh": candidate,
             }
@@ -350,6 +358,19 @@ def test_evaluator_ignores_old_setup_dirty_partial_and_nonfinite_cycles():
     report = observation.evaluate_observations(state)
     assert report["status"] == "insufficient_evidence"
     assert report["eligible_cycles"] == 8
+
+
+def test_evaluator_skips_post_trip_reheats_and_dry_cycles():
+    """Re-heats and dry cycles have nothing to correct: they only dilute the error."""
+    state = evaluation_state()
+    reheat = state["cycles"][0]
+    reheat["end"] = iso(3 * 60 + 59)  # cycle 0 starts at minute 0
+    state["cycles"][1]["water_l"] = 0.0
+    state["cycles"][2].pop("water_l")
+    report = observation.evaluate_observations(state)
+    assert report["eligible_cycles"] == 9
+    assert report["status"] == "insufficient_evidence"
+    assert report["appliance_exploration"]["eligible_cycles"] == 9
 
 
 def test_evaluator_requires_recognized_events_not_just_anchor_count():
@@ -524,6 +545,8 @@ def test_no_metered_water_does_not_mean_demonstrated_zero_consumption():
     state = appliance_tick(state, 3)
     run = state["appliance_observations"]["runs"][0]
     assert "no_metered_water" in run["quality_flags"]
+    # Appliances always fill: a dry run is a missed meter, never a clean sample.
+    assert run["complete"] is False
     assert run["interior_profile_usable"] is False
     profile = observation.summarize_observation(state)["appliance_profiles"]["per_source"]["washer"]
     assert profile["runs_with_metered_water"] == 0
@@ -653,3 +676,361 @@ def test_improved_exploratory_error_never_passes_accepted_attribution_gate():
     assert exploration["hypothetical_min_residual"]["rmse_kwh"] == 0
     assert exploration["accepted_cold_attribution_kwh"] == 0
     assert exploration["automatic_promotion"] is False
+
+
+def test_refit_constants_match_live_model():
+    assert observation.DAYPART_BOUNDS == tank.DAYPART_BOUNDS
+    assert observation.REFIT_PRIOR_SCALES == (
+        *((tank.PRIOR_HOT_FRACTION,) * 4),
+        tank.PRIOR_STANDBY_W,
+        tank.PRIOR_STANDBY_W_PER_K,
+    )
+    assert observation.REFIT_PARAM_BOUNDS == (
+        *((tank.HOT_FRACTION_MIN, tank.HOT_FRACTION_MAX),) * 4,
+        (tank.STANDBY_W_MIN, tank.STANDBY_W_MAX),
+        (tank.STANDBY_W_PER_K_MIN, tank.STANDBY_W_PER_K_MAX),
+    )
+    assert observation.EVAL_MIN_CYCLE_S == tank.LEARN_MIN_CYCLE_HOURS * 3600
+    for hour in range(24):
+        inputs = observation.ObservationInputs(
+            iso(), "same", 0, False, 0, False, False, local_hour=hour
+        )
+        assert observation._daypart(inputs) == tank.daypart_bucket(hour)
+
+
+def test_anchor_features_include_final_tick_and_reproduce_multitick_physics():
+    start = BASE.replace(hour=5, minute=58)
+    params = tank.TankParams(300, 75, 12)
+    e = tank.draw_kwh_from_liters(1, 1, 75, 12)
+    live = replace(
+        tank.initial_state(22),
+        hot_fraction_profile=(0.2, 0.3, 0.4, 0.5),
+        standby_w=90,
+        standby_w_per_k=2,
+    )
+    saved, water, energy = None, 1000.0, 100.0
+    last = 12 * 60 + 4  # 18:02, crossing every daypart boundary.
+    for minute in range(last + 1):
+        now = start + timedelta(minutes=minute)
+        water += 2 if minute in (2, 4, 303, last) else 0
+        energy += 0.001 if minute else 0
+        previous = live
+        anchored = minute in (0, last)
+        model_inputs = tank.TickInputs(
+            now_iso=now.isoformat(),
+            elapsed_s=60,
+            energy_counter_kwh=energy,
+            water_counter_l=water,
+            contactor_on=True,
+            heating_on=not anchored,
+            contactor_on_for_s=120,
+            heating_off_for_s=60,
+            local_hour=now.hour,
+            ambient_c=10,
+            people_home=1,
+            e_base=3.0,
+            e_draw_per_person=2.2,
+            empty_house_factor=0.4,
+        )
+        result = tank.apply_tick(previous, params, model_inputs)
+        live = result.state
+        saved = observation.advance_observation(
+            saved,
+            observation.ObservationInputs(
+                now_iso=now.isoformat(),
+                source_signature="same",
+                water_l=water,
+                motion=False,
+                humidity=40,
+                ventilation=False,
+                appliance_active=False,
+                appliance_states={"washer": 1 <= minute <= 4 or 303 <= minute <= 305},
+                household_activity=False,
+                local_hour=now.hour,
+                baseline_draw_kwh=result.draw_kwh,
+                standby_kwh=result.standby_kwh,
+                energy_in_kwh=result.energy_in_kwh,
+                anchored=result.anchored,
+                previous_cycle_unclamped_kwh=previous.cycle_unclamped_kwh or 0,
+                previous_cycle_clean=previous.cycle_clean,
+                previous_cycle_hot_liters_by_bucket=previous.cycle_hot_liters_by_bucket,
+                previous_cycle_cold_kh=previous.cycle_cold_kh,
+                previous_hot_fraction_profile=tank.profile_of(previous),
+                previous_standby_w=previous.standby_w,
+                previous_standby_w_per_k=previous.standby_w_per_k,
+                kwh_per_hot_liter=e,
+                tick_cold_kh=5 / 60,
+            ),
+        )
+    row = saved["cycles"][0]
+    features = row["features"]
+    assert features["hot_liters_by_bucket"] == pytest.approx([0, 4, 2, 2])
+    assert features["appliances"]["washer"] == {
+        "run_starts_by_bucket": [1, 0, 1, 0],
+        "liters_by_bucket": [0, 4, 2, 0],
+    }
+    assert features["cycle_hours"] == pytest.approx(last / 60)
+    assert features["cold_kh"] == pytest.approx(5 * last / 60)
+    assert features["cutoff_rebased"] is False
+    p0 = observation._param_vector(features["params"])
+    assert observation._refit_residual(row, p0, {}) == row["baseline_residual_kwh"]
+    # This independent balance detects missing final-tick litres or cold hours;
+    # 1e-12 covers only repeated floating-point integration over 724 ticks.
+    expected = (
+        e
+        * sum(
+            hf * liters for hf, liters in zip(p0[:4], features["hot_liters_by_bucket"], strict=True)
+        )
+        + p0[4] * features["cycle_hours"] / 1000
+        + p0[5] * features["cold_kh"] / 1000
+        - row["energy_in_kwh"]
+    )
+    assert expected == pytest.approx(row["baseline_residual_kwh"], abs=1e-12)
+    assert features["params"]["standby_w"] != live.standby_w
+    json.dumps(saved, allow_nan=False)
+
+
+def refit_state(*, cold_heldout=True, count=48):
+    """Known physics: TRAIN is cold; optional held-out regime makes it fail."""
+    saved = {
+        "mode": "shadow",
+        "source_signature": "same",
+        "cycles": [],
+        "appliance_observations": {"runs": []},
+    }
+    profile = [0.25, 0.3, 0.35, 0.4]
+    e = tank.draw_kwh_from_liters(1, 1, 75, 12)
+    for index in range(count):
+        start = BASE + timedelta(days=index)
+        heldout = index >= count // 2
+        n = 3 if heldout and not cold_heldout else 1 + index % 3
+        bucket = index % 4
+        counts = [n if b == bucket else 0 for b in range(4)]
+        residual = e * profile[bucket] * 20 * n if cold_heldout or not heldout else 0.0
+        saved["cycles"].append(
+            {
+                "start": start.isoformat(),
+                "end": (start + timedelta(days=1)).isoformat(),
+                "complete": True,
+                "clean": True,
+                "synchronized": True,
+                "water_l": 600,
+                "source_signature": "same",
+                "baseline_residual_kwh": residual,
+                "shadow_residual_kwh": residual,
+                "features": {
+                    "hot_liters_by_bucket": [
+                        80 + (index * (b + 3) * 17 + b * 31) % 160 for b in range(4)
+                    ],
+                    "cycle_hours": 24.0,
+                    "cold_kh": 24 * (index % 9),
+                    "kwh_per_hot_liter": e,
+                    "params": {
+                        "hot_fraction_profile": profile[:],
+                        "standby_w": 100.0,
+                        "standby_w_per_k": 2.0,
+                    },
+                    "cutoff_rebased": False,
+                    "appliances": {
+                        "washer": {
+                            "run_starts_by_bucket": counts,
+                            "liters_by_bucket": [20 * c for c in counts],
+                        }
+                    },
+                },
+            }
+        )
+    for index in range(5):
+        saved["appliance_observations"]["runs"].append(
+            {
+                "source": "washer",
+                "source_signature": "same",
+                "complete": True,
+                "start": (BASE + timedelta(hours=index * 2)).isoformat(),
+                "end": (BASE + timedelta(hours=index * 2 + 1)).isoformat(),
+                "observed_interior_household_l": 20.0,
+                "observed_interior_seconds": 3600.0,
+                "gross_household_l": 20.0,
+                "interior_profile_usable": True,
+                "household_flow_episodes": 1,
+                "quality_flags": ["state_transition_interval"],
+            }
+        )
+    return saved
+
+
+def test_refit_passes_when_appliance_water_is_cold_without_mutating_saved():
+    saved = refit_state()
+    before = copy.deepcopy(saved)
+    report = observation.evaluate_appliance_refit(saved)
+    assert saved == before
+    assert report["status"] == "passes_shadow_comparison"
+    assert report["reasons"] == []
+    assert report["C2"]["rmse_kwh"] < report["B1"]["rmse_kwh"]
+    assert abs(report["C2"]["bias_kwh"]) <= abs(report["B1"]["bias_kwh"]) + 1e-12
+    assert report["n_heldout_with_consistent_runs"] == 24
+    assert report["per_appliance"]["washer"] == {
+        "n": 5,
+        "median_l": 20,
+        "mean_l": 20,
+        "sd_l": 0,
+        "cv": 0,
+        "consistent": True,
+    }
+    assert report["automatic_promotion"] is False
+    assert report["accepted_cold_attribution_kwh"] == 0
+    assert report["interpretation"] == "shadow_refit_comparison_not_control"
+    published = observation.summarize_observation(saved)
+    assert published["evaluation"]["appliance_refit"] == report
+    json.dumps(published, allow_nan=False)
+
+
+def test_refit_fails_when_deduction_worsens_heldout_bias():
+    report = observation.evaluate_appliance_refit(refit_state(cold_heldout=False))
+    assert report["status"] == "fails_shadow_comparison"
+    assert abs(report["C2"]["bias_kwh"]) > abs(report["B1"]["bias_kwh"])
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize("flag", sorted(observation.REFIT_RUN_REJECTIONS))
+def test_refit_rejects_every_unclean_run_flag(flag):
+    saved = refit_state()
+    bad_run = copy.deepcopy(saved["appliance_observations"]["runs"][0])
+    bad_run.update(quality_flags=[flag], observed_interior_household_l=10000)
+    saved["appliance_observations"]["runs"].append(bad_run)
+    assert observation.evaluate_appliance_refit(saved)["per_appliance"]["washer"]["n"] == 5
+
+
+def test_refit_run_statistics_do_not_leak_future_or_old_setup_data():
+    saved = refit_state()
+    run = saved["appliance_observations"]["runs"][0]
+    split = saved["cycles"][24]["start"]
+    for overrides in (
+        {"start": split, "end": iso(40 * 24 * 60)},
+        {"start": iso(), "end": iso(40 * 24 * 60)},
+        {"source_signature": "old"},
+        {"complete": False},
+        {"observed_interior_household_l": float("nan")},
+        {"observed_interior_household_l": 0},
+    ):
+        saved["appliance_observations"]["runs"].append(
+            {**run, "observed_interior_household_l": 10000, **overrides}
+        )
+    assert observation.evaluate_appliance_refit(saved)["per_appliance"]["washer"]["n"] == 5
+
+
+def test_refit_ignores_legacy_rebased_and_invalid_cycles():
+    saved = refit_state()
+    saved["cycles"][0].pop("features")
+    saved["cycles"][1]["features"]["cutoff_rebased"] = True
+    saved["cycles"][2]["features"]["kwh_per_hot_liter"] = float("nan")
+    saved["cycles"][3]["features"]["hot_liters_by_bucket"] = []
+    assert observation.evaluate_appliance_refit(saved)["eligible_cycles"] == 44
+    legacy = evaluation_state()
+    report = observation.evaluate_appliance_refit(legacy)
+    assert report["eligible_cycles"] == 0
+    assert report["reasons"] == [
+        "too_few_cycles",
+        "no_consistent_appliance",
+        "too_few_heldout_cycles_with_runs",
+    ]
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "count, expected", [(11, "too_few_cycles"), (12, "too_few_heldout_cycles_with_runs")]
+)
+def test_refit_minimum_cycle_evidence(count, expected):
+    report = observation.evaluate_appliance_refit(refit_state(count=count))
+    assert report["status"] == "insufficient_evidence"
+    assert expected in report["reasons"]
+
+
+@pytest.mark.parametrize("volumes", [[20] * 4, [5, 10, 20, 30, 40]])
+def test_refit_requires_five_consistent_volume_samples(volumes):
+    saved = refit_state()
+    runs = saved["appliance_observations"]["runs"][: len(volumes)]
+    saved["appliance_observations"]["runs"] = runs
+    for run, volume in zip(runs, volumes, strict=True):
+        run["observed_interior_household_l"] = volume
+    report = observation.evaluate_appliance_refit(saved)
+    assert report["status"] == "insufficient_evidence"
+    assert "no_consistent_appliance" in report["reasons"]
+    assert report["per_appliance"]["washer"]["consistent"] is False
+    assert report["B1"] == report["C2"]
+
+
+def test_refit_cv_threshold_is_strict():
+    saved = refit_state()
+    sample = saved["appliance_observations"]["runs"][0]
+    saved["appliance_observations"]["runs"] = [
+        {**sample, "observed_interior_household_l": volume} for volume in [15, 25] * 4
+    ]
+    stats = observation.evaluate_appliance_refit(saved)["per_appliance"]["washer"]
+    assert stats["cv"] == 0.25
+    assert stats["consistent"] is False
+
+
+def test_offline_evaluation_tool_loads_refit_standalone():
+    path = _PATH.parents[2] / "tools" / "evaluate_tank_observations.py"
+    spec = importlib.util.spec_from_file_location("lnp_refit_tool", path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    saved = refit_state()
+    stores = tool.find_observations({"load": {"observation": saved}})
+    reports = {
+        name: tool.load_model().evaluate_observations(state) for name, state in stores.items()
+    }
+    assert (
+        reports["root.load.observation"]["appliance_refit"]["status"] == "passes_shadow_comparison"
+    )
+    json.dumps(reports, allow_nan=False)
+
+
+def test_refit_ridge_solution_and_hard_bounds():
+    row = refit_state()["cycles"][0]
+    row["features"].update(hot_liters_by_bucket=[0] * 4, cycle_hours=1000, cold_kh=0)
+    row["baseline_residual_kwh"] = 10
+    fitted = observation._fit_refit([row], {})
+    assert fitted[4] == pytest.approx(100 - 900 * 10 / 901)
+    assert fitted[:4] == row["features"]["params"]["hot_fraction_profile"]
+    for residual, expected in ((1e6, 20), (-1e6, 250)):
+        row["baseline_residual_kwh"] = residual
+        assert observation._fit_refit([row], {})[4] == expected
+
+
+def test_cutoff_flag_is_sticky_but_clears_for_next_observation_cycle():
+    state = appliance_tick(anchored=True)
+    state = appliance_tick(state, 1, previous_cutoff_rebased=True)
+    assert state["cycle"]["features"]["cutoff_rebased"] is True
+    state = appliance_tick(state, 2)
+    state = appliance_tick(
+        state,
+        3,
+        anchored=True,
+        kwh_per_hot_liter=0.07,
+        previous_cycle_hot_liters_by_bucket=(0, 0, 0, 0),
+        previous_cycle_cold_kh=0,
+        previous_hot_fraction_profile=(0.25,) * 4,
+        previous_standby_w=100,
+        previous_standby_w_per_k=0,
+    )
+    assert state["cycles"][0]["features"]["cutoff_rebased"] is True
+    assert state["cycle"]["features"]["cutoff_rebased"] is False
+
+
+def test_legacy_in_progress_cycle_is_not_given_partial_features():
+    state = appliance_tick(anchored=True)
+    state["cycle"].pop("features")
+    state = appliance_tick(
+        state,
+        1,
+        anchored=True,
+        kwh_per_hot_liter=0.07,
+        previous_cycle_hot_liters_by_bucket=(0, 0, 0, 0),
+        previous_cycle_cold_kh=0,
+        previous_hot_fraction_profile=(0.25,) * 4,
+        previous_standby_w=100,
+        previous_standby_w_per_k=0,
+    )
+    assert "features" not in state["cycles"][0]

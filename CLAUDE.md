@@ -90,6 +90,7 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
 | `jobs.py` | The two daily jobs; drives both coordinators (each capability step isolated — one failing never skips the other) | yes |
 | `coordinator.py` | Load `DataUpdateCoordinator`; per-load `LoadResult` + the push-time `PublishedTarget` cache; predict/capture serialised by one lock, per-load work isolated | yes |
 | `forecast_coordinator.py` | Price-forecast coordinator: 5-min due-check tick → hourly Wattcast fetch (persisted cache, backoff, repair issue) → mapping refit → build slots → per-source snapshot; daily local refit; nightly per-source scoring; `ForecastResult` | yes |
+| `tank_observation.py` | **Pure** shadow observer (never a control input): shower events + comfort feedback, appliance run logs, per-anchor-cycle residuals and refit features (`features`: hot litres per daypart, hours, cold K·h, params in force, per-appliance run starts/litres), and the held-out evaluators (`evaluate_observations`, `evaluate_appliance_exploration`, `evaluate_appliance_refit`). Evaluations use only ≥ 4 h cycles with water (`_eligible_cycles`). `tools/evaluate_tank_observations.py` loads it by path | no |
 | `tank_tracker.py` | 60 s-tick coordinator: reads counters/switch/detector states, drives `tank_model.apply_tick`, publishes per-load `TankResult`, fires the low-charge boost | yes |
 | `source_health.py` | Per-source health checks + `source_unhealthy_*` Repairs (15-min grace) + registry-rename follow. Appliance sources: plain `unavailable` = **powered off** (cloud appliances like LG ThinQ go offline when off), never a Repair; a `restored` state (integration not loaded) still is. The tracker keeps an appliance that went offline *mid-run* unknown until it reports again | yes |
 | `runtime.py` | `RuntimeData` (both coordinators) + the `ConfigEntry` type alias | yes |
@@ -553,6 +554,22 @@ are otherwise independent. The `ConfigSubentry` API is relatively new; the
   place. Future work: room-occupancy draw attribution (bathroom motion ⇒ hot)
   if garden-heavy days still skew the estimate; a hot-outlet pipe sensor
   remains the real fix for hot/cold attribution noise, deferred.
+
+## Appliance cold-water deduction — evidence status (read before touching it)
+
+Reviewed 2026-11-04 on 14 Oct–4 Nov data (store + recorder + dump replay):
+**not validated, live accounting unchanged.** 0 of 12 dishwasher/washer runs
+were clean (overlapping household use, unobserved washer starts, water-meter OCR
+outages that held the last total), and no usable held-out ≥ 4 h cycle contained
+an appliance run. The learned hot fractions are ~flat (~0.23) and already absorb
+average cold-only use, so a deduction is only worth it if `appliance_refit`
+(B1 vs C2, both refit on the train half) passes on the store's own data. v0.15.0
+fixed what blocked the evidence: LG start bursts counted as one boundary
+(decoded-activity edges, `_decoded_activity`), 0 L runs marked incomplete,
+evaluators limited to ≥ 4 h cycles with water, and per-cycle refit features. The
+water-meter OCR now reports `unavailable` after 10 min without a valid reading
+(watermeter_ocr, 2026-11-04), so meter outages reach the model's fallback.
+Promotion to live accounting needs the owner's explicit approval.
 
 ## The dashboard card (read before touching `www/…card.js` or the attrs)
 

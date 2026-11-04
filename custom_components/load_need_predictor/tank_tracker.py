@@ -77,6 +77,8 @@ from .tank_model import (
     TickInputs,
     apply_tick,
     capacity_kwh,
+    cold_hinge_k,
+    draw_kwh_from_liters,
     initial_state,
     liters_at_temp,
     profile_of,
@@ -107,6 +109,25 @@ BOOST_RETRY_INTERVAL = timedelta(minutes=15)
 _LITER_ALIASES = frozenset({"l", "liter", "liters", "Liter", "litre", "litres"})
 
 _UNKNOWN_STATES = ("unknown", "unavailable")
+
+
+def _decoded_activity(state, previous) -> bool | None:
+    """The run activity a state carries, for boundary counting only.
+
+    Offline is powered off — unless it dropped straight out of a non-idle
+    state, which is a lost connection (unknown), as in ``_record_motion``.
+    """
+    if state is None:
+        return None
+    if appliance_offline(state):
+        if (
+            previous is not None
+            and not appliance_offline(previous)
+            and appliance_state(previous.state) is not False
+        ):
+            return None
+        return False
+    return appliance_state(state.state)
 
 
 @dataclass
@@ -234,6 +255,16 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
             self._appliance_lost_mid_run.discard(entity_id)
         if old is None or new is None or old.state != new.state:
             self._appliance_changed.add(entity_id)
+        # Only a change in *decoded run activity* can hide a run boundary. An LG
+        # washer reports unavailable → initial → detecting → running within one
+        # minute; counting raw strings saw 3 changes, so every washer start was
+        # recorded as unobserved (14 Oct–4 Nov: 7 of 7 runs) though it was one
+        # idle→running edge. Two activity flips inside one tick still hide one.
+        if (
+            old is None
+            or new is None
+            or _decoded_activity(old, None) != _decoded_activity(new, old)
+        ):
             self._appliance_change_counts[entity_id] = (
                 self._appliance_change_counts.get(entity_id, 0) + 1
             )
@@ -650,6 +681,31 @@ class TankTracker(DataUpdateCoordinator[dict[str, TankResult]]):
                     and tick.draw_source != "fallback"
                     and inputs.energy_counter_kwh is not None
                     and inputs.water_counter_l is not None
+                ),
+                local_hour=dt_util.as_local(now).hour,
+                kwh_per_hot_liter=draw_kwh_from_liters(
+                    1.0, 1.0, cfg.tank_setpoint_c, cfg.tank_cold_in_c
+                ),
+                previous_cycle_hot_liters_by_bucket=previous.cycle_hot_liters_by_bucket,
+                previous_cycle_cold_kh=previous.cycle_cold_kh,
+                previous_hot_fraction_profile=profile_of(previous),
+                previous_standby_w=previous.standby_w,
+                previous_standby_w_per_k=previous.standby_w_per_k,
+                # The mark persists until the anchor and proves cut-off learning.
+                # Also exclude settled cut-offs without a step: settling can clamp
+                # the ledger, so its balance need not be a single linear cycle.
+                previous_cutoff_rebased=(
+                    previous.cycle_cutoff_mark_kwh is not None
+                    or previous.cycle_display_lift_kwh > 0
+                    or bool(
+                        previous.last_cutoff_iso
+                        and previous.cycle_start_iso
+                        and dt_util.parse_datetime(previous.last_cutoff_iso)
+                        >= dt_util.parse_datetime(previous.cycle_start_iso)
+                    )
+                ),
+                tick_cold_kh=(
+                    cold_hinge_k(tick.state.last_ambient_c) * max(0.0, inputs.elapsed_s) / 3600
                 ),
                 anchored=tick.anchored,
                 tank_capacity_kwh=tick.capacity_kwh,

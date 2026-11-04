@@ -893,6 +893,49 @@ async def test_appliance_context_records_short_pulses_and_does_not_change_contro
     assert any("sensor.washer" in item for item in tracker.data[observed_sid].quality_warnings)
 
 
+async def test_lg_start_burst_is_one_observed_boundary(hass: HomeAssistant, freezer) -> None:
+    """unavailable → initial → detecting → running inside one tick is one edge.
+
+    Counting raw strings recorded every real washer start as unobserved.
+    """
+    hass.states.async_set(_ENERGY, "100", _KWH)
+    hass.states.async_set(_WATER, "1000", {"unit_of_measurement": "L"})
+    hass.states.async_set(_SWITCH, "off")
+    hass.states.async_set(_LED, "off")
+    hass.states.async_set("sensor.washer", "unavailable")
+    load = {
+        **_TANK_LOAD,
+        "tank_boost_soc_pct": None,
+        "cold_appliance_entities": ["sensor.washer"],
+        "appliance_household_activity_entities": ["binary_sensor.bathroom"],
+    }
+    hass.states.async_set("binary_sensor.bathroom", "off")
+    entry = await _setup(hass, [load])
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    (sid,) = list(entry.subentries)
+    await hass.async_block_till_done(wait_background_tasks=True)  # initial tick first
+    for _ in range(2):
+        freezer.tick(timedelta(seconds=60))
+        await tracker.async_tick()
+    # Let a timer tick that fell due during the frozen-clock jumps run now, not
+    # at the same instant as the burst below (a same-instant tick reads as a gap).
+    await hass.async_block_till_done()
+    for status in ("initial", "detecting", "running"):
+        hass.states.async_set("sensor.washer", status)
+        await hass.async_block_till_done()
+    assert tracker._appliance_change_counts["sensor.washer"] == 1
+    freezer.tick(timedelta(seconds=60))
+    await tracker.async_tick()
+    run = coord.tank_observations[sid]["appliance_observations"]["active_runs"]["sensor.washer"]
+    assert "start_unobserved" not in run["quality_flags"]
+    assert run["complete"] is True
+    # Two real activity flips inside one tick still hide a boundary.
+    for status in ("end", "running"):
+        hass.states.async_set("sensor.washer", status)
+        await hass.async_block_till_done()
+    assert tracker._appliance_change_counts["sensor.washer"] == 2
+
+
 async def test_appliance_offline_since_startup_is_idle(hass: HomeAssistant) -> None:
     """An LG washer left off is ``unavailable`` from HA start until powered on."""
     from custom_components.load_need_predictor.tank_tracker import TankTracker
@@ -915,3 +958,120 @@ async def test_bad_context_units_never_corroborate_shower(hass: HomeAssistant) -
     assert tracker._number("sensor.supply", temperature=True) is None
     hass.states.async_set("sensor.humidity", "50", {"unit_of_measurement": "%"})
     assert tracker._number("sensor.humidity", humidity=True) == 50
+
+
+@pytest.mark.parametrize(
+    "cutoff, excluded",
+    [
+        ("none", False),
+        ("mark", True),
+        ("lift", True),
+        ("settled", True),
+        ("old", False),
+        ("pending", False),
+    ],
+)
+async def test_shadow_refit_uses_pre_anchor_features_and_cycle_cutoff_signals(
+    hass: HomeAssistant, freezer, cutoff, excluded
+) -> None:
+    from custom_components.load_need_predictor.tank_model import draw_kwh_from_liters
+    from custom_components.load_need_predictor.tank_observation import (
+        ObservationInputs,
+        advance_observation,
+    )
+
+    await hass.config.async_set_time_zone("Europe/Helsinki")
+    freezer.move_to("2026-10-05T15:30:00+00:00")  # local evening, UTC day bucket
+    hass.states.async_set(_ENERGY, "100", _KWH)
+    hass.states.async_set(_WATER, "1000", {"unit_of_measurement": "L"})
+    hass.states.async_set(_SWITCH, "on")
+    hass.states.async_set(_LED, "off")
+    hass.states.async_set("sensor.washer", "off")
+    hass.states.async_set("sensor.outdoor", "5", {"unit_of_measurement": "°C"})
+    entry = await _setup(
+        hass,
+        [
+            {
+                **_TANK_LOAD,
+                "tank_boost_soc_pct": None,
+                "cold_appliance_entities": ["sensor.washer"],
+                "outdoor_temp_entity": "sensor.outdoor",
+            }
+        ],
+    )
+    tracker, coord = entry.runtime_data.tank, entry.runtime_data.load
+    tracker.async_shutdown_ticker()
+    sid = _tank_sid(entry)
+    freezer.tick(timedelta(seconds=180))
+    now = dt_util.utcnow()
+    start = (now - timedelta(hours=6)).isoformat()
+    signature = coord.tank_observations[sid]["source_signature"]
+    saved = advance_observation(
+        None,
+        ObservationInputs(
+            now_iso=start,
+            source_signature=signature,
+            water_l=1000,
+            motion=False,
+            humidity=40,
+            ventilation=False,
+            appliance_active=False,
+            anchored=True,
+            appliance_states={"sensor.washer": False},
+        ),
+    )
+    saved["last_iso"] = (now - timedelta(seconds=60)).isoformat()
+    coord.tank_observations[sid] = saved
+    previous = replace(
+        coord.tanks[sid],
+        calibrated=True,
+        anchor_latched=False,
+        cycle_start_iso=start,
+        last_anchor_iso=start,
+        last_tick_iso=saved["last_iso"],
+        hot_fraction_profile=(0.2, 0.3, 0.4, 0.5),
+        standby_w=100,
+        standby_w_per_k=2,
+        cycle_hot_liters_by_bucket=(10, 20, 30, 40),
+        cycle_liters=100,
+        cycle_cold_kh=60,
+        cycle_unclamped_kwh=1,
+        cycle_clean=True,
+        energy_baseline_kwh=100,
+        water_baseline_l=1000,
+        water_baseline_iso=saved["last_iso"],
+        cycle_cutoff_mark_kwh=0.0 if cutoff == "mark" else None,
+        cycle_display_lift_kwh=0.1 if cutoff == "lift" else 0,
+        last_cutoff_iso=(
+            (now - timedelta(hours=1 if cutoff == "settled" else 7)).isoformat()
+            if cutoff in ("settled", "old")
+            else ""
+        ),
+        cutoff_pending_iso=now.isoformat() if cutoff == "pending" else "",
+    )
+    coord.tanks[sid] = previous
+    hass.states.async_set(_WATER, "1003", {"unit_of_measurement": "L"})
+    hass.states.async_set("sensor.washer", "running")
+    with patch(
+        "custom_components.load_need_predictor.tank_tracker.advance_observation",
+        wraps=advance_observation,
+    ) as observe:
+        await tracker._tick_one(sid, tracker.tank_configs()[sid], now, now.isoformat())
+    observed = observe.call_args.args[1]
+    assert observed.anchored is True
+    assert observed.previous_hot_fraction_profile == previous.hot_fraction_profile
+    assert observed.previous_cycle_hot_liters_by_bucket == previous.cycle_hot_liters_by_bucket
+    assert observed.previous_cycle_cold_kh == 60
+    assert observed.previous_standby_w == 100
+    assert observed.previous_standby_w_per_k == 2
+    assert observed.local_hour == 18
+    assert observed.previous_cutoff_rebased is excluded
+    assert observed.kwh_per_hot_liter == draw_kwh_from_liters(1, 1, 75, 12)
+    features = coord.tank_observations[sid]["cycles"][0]["features"]
+    assert features["hot_liters_by_bucket"] == pytest.approx([10, 20, 30, 43])
+    assert features["cold_kh"] == pytest.approx(60 + 10 / 60)
+    assert features["cycle_hours"] == 6
+    assert features["params"]["hot_fraction_profile"] == [0.2, 0.3, 0.4, 0.5]
+    assert features["cutoff_rebased"] is excluded
+    assert features["appliances"]["sensor.washer"]["run_starts_by_bucket"] == [0, 0, 0, 1]
+    assert coord.tanks[sid].hot_fraction_profile != previous.hot_fraction_profile
