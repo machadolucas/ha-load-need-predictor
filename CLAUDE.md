@@ -5,8 +5,9 @@ Working notes for AI agents and future-me. Read this before changing code.
 **Status (alpha):** built incrementally in milestones (see the approved plan at
 `~/.claude/plans/i-want-to-build-compressed-backus.md` — the *why*; this file is
 the *how*). Tests run under Python **3.13** (Home Assistant doesn't support 3.14).
-The CI workflow files exist locally but are git-ignored (the push token lacks
-`workflow` scope) — mirrors the `ha-load-scheduler` repo.
+GitHub Actions runs Tests (Ruff lint/format and pytest with a 90% coverage
+gate) and Validate (hassfest and HACS) on pushes and pull requests. Validate
+also runs daily. The workflows use Node.js 24 actions and Python 3.13.
 
 ## What this is
 
