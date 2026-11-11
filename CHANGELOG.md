@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.2 — 2026-11-11
+
+- Declare the optional Lovelace dependency used for dashboard resource registration.
+- Enable GitHub Actions tests, lint and Home Assistant/HACS validation.
+- Keep prediction, tank tracking and existing configuration unchanged.
+
 ## 0.15.1 — 2026-11-11
 
 - Add refreshed integration artwork as bundled 256 px and 512 px icons for
