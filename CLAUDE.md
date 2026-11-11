@@ -647,20 +647,18 @@ never fetched. **Use `gh release list` to see the real latest version, not
 
 ## Branding / icon
 
-`brands/` holds the icon: `icon.svg` (editable source) + `icon.png` (256) +
-`icon@2x.png` (512), rendered with `rsvg-convert`. It's a full-bleed app tile
-(blue energy gradient, white price bars with the cheapest in green) and is
-**derived from the Load Scheduler icon** — same tile/bars/green/amber, but the
-scheduler's bolt becomes a **forecast line projecting (dashed) beyond the bars**.
-Re-render after editing the SVG:
+The current artwork master is `brands/icon-master.png`. Home Assistant 2026.3+
+serves the bundled integration images from
+`custom_components/load_need_predictor/brand/icon.png` (256 × 256) and
+`custom_components/load_need_predictor/brand/icon@2x.png` (512 × 512). Resize those
+files from the master when changing the artwork; do not regenerate them from
+the legacy SVG.
 
-```bash
-cd brands && rsvg-convert -w 512 -h 512 icon.svg -o icon@2x.png \
-                        && rsvg-convert -w 256 -h 256 icon.svg -o icon.png
-```
+`brands/icon.svg`, `brands/icon.png` and `brands/icon@2x.png` retain the legacy
+artwork for reference. They are not the source of the current bundled images.
 
-**TODO — make it show in HA + HACS (not done yet):** HA/HACS load integration
-icons only from the `home-assistant/brands` repo (no repo-local or manifest
-override). Open a PR there adding `custom_integrations/load_need_predictor/icon.png`
-+ `icon@2x.png` (the files in `brands/`). Keep it full-bleed so brands' trim
-check passes. After merge, an HA restart may be needed to clear the brand cache.
+Local brand images need no manifest branding key or upstream brands PR. Keep
+the existing Home Assistant minimum in `hacs.json`: earlier supported versions
+can use the integration without the bundled icon. Legacy HACS catalog displays
+may use different artwork; no upstream submission is required for local images
+in Home Assistant 2026.3+.
