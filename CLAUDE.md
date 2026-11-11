@@ -8,6 +8,9 @@ the *how*). Tests run under Python **3.13** (Home Assistant doesn't support 3.14
 GitHub Actions runs Tests (Ruff lint/format and pytest with a 90% coverage
 gate) and Validate (hassfest and HACS) on pushes and pull requests. Validate
 also runs daily. The workflows use Node.js 24 actions and Python 3.13.
+The manifest lists `lovelace` as a soft dependency for the dashboard resource
+registration; repository topics identify this as a Home Assistant custom
+integration for HACS validation.
 
 ## What this is
 
