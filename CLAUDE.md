@@ -4,10 +4,10 @@ Working notes for AI agents and future-me. Read this before changing code.
 
 **Status (alpha):** built incrementally in milestones (see the approved plan at
 `~/.claude/plans/i-want-to-build-compressed-backus.md` — the *why*; this file is
-the *how*). Tests run under Python **3.13** (Home Assistant doesn't support 3.14).
+the *how*). The locked dev/HA test environment uses Python 3.14.10 and HA 2026.11.1; HACS runtime minimum remains in hacs.json.
 GitHub Actions runs Tests (Ruff lint/format and pytest with a 90% coverage
 gate) and Validate (hassfest and HACS) on pushes and pull requests. Validate
-also runs daily. The workflows use Node.js 24 actions and Python 3.13.
+also runs daily. The workflows use Node.js 24 actions and the locked Python 3.14.10 / HA 2026.11.1 dev environment.
 The manifest lists `lovelace` as a soft dependency for the dashboard resource
 registration; repository topics identify this as a Home Assistant custom
 integration for HACS validation.
@@ -607,11 +607,18 @@ shows is published as sensor attributes — the card itself holds no model logic
 
 ## Dev workflow
 
+The `uv.lock` environment is for development and tests only: Python is
+pinned to 3.14.10, and Home Assistant 2026.11.1 is selected by an explicit
+uv override because pytest-homeassistant-custom-component 0.13.375 declares
+HA 2026.10.4. The integration's HACS runtime minimum in `hacs.json` is
+unchanged. Root conftest loads Home Assistant and the plugin only when both
+are installed; otherwise pure tests remain runnable with pytest alone. The
+compatibility shim for the plugin's removed logger helper raises if called.
+
 ```bash
-uv venv --python 3.13 .venv313
-uv pip install --python .venv313/bin/python -r requirements_test.txt
-.venv313/bin/python -m pytest
-.venv313/bin/ruff check . && .venv313/bin/ruff format --check .
+uv sync --locked
+uv run pytest
+uv run ruff check . && uv run ruff format --check .
 ```
 
 - Pure tests (`test_predictor`/`test_features`/`test_models`) load their module

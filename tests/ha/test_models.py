@@ -1,4 +1,4 @@
-"""Tests for the per-load config mapping (logic-only; reads plain dicts)."""
+"""Config mapping tests; its constants depend on Home Assistant Platform."""
 
 from __future__ import annotations
 

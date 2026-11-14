@@ -645,12 +645,28 @@ predicting and publishing its sensor, and simply skips the push.
 
 ## Development
 
+Validation on 2026-11-14: 722 full-suite tests passed with 97.29% coverage;
+412 standalone prediction/price/tank tests passed without Home Assistant.
+Ruff lint and formatting passed. Runtime files, installed v0.15.2, and
+shadow-only behavior are unchanged.
+
+Prediction, price and tank-model tests run independently of Home Assistant.
+The configuration-mapping tests live under `tests/ha/` because their constants
+import HA’s `Platform` enum; they remain part of the complete suite.
+
+The `uv.lock` environment is for development and tests only: Python is
+pinned to 3.14.10, and Home Assistant 2026.11.1 is selected by an explicit
+uv override because pytest-homeassistant-custom-component 0.13.375 declares
+HA 2026.10.4. The integration's HACS runtime minimum in `hacs.json` is
+unchanged. Root conftest loads Home Assistant and the plugin only when both
+are installed; otherwise pure tests remain runnable with pytest alone. The
+compatibility shim for the plugin's removed logger helper raises if called.
+
 ```bash
-# HA-side tests need Python 3.13 (HA doesn't support 3.14 yet):
-uv venv --python 3.13 .venv313
-uv pip install --python .venv313/bin/python -r requirements_test.txt
-.venv313/bin/python -m pytest
-.venv313/bin/ruff check . && .venv313/bin/ruff format --check .
+# Full dev/HA tests use Python 3.14.10 and HA 2026.11.1; HACS runtime minimum remains in hacs.json:
+uv sync --locked
+uv run pytest
+uv run ruff check . && uv run ruff format --check .
 ```
 
 The prediction model

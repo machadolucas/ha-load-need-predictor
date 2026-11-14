@@ -1,9 +1,33 @@
+[project]
+name = "ha-load-need-predictor"
+version = "0.15.2"
+requires-python = "==3.14.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "homeassistant==2026.11.1",
+  "pytest==9.0.3",
+  "pytest-cov==7.1.0",
+  "pytest-homeassistant-custom-component==0.13.375",
+  "ruff==0.17.5",
+]
+
+[tool.uv]
+package = false
+# Python 3.14.10 is the exact dev/test interpreter. HACS runtime minimum
+# stays in hacs.json.
+# Plugin 0.13.375 pins HA 2026.10.4; override only its dev dependency
+# to test against HA 2026.11.1.
+override-dependencies = ["homeassistant==2026.11.1"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-q -p no:homeassistant -p no:respx"
 asyncio_mode = "auto"
-# Pure tests (test_predictor / test_features / test_models) load their module via
-# importlib and need only pytest. The HA-side tests under tests/ha/ use
-# pytest-homeassistant-custom-component (Python 3.13 — HA does not support 3.14).
+# Pure unit modules do not instantiate HA. Root enables the test plugin
+# only when both HA and the plugin are installed. HACS runtime minimum
+# remains in hacs.json.
 
 [tool.ruff]
 target-version = "py313"
